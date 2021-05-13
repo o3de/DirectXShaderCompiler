@@ -65,6 +65,7 @@ struct SpirvCodeGenOptions {
   bool useScalarLayout = false;
   bool flattenResourceArrays = false;
   bool reduceLoadSize = false;
+  bool disableImageTypeDepthHint = false; // Disable depth hint for OpTypeImage because some mobile drivers crash.
   bool autoShiftBindings = false;
   bool supportNonzeroBaseInstance = false;
   bool supportNonzeroBaseVertex = false;

@@ -425,6 +425,8 @@ def fvk_bind_sampler_heap : MultiArg<["-"], "fvk-bind-sampler-heap", 2>, MetaVar
   HelpText<"Specify Vulkan binding number and set number for the sampler heap.">;
 def fvk_bind_counter_heap : MultiArg<["-"], "fvk-bind-counter-heap", 2>, MetaVarName<"<binding> <set>">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
   HelpText<"Specify Vulkan binding number and set number for the counter heap.">;
+def fvk_disable_depth_hint: Flag<["-"], "fvk-disable-depth-hint">, Group<spirv_Group>, Flags<[CoreOption, DriverOption]>,
+  HelpText<"Disable the depth hint when generating OpTypeImage (driver issues)">;
 // SPIRV Change Ends
 
 //////////////////////////////////////////////////////////////////////////////

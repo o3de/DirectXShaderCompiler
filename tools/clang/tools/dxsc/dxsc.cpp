@@ -125,8 +125,16 @@ int main(int argc, const char **argv) {
     cl::ParseCommandLineOptions(argc, argStrings.getArrayRef().data(),
                                 "dxsc patching\n");
 
-    if (InputFilename == "" || !SentinelValue || Help) {
+    if (Help) {
       cl::PrintHelpMessage();
+      return 0;
+    }
+    if (InputFilename == "") {
+      llvm::errs() << "dxsc: error: missing input DXIL file\n";
+      return 2;
+    }
+    if (SentinelValue.getNumOccurrences() == 0) {
+      llvm::errs() << "dxsc: error: missing -sv sentinel value\n";
       return 2;
     }
 

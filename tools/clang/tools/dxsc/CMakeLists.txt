@@ -36,4 +36,3 @@ endif()
 
 install(TARGETS dxsc
   RUNTIME DESTINATION bin)
-

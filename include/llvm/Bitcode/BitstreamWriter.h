@@ -380,7 +380,7 @@ private:
           WriteByte(0);
       } else {  // Single scalar field.
         assert(RecordIdx < Vals.size() && "Invalid abbrev/record");
-        
+
         // O3DE Change Start
         if (WriteConstantCallback &&
             Vals[0] == bitc::CST_CODE_INTEGER &&

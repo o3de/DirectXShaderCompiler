@@ -140,7 +140,7 @@ int main(int argc, const char **argv) {
 
     DXCLibraryDllLoader dxcSupport;
     dxc::EnsureEnabled(dxcSupport);
-    
+
     CComPtr<IDxcBlobEncoding> pSource;
     ReadFileIntoBlob(dxcSupport, StringRefWide(InputFilename), &pSource);
 
@@ -255,7 +255,7 @@ int main(int argc, const char **argv) {
           I->replaceAllUsesWith(scConstant);
         }
 
-        // Step 3: 
+        // Step 3:
         // Remove any other instructions using the slot the load happened
         // from,
         //   which includes not only volatile stores but also any other
@@ -371,7 +371,7 @@ int main(int argc, const char **argv) {
       std::string msg(pStart);
       IFTMSG(status, msg);
     }
-    
+
     // Write the blob
     if (!OutputFilename.empty()) {
       // Write the signed blob to a file

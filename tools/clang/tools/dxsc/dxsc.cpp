@@ -130,7 +130,7 @@ int main(int argc, const char **argv) {
       return 2;
     }
 
-    DxcDllSupport dxcSupport;
+    DXCLibraryDllLoader dxcSupport;
     dxc::EnsureEnabled(dxcSupport);
     
     CComPtr<IDxcBlobEncoding> pSource;
@@ -344,9 +344,10 @@ int main(int argc, const char **argv) {
                            &pContainerBlob));
 
     // Sign container
+    // Keep the validator DLL loaded until its COM objects are released.
+    SpecificDllLoader DxilSupport;
     CComPtr<IDxcValidator> pValidator;
     CComPtr<IDxcOperationResult> pResult;
-    DxcDllSupport DxilSupport;
     IFT(DxilSupport.InitializeForDll(kDxilLib, "DxcCreateInstance"));
     IFT(DxilSupport.CreateInstance(CLSID_DxcValidator, &pValidator));
     IFT(pValidator->Validate(pContainerBlob, DxcValidatorFlags_InPlaceEdit,

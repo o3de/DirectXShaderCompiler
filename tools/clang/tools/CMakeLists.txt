@@ -43,3 +43,7 @@ add_subdirectory(dxlib-sample)
 add_subdirectory(dotnetc)
 endif (MSVC)
 # HLSL Change Ends
+
+# O3DE Change Starts
+add_subdirectory(dxsc)
+# O3DE Change Ends

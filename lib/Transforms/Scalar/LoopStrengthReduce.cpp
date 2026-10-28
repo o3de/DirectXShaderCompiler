@@ -802,7 +802,7 @@ static bool isHighCostExpansion(const SCEV *S,
 /// specified set are trivially dead, delete them and see if this makes any of
 /// their operands subsequently dead.
 static bool
-DeleteTriviallyDeadInstructions(SmallVectorImpl<WeakVH> &DeadInsts) {
+DeleteTriviallyDeadInstructions(SmallVectorImpl<WeakTrackingVH> &DeadInsts) {
   bool Changed = false;
 
   while (!DeadInsts.empty()) {
@@ -1395,8 +1395,11 @@ static bool isAMCompletelyFolded(const TargetTransformInfo &TTI,
       // ICmpZero -1*ScaleReg + BaseOffset => ICmp ScaleReg, BaseOffset
       // Offs is the ICmp immediate.
       if (Scale == 0)
-        // The cast does the right thing with INT64_MIN.
-        BaseOffset = -(uint64_t)BaseOffset;
+        // Negate BaseOffset using two's complement (~x + 1) to avoid undefined
+        // behavior. Simple negation (-BaseOffset) would be undefined for
+        // INT64_MIN since -INT64_MIN cannot fit in int64_t. Two's complement
+        // gives the expected wraparound behavior: -INT64_MIN becomes INT64_MIN.
+        BaseOffset = ~BaseOffset + 1ULL;
       return TTI.isLegalICmpImmediate(BaseOffset);
     }
 
@@ -1686,7 +1689,7 @@ class LSRInstance {
   void FinalizeChain(IVChain &Chain);
   void CollectChains();
   void GenerateIVChain(const IVChain &Chain, SCEVExpander &Rewriter,
-                       SmallVectorImpl<WeakVH> &DeadInsts);
+                       SmallVectorImpl<WeakTrackingVH> &DeadInsts);
 
   void CollectInterestingTypesAndFactors();
   void CollectFixupsAndInitialFormulae();
@@ -1766,21 +1769,14 @@ class LSRInstance {
                                   const LSRUse &LU,
                                   SCEVExpander &Rewriter) const;
 
-  Value *Expand(const LSRFixup &LF,
-                const Formula &F,
-                BasicBlock::iterator IP,
+  Value *Expand(const LSRFixup &LF, const Formula &F, BasicBlock::iterator IP,
                 SCEVExpander &Rewriter,
-                SmallVectorImpl<WeakVH> &DeadInsts) const;
-  void RewriteForPHI(PHINode *PN, const LSRFixup &LF,
-                     const Formula &F,
+                SmallVectorImpl<WeakTrackingVH> &DeadInsts) const;
+  void RewriteForPHI(PHINode *PN, const LSRFixup &LF, const Formula &F,
                      SCEVExpander &Rewriter,
-                     SmallVectorImpl<WeakVH> &DeadInsts,
-                     Pass *P) const;
-  void Rewrite(const LSRFixup &LF,
-               const Formula &F,
-               SCEVExpander &Rewriter,
-               SmallVectorImpl<WeakVH> &DeadInsts,
-               Pass *P) const;
+                     SmallVectorImpl<WeakTrackingVH> &DeadInsts, Pass *P) const;
+  void Rewrite(const LSRFixup &LF, const Formula &F, SCEVExpander &Rewriter,
+               SmallVectorImpl<WeakTrackingVH> &DeadInsts, Pass *P) const;
   void ImplementSolution(const SmallVectorImpl<const Formula *> &Solution,
                          Pass *P);
 
@@ -2848,7 +2844,7 @@ static bool canFoldIVIncExpr(const SCEV *IncExpr, Instruction *UserInst,
 /// GenerateIVChains - Generate an add or subtract for each IVInc in a chain to
 /// materialize the IV user's operand from the previous IV user's operand.
 void LSRInstance::GenerateIVChain(const IVChain &Chain, SCEVExpander &Rewriter,
-                                  SmallVectorImpl<WeakVH> &DeadInsts) {
+                                  SmallVectorImpl<WeakTrackingVH> &DeadInsts) {
   // Find the new IVOperand for the head of the chain. It may have been replaced
   // by LSR.
   const IVInc &Head = Chain.Incs[0];
@@ -3007,7 +3003,7 @@ void LSRInstance::CollectFixupsAndInitialFormulae() {
         // of -1) are now also interesting.
         for (size_t i = 0, e = Factors.size(); i != e; ++i)
           if (Factors[i] != -1)
-            Factors.insert(-(uint64_t)Factors[i]);
+            Factors.insert(~Factors[i] + 1ULL);
         Factors.insert(-1);
       }
 
@@ -3746,7 +3742,7 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
     const SCEV *OrigReg = WI.OrigReg;
 
     Type *IntTy = SE.getEffectiveSCEVType(OrigReg->getType());
-    const SCEV *NegImmS = SE.getSCEV(ConstantInt::get(IntTy, -(uint64_t)Imm));
+    const SCEV *NegImmS = SE.getSCEV(ConstantInt::get(IntTy, ~Imm + 1ULL));
     unsigned BitWidth = SE.getTypeSizeInBits(IntTy);
 
     // TODO: Use a more targeted data structure.
@@ -3761,8 +3757,8 @@ void LSRInstance::GenerateCrossUseConstantOffsets() {
       if (F.ScaledReg == OrigReg) {
         int64_t Offset = (uint64_t)F.BaseOffset + Imm * (uint64_t)F.Scale;
         // Don't create 50 + reg(-50).
-        if (F.referencesReg(SE.getSCEV(
-                   ConstantInt::get(IntTy, -(uint64_t)Offset))))
+        if (F.referencesReg(
+                SE.getSCEV(ConstantInt::get(IntTy, ~Offset + 1ULL))))
           continue;
         Formula NewF = F;
         NewF.BaseOffset = Offset;
@@ -4449,11 +4445,9 @@ LSRInstance::AdjustInsertPositionForExpand(BasicBlock::iterator LowestIP,
 
 /// Expand - Emit instructions for the leading candidate expression for this
 /// LSRUse (this is called "expanding").
-Value *LSRInstance::Expand(const LSRFixup &LF,
-                           const Formula &F,
-                           BasicBlock::iterator IP,
-                           SCEVExpander &Rewriter,
-                           SmallVectorImpl<WeakVH> &DeadInsts) const {
+Value *LSRInstance::Expand(const LSRFixup &LF, const Formula &F,
+                           BasicBlock::iterator IP, SCEVExpander &Rewriter,
+                           SmallVectorImpl<WeakTrackingVH> &DeadInsts) const {
   const LSRUse &LU = Uses[LF.LUIdx];
   if (LU.RigidFormula)
     return LF.OperandValToReplace;
@@ -4565,7 +4559,7 @@ Value *LSRInstance::Expand(const LSRFixup &LF,
       // The other interesting way of "folding" with an ICmpZero is to use a
       // negated immediate.
       if (!ICmpScaledV)
-        ICmpScaledV = ConstantInt::get(IntTy, -(uint64_t)Offset);
+        ICmpScaledV = ConstantInt::get(IntTy, ~Offset + 1ULL);
       else {
         Ops.push_back(SE.getUnknown(ICmpScaledV));
         ICmpScaledV = ConstantInt::get(IntTy, Offset);
@@ -4617,8 +4611,8 @@ Value *LSRInstance::Expand(const LSRFixup &LF,
       assert((F.Scale == 0 || F.Scale == 1) &&
              "ICmp does not support folding a global value and "
              "a scale at the same time!");
-      Constant *C = ConstantInt::getSigned(SE.getEffectiveSCEVType(OpTy),
-                                           -(uint64_t)Offset);
+      Constant *C =
+          ConstantInt::getSigned(SE.getEffectiveSCEVType(OpTy), ~Offset + 1ULL);
       if (C->getType() != OpTy)
         C = ConstantExpr::getCast(CastInst::getCastOpcode(C, false,
                                                           OpTy, false),
@@ -4634,11 +4628,9 @@ Value *LSRInstance::Expand(const LSRFixup &LF,
 /// RewriteForPHI - Helper for Rewrite. PHI nodes are special because the use
 /// of their operands effectively happens in their predecessor blocks, so the
 /// expression may need to be expanded in multiple places.
-void LSRInstance::RewriteForPHI(PHINode *PN,
-                                const LSRFixup &LF,
-                                const Formula &F,
-                                SCEVExpander &Rewriter,
-                                SmallVectorImpl<WeakVH> &DeadInsts,
+void LSRInstance::RewriteForPHI(PHINode *PN, const LSRFixup &LF,
+                                const Formula &F, SCEVExpander &Rewriter,
+                                SmallVectorImpl<WeakTrackingVH> &DeadInsts,
                                 Pass *P) const {
   DenseMap<BasicBlock *, Value *> Inserted;
   for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i)
@@ -4710,10 +4702,9 @@ void LSRInstance::RewriteForPHI(PHINode *PN,
 /// Rewrite - Emit instructions for the leading candidate expression for this
 /// LSRUse (this is called "expanding"), and update the UserInst to reference
 /// the newly expanded value.
-void LSRInstance::Rewrite(const LSRFixup &LF,
-                          const Formula &F,
+void LSRInstance::Rewrite(const LSRFixup &LF, const Formula &F,
                           SCEVExpander &Rewriter,
-                          SmallVectorImpl<WeakVH> &DeadInsts,
+                          SmallVectorImpl<WeakTrackingVH> &DeadInsts,
                           Pass *P) const {
   // First, find an insertion point that dominates UserInst. For PHI nodes,
   // find the nearest block which dominates all the relevant uses.
@@ -4752,7 +4743,7 @@ LSRInstance::ImplementSolution(const SmallVectorImpl<const Formula *> &Solution,
                                Pass *P) {
   // Keep track of instructions we may have made dead, so that
   // we can remove them after we are done working.
-  SmallVector<WeakVH, 16> DeadInsts;
+  SmallVector<WeakTrackingVH, 16> DeadInsts;
 
   SCEVExpander Rewriter(SE, L->getHeader()->getModule()->getDataLayout(),
                         "lsr");
@@ -5016,7 +5007,7 @@ bool LoopStrengthReduce::runOnLoop(Loop *L, LPPassManager & /*LPM*/) {
   // Remove any extra phis created by processing inner loops.
   Changed |= DeleteDeadPHIs(L->getHeader());
   if (EnablePhiElim && L->isLoopSimplifyForm()) {
-    SmallVector<WeakVH, 16> DeadInsts;
+    SmallVector<WeakTrackingVH, 16> DeadInsts;
     const DataLayout &DL = L->getHeader()->getModule()->getDataLayout();
     SCEVExpander Rewriter(getAnalysis<ScalarEvolution>(), DL, "lsr");
 #ifndef NDEBUG

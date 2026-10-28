@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 #define FallbackLayerRegisterSpace 214743647
 
 // SRVs
@@ -24,10 +26,10 @@
 #ifndef HLSL
 struct ViewKey {
   unsigned int ViewType;
-  union
-  {
+  union {
     unsigned int StructuredStride; // When ViewType == StructuredBuffer
-    unsigned int SRVComponentType; // When ViewType != StructuredBuffer &&  ViewType != RawBuffer
+    unsigned int SRVComponentType; // When ViewType != StructuredBuffer &&
+                                   // ViewType != RawBuffer
   };
 };
 

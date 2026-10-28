@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.8)
+cmake_minimum_required(VERSION 3.17.2) # HLSL Change - Require CMake 3.17.2.
 
 # FIXME: It may be removed when we use 2.8.12.
 if(CMAKE_VERSION VERSION_LESS 2.8.12)
@@ -499,7 +499,9 @@ if( CLANG_INCLUDE_TESTS OR HLSL_INCLUDE_TESTS ) # HLSL Change
       clang_unit_site_config=${CMAKE_CURRENT_BINARY_DIR}/test/Unit/lit.site.cfg
       )
   endif()
-#  add_subdirectory(test) # HLSL Change - disable pure .lit tests
+  if (CLANG_INCLUDE_TESTS) # HLSL Change - respect variable for clang tests
+    add_subdirectory(test)
+  endif()
 
   if(CLANG_BUILT_STANDALONE)
     # Add a global check rule now that all subdirectories have been traversed

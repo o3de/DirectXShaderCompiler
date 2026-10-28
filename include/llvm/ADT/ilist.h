@@ -43,6 +43,8 @@
 #include <cassert>
 #include <cstddef>
 #include <iterator>
+#include <memory>  // HLSL Change
+#include <utility> // HLSL Change
 
 namespace llvm {
 
@@ -102,6 +104,12 @@ struct ilist_sentinel_traits {
   static void noteHead(NodeTy *NewHead, NodeTy *Sentinel) {
     ilist_traits<NodeTy>::setPrev(NewHead, Sentinel);
   }
+
+  // HLSL Change Starts
+  /// setSentinel - Take ownership of a constructed sentinel object.
+  /// Unused by this implementation.
+  void setSentinel(std::unique_ptr<NodeTy> &&) {}
+  // HLSL Change Ends
 };
 
 /// ilist_node_traits - A fragment for template traits for intrusive list
@@ -142,18 +150,16 @@ struct ilist_traits<const Ty> : public ilist_traits<Ty> {};
 // ilist_iterator<Node> - Iterator for intrusive list.
 //
 template<typename NodeTy>
-class ilist_iterator
-  : public std::iterator<std::bidirectional_iterator_tag, NodeTy, ptrdiff_t> {
+class ilist_iterator {
 
 public:
-  typedef ilist_traits<NodeTy> Traits;
-  typedef std::iterator<std::bidirectional_iterator_tag,
-                        NodeTy, ptrdiff_t> super;
+  using iterator_category = std::bidirectional_iterator_tag;
+  using value_type = NodeTy;
+  using difference_type = std::ptrdiff_t;
+  using pointer = value_type *;
+  using reference = value_type &;
 
-  typedef typename super::value_type value_type;
-  typedef typename super::difference_type difference_type;
-  typedef typename super::pointer pointer;
-  typedef typename super::reference reference;
+  typedef ilist_traits<NodeTy> Traits;
 private:
   pointer NodePtr;
 
@@ -248,22 +254,24 @@ void operator+(ilist_iterator<T>,int) = delete;
 
 // operator!=/operator== - Allow mixed comparisons without dereferencing
 // the iterator, which could very likely be pointing to end().
-template<typename T>
-bool operator!=(const T* LHS, const ilist_iterator<const T> &RHS) {
+// HLSL Change Begin: Support for C++20
+template<typename T, typename U>
+bool operator!=(const T* LHS, const ilist_iterator<const U> &RHS) {
   return LHS != RHS.getNodePtrUnchecked();
 }
-template<typename T>
-bool operator==(const T* LHS, const ilist_iterator<const T> &RHS) {
+template<typename T, typename U>
+bool operator==(const T* LHS, const ilist_iterator<const U> &RHS) {
   return LHS == RHS.getNodePtrUnchecked();
 }
-template<typename T>
-bool operator!=(T* LHS, const ilist_iterator<T> &RHS) {
+template<typename T, typename U>
+bool operator!=(T* LHS, const ilist_iterator<U> &RHS) {
   return LHS != RHS.getNodePtrUnchecked();
 }
-template<typename T>
-bool operator==(T* LHS, const ilist_iterator<T> &RHS) {
+template<typename T, typename U>
+bool operator==(T* LHS, const ilist_iterator<U> &RHS) {
   return LHS == RHS.getNodePtrUnchecked();
 }
+// HLSL Change End
 
 
 // Allow ilist_iterators to convert into pointers to a node automatically when
@@ -347,7 +355,16 @@ public:
   typedef std::reverse_iterator<const_iterator>  const_reverse_iterator;
   typedef std::reverse_iterator<iterator>  reverse_iterator;
 
+  // Default constructor. Relies on base classes to create and manage
+  // the lifetime of the sentinel.
   iplist() : Head(this->provideInitialHead()) {}
+  // HLSL Change Starts
+  // Construct with a sentinel object, and take ownership of the sentinel.
+  iplist(std::unique_ptr<NodeTy> initial_head) : Head(initial_head.get()) {
+    // Transfer ownership to the sentinel traits base class implementation.
+    this->setSentinel(std::move(initial_head));
+  }
+  // HLSL Change Ends
   ~iplist() {
     if (!Head) return;
     clear();

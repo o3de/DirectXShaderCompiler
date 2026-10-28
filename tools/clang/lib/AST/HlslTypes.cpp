@@ -13,13 +13,16 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
+#include "clang/AST/HlslTypes.h"
+#include "dxc/DXIL/DxilNodeProps.h"
+#include "dxc/DXIL/DxilSemantic.h"
 #include "dxc/Support/Global.h"
+#include "clang/AST/ASTContext.h"
 #include "clang/AST/CanonicalType.h"
 #include "clang/AST/DeclTemplate.h"
-#include "clang/AST/HlslTypes.h"
 #include "clang/AST/Type.h"
 #include "clang/Sema/AttributeList.h" // conceptually ParsedAttributes
-#include "clang/AST/ASTContext.h"
+#include "llvm/ADT/StringSwitch.h"
 
 using namespace clang;
 
@@ -50,44 +53,33 @@ ConvertHLSLVecMatTypeToExtVectorType(const clang::ASTContext &context,
   return nullptr;
 }
 
-bool IsHLSLVecMatType(clang::QualType type) {
-  const Type *Ty = type.getCanonicalType().getTypePtr();
-  if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
-      if (templateDecl->getName() == "vector") {
-        return true;
-      } else if (templateDecl->getName() == "matrix") {
-        return true;
-      }
-    }
+template <typename AttrType> static AttrType *getAttr(clang::QualType type) {
+  type = type.getCanonicalType();
+  if (const RecordType *RT = type->getAs<RecordType>()) {
+    if (const auto *Spec =
+            dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl()))
+      if (const auto *Template =
+              dyn_cast<ClassTemplateDecl>(Spec->getSpecializedTemplate()))
+        return Template->getTemplatedDecl()->getAttr<AttrType>();
+    if (const auto *Decl = dyn_cast<CXXRecordDecl>(RT->getDecl()))
+      return Decl->getAttr<AttrType>();
   }
-  return false;
+  return nullptr;
+}
+
+bool IsHLSLVecMatType(clang::QualType type) {
+  return getAttr<HLSLMatrixAttr>(type) || getAttr<HLSLVectorAttr>(type);
 }
 
 bool IsHLSLMatType(clang::QualType type) {
-  const clang::Type *Ty = type.getCanonicalType().getTypePtr();
-  if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
-      if (templateDecl->getName() == "matrix") {
-        return true;
-      }
-    }
-  }
+  if (getAttr<HLSLMatrixAttr>(type))
+    return true;
   return false;
 }
 
 bool IsHLSLVecType(clang::QualType type) {
-  const clang::Type *Ty = type.getCanonicalType().getTypePtr();
-  if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
-      if (templateDecl->getName() == "vector") {
-        return true;
-      }
-    }
-  }
+  if (getAttr<HLSLVectorAttr>(type))
+    return true;
   return false;
 }
 
@@ -96,34 +88,57 @@ bool IsHLSLNumericOrAggregateOfNumericType(clang::QualType type) {
   if (isa<RecordType>(Ty)) {
     if (IsHLSLVecMatType(type))
       return true;
-    return IsHLSLNumericUserDefinedType(type);
+    return IsHLSLCopyableAnnotatableRecord(type);
   } else if (type->isArrayType()) {
-    return IsHLSLNumericOrAggregateOfNumericType(QualType(type->getArrayElementTypeNoTypeQual(), 0));
+    return IsHLSLNumericOrAggregateOfNumericType(
+        QualType(type->getArrayElementTypeNoTypeQual(), 0));
+  } else if (type->isEnumeralType()) {
+    return true;
   }
 
   // Chars can only appear as part of strings, which we don't consider numeric.
-  const BuiltinType* BuiltinTy = dyn_cast<BuiltinType>(Ty);
-  return BuiltinTy != nullptr && BuiltinTy->getKind() != BuiltinType::Kind::Char_S;
+  const BuiltinType *BuiltinTy = dyn_cast<BuiltinType>(Ty);
+  return BuiltinTy != nullptr &&
+         BuiltinTy->getKind() != BuiltinType::Kind::Char_S;
 }
 
-bool IsHLSLNumericUserDefinedType(clang::QualType type) {
-  const clang::Type *Ty = type.getCanonicalType().getTypePtr();
+// In some cases we need record types that are annotatable and trivially
+// copyable from outside the shader. This excludes resource types which may be
+// trivially copyable inside the shader, and builtin matrix and vector types
+// which can't be annotated. But includes UDTs of trivially copyable data and
+// the builtin trivially copyable raytracing structs.
+bool IsHLSLCopyableAnnotatableRecord(clang::QualType QT) {
+  assert(!QT->isIncompleteType() && "Type must be complete!");
+  const clang::Type *Ty = QT.getCanonicalType().getTypePtr();
   if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
     const RecordDecl *RD = RT->getDecl();
-    if (isa<ClassTemplateSpecializationDecl>(RD)) {
-      return false;   // UDT are not templates
-    }
-    // TODO: avoid check by name
-    StringRef name = RD->getName();
-    if (name == "ByteAddressBuffer" ||
-        name == "RWByteAddressBuffer" ||
-        name == "RaytracingAccelerationStructure")
+    if (!IsUserDefinedRecordType(QT))
       return false;
-    for (auto member : RD->fields()) {
-      if (!IsHLSLNumericOrAggregateOfNumericType(member->getType()))
+    for (auto Member : RD->fields()) {
+      if (!IsHLSLNumericOrAggregateOfNumericType(Member->getType()))
         return false;
     }
+    if (auto *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
+      // Walk up the inheritance chain and check base class fields
+      for (const auto &Base : CXXRD->bases()) {
+        if (!IsHLSLCopyableAnnotatableRecord(Base.getType()))
+          return false;
+      }
+    }
     return true;
+  }
+  return false;
+}
+
+bool IsHLSLBuiltinRayAttributeStruct(clang::QualType QT) {
+  QT = QT.getCanonicalType();
+  const clang::Type *Ty = QT.getTypePtr();
+  if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
+    const RecordDecl *RD = RT->getDecl();
+    if (RD->getName() == "BuiltInTriangleIntersectionAttributes" ||
+        RD->getName() == "RayDesc" ||
+        RD->getName() == "BuiltInTrianglePositions")
+      return true;
   }
   return false;
 }
@@ -131,24 +146,31 @@ bool IsHLSLNumericUserDefinedType(clang::QualType type) {
 // Aggregate types are arrays and user-defined structs
 bool IsHLSLAggregateType(clang::QualType type) {
   type = type.getCanonicalType();
-  if (isa<clang::ArrayType>(type)) return true;
+  if (isa<clang::ArrayType>(type))
+    return true;
 
-  const RecordType *Record = dyn_cast<RecordType>(type);
-  return Record != nullptr
-    && !IsHLSLVecMatType(type) && !IsHLSLResourceType(type)
-    && !dyn_cast<ClassTemplateSpecializationDecl>(Record->getAsCXXRecordDecl());
+  return IsUserDefinedRecordType(type);
+}
+
+bool GetHLSLNodeIORecordType(const ParmVarDecl *parmDecl, NodeFlags &nodeKind) {
+  clang::QualType paramTy = parmDecl->getType().getCanonicalType();
+
+  if (auto arrayType = dyn_cast<ConstantArrayType>(paramTy))
+    paramTy = arrayType->getElementType();
+
+  nodeKind = NodeFlags(GetNodeIOType(paramTy));
+  return nodeKind.IsValidNodeKind();
 }
 
 clang::QualType GetElementTypeOrType(clang::QualType type) {
   if (const RecordType *RT = type->getAs<RecordType>()) {
     if (const ClassTemplateSpecializationDecl *templateDecl =
-      dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
+            dyn_cast<ClassTemplateSpecializationDecl>(RT->getDecl())) {
       // TODO: check pointer instead of name
       if (templateDecl->getName() == "vector") {
         const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
         return argList[0].getAsType();
-      }
-      else if (templateDecl->getName() == "matrix") {
+      } else if (templateDecl->getName() == "matrix") {
         const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
         return argList[0].getAsType();
       }
@@ -163,13 +185,16 @@ bool HasHLSLMatOrientation(clang::QualType type, bool *pIsRowMajor) {
     AttributedType::Kind kind = AT->getAttrKind();
     switch (kind) {
     case AttributedType::attr_hlsl_row_major:
-      if (pIsRowMajor) *pIsRowMajor = true;
+      if (pIsRowMajor)
+        *pIsRowMajor = true;
       return true;
     case AttributedType::attr_hlsl_column_major:
-      if (pIsRowMajor) *pIsRowMajor = false;
+      if (pIsRowMajor)
+        *pIsRowMajor = false;
       return true;
     }
-    AT = AT->getLocallyUnqualifiedSingleStepDesugaredType()->getAs<AttributedType>();
+    AT = AT->getLocallyUnqualifiedSingleStepDesugaredType()
+             ->getAs<AttributedType>();
   }
   return false;
 }
@@ -194,6 +219,22 @@ bool IsHLSLUnsigned(clang::QualType type) {
   return type->isUnsignedIntegerType();
 }
 
+bool IsHLSLMinPrecision(clang::QualType Ty) {
+  Ty = Ty.getCanonicalType().getNonReferenceType();
+  if (auto BT = Ty->getAs<clang::BuiltinType>()) {
+    switch (BT->getKind()) {
+    case clang::BuiltinType::Min12Int:
+    case clang::BuiltinType::Min16Int:
+    case clang::BuiltinType::Min16UInt:
+    case clang::BuiltinType::Min16Float:
+    case clang::BuiltinType::Min10Float:
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool HasHLSLUNormSNorm(clang::QualType type, bool *pIsSNorm) {
   // snorm/unorm can be on outer vector/matrix as well as element type
   // in the template form.  Outer-most type attribute wins.
@@ -208,13 +249,16 @@ bool HasHLSLUNormSNorm(clang::QualType type, bool *pIsSNorm) {
       AttributedType::Kind kind = AT->getAttrKind();
       switch (kind) {
       case AttributedType::attr_hlsl_snorm:
-        if (pIsSNorm) *pIsSNorm = true;
+        if (pIsSNorm)
+          *pIsSNorm = true;
         return true;
       case AttributedType::attr_hlsl_unorm:
-        if (pIsSNorm) *pIsSNorm = false;
+        if (pIsSNorm)
+          *pIsSNorm = false;
         return true;
       }
-      AT = AT->getLocallyUnqualifiedSingleStepDesugaredType()->getAs<AttributedType>();
+      AT = AT->getLocallyUnqualifiedSingleStepDesugaredType()
+               ->getAs<AttributedType>();
     }
     if (type == elementType)
       break;
@@ -237,10 +281,24 @@ bool HasHLSLGloballyCoherent(clang::QualType type) {
   return false;
 }
 
+bool HasHLSLReorderCoherent(clang::QualType type) {
+  const AttributedType *AT = type->getAs<AttributedType>();
+  while (AT) {
+    AttributedType::Kind kind = AT->getAttrKind();
+    if (kind == AttributedType::attr_hlsl_reordercoherent)
+      return true;
+    AT = AT->getLocallyUnqualifiedSingleStepDesugaredType()
+             ->getAs<AttributedType>();
+  }
+  return false;
+}
+
+/// Checks whether the pAttributes indicate a parameter is groupshared
+bool IsParamAttributedAsGroupShared(clang::AttributeList *pAttributes);
+
 /// Checks whether the pAttributes indicate a parameter is inout or out; if
 /// inout, pIsIn will be set to true.
-bool IsParamAttributedAsOut(_In_opt_ clang::AttributeList *pAttributes,
-  _Out_opt_ bool *pIsIn);
+bool IsParamAttributedAsOut(clang::AttributeList *pAttributes, bool *pIsIn);
 
 /// <summary>Gets the type with structural information (elements and shape) for
 /// the given type.</summary>
@@ -258,7 +316,8 @@ QualType GetStructuralForm(QualType type) {
     type = RefType ? RefType->getPointeeType() : AttrType->getEquivalentType();
   }
 
-  // Despite its name, getCanonicalTypeUnqualified will preserve const for array elements or something
+  // Despite its name, getCanonicalTypeUnqualified will preserve const for array
+  // elements or something
   return QualType(type->getCanonicalTypeUnqualified()->getTypePtr(), 0);
 }
 
@@ -328,7 +387,8 @@ void GetRowsAndCols(clang::QualType type, uint32_t &rowCount,
 
 bool IsArrayConstantStringType(const QualType type) {
   DXASSERT_NOMSG(type->isArrayType());
-  return type->getArrayElementTypeNoTypeQual()->isSpecificBuiltinType(BuiltinType::Char_S);
+  return type->getArrayElementTypeNoTypeQual()->isSpecificBuiltinType(
+      BuiltinType::Char_S);
 }
 
 bool IsPointerStringType(const QualType type) {
@@ -424,141 +484,134 @@ clang::QualType GetHLSLMatElementType(clang::QualType type) {
   QualType elemTy = arg0.getAsType();
   return elemTy;
 }
+
 // TODO: Add type cache to ASTContext.
 bool IsHLSLInputPatchType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "InputPatch") {
-        return true;
-      }
-    }
-  }
+  if (const HLSLTessPatchAttr *Attr = getAttr<HLSLTessPatchAttr>(type))
+    return Attr->getIsInput();
   return false;
 }
+
 bool IsHLSLOutputPatchType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "OutputPatch") {
-        return true;
-      }
-    }
-  }
+  if (const HLSLTessPatchAttr *Attr = getAttr<HLSLTessPatchAttr>(type))
+    return !Attr->getIsInput();
   return false;
 }
+
 bool IsHLSLPointStreamType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "PointStream")
-        return true;
-    }
-  }
+  if (const HLSLStreamOutputAttr *Attr = getAttr<HLSLStreamOutputAttr>(type))
+    return Attr->getPrimVertices() == (unsigned)DXIL::InputPrimitive::Point;
   return false;
 }
+
 bool IsHLSLLineStreamType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "LineStream")
-        return true;
-    }
-  }
+  if (const HLSLStreamOutputAttr *Attr = getAttr<HLSLStreamOutputAttr>(type))
+    return Attr->getPrimVertices() == (unsigned)DXIL::InputPrimitive::Line;
   return false;
 }
+
 bool IsHLSLTriangleStreamType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "TriangleStream")
-        return true;
-    }
-  }
+  if (const HLSLStreamOutputAttr *Attr = getAttr<HLSLStreamOutputAttr>(type))
+    return Attr->getPrimVertices() == (unsigned)DXIL::InputPrimitive::Triangle;
   return false;
 }
+
 bool IsHLSLStreamOutputType(QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      if (templateDecl->getName() == "PointStream")
-        return true;
-      if (templateDecl->getName() == "LineStream")
-        return true;
-      if (templateDecl->getName() == "TriangleStream")
-        return true;
-    }
-  }
+  if (getAttr<HLSLStreamOutputAttr>(type))
+    return true;
   return false;
 }
+
 bool IsHLSLResourceType(clang::QualType type) {
-  if (const RecordType *RT = type->getAs<RecordType>()) {
-    StringRef name = RT->getDecl()->getName();
-    if (name == "Texture1D" || name == "RWTexture1D")
-      return true;
-    if (name == "Texture2D" || name == "RWTexture2D")
-      return true;
-    if (name == "Texture2DMS" || name == "RWTexture2DMS")
-      return true;
-    if (name == "Texture3D" || name == "RWTexture3D")
-      return true;
-    if (name == "TextureCube" || name == "RWTextureCube")
-      return true;
-
-    if (name == "Texture1DArray" || name == "RWTexture1DArray")
-      return true;
-    if (name == "Texture2DArray" || name == "RWTexture2DArray")
-      return true;
-    if (name == "Texture2DMSArray" || name == "RWTexture2DMSArray")
-      return true;
-    if (name == "TextureCubeArray" || name == "RWTextureCubeArray")
-      return true;
-
-    if (name == "FeedbackTexture2D" || name == "FeedbackTexture2DArray")
-      return true;
-
-    if (name == "ByteAddressBuffer" || name == "RWByteAddressBuffer")
-      return true;
-
-    if (name == "StructuredBuffer" || name == "RWStructuredBuffer")
-      return true;
-
-    if (name == "AppendStructuredBuffer" || name == "ConsumeStructuredBuffer")
-      return true;
-
-    if (name == "Buffer" || name == "RWBuffer")
-      return true;
-
-    if (name == "SamplerState" || name == "SamplerComparisonState")
-      return true;
-
-    if (name == "ConstantBuffer" || name == "TextureBuffer")
-      return true;
-
-    if (name == "RaytracingAccelerationStructure")
-      return true;
-  }
+  if (getAttr<HLSLResourceAttr>(type))
+    return true;
   return false;
 }
 
-bool IsHLSLBufferViewType(clang::QualType type) {
-  if (const RecordType *RT = type->getAs<RecordType>()) {
-    StringRef name = RT->getDecl()->getName();
-    if (name == "ConstantBuffer" || name == "TextureBuffer")
-      return true;
-  }
+bool IsHLSLHitObjectType(QualType type) {
+  return nullptr != getAttr<HLSLHitObjectAttr>(type);
+}
+
+DXIL::NodeIOKind GetNodeIOType(clang::QualType type) {
+  if (const HLSLNodeObjectAttr *Attr = getAttr<HLSLNodeObjectAttr>(type))
+    return Attr->getNodeIOType();
+  return DXIL::NodeIOKind::Invalid;
+}
+
+bool IsHLSLNodeInputType(clang::QualType type) {
+  return (static_cast<uint32_t>(GetNodeIOType(type)) &
+          static_cast<uint32_t>(DXIL::NodeIOFlags::Input)) != 0;
+}
+
+bool IsHLSLDynamicResourceType(clang::QualType type) {
+  if (const HLSLDynamicResourceAttr *Attr =
+          getAttr<HLSLDynamicResourceAttr>(type))
+    return !Attr->getIsSampler();
+  return false;
+}
+
+bool IsHLSLDynamicSamplerType(clang::QualType type) {
+  if (const HLSLDynamicResourceAttr *Attr =
+          getAttr<HLSLDynamicResourceAttr>(type))
+    return Attr->getIsSampler();
+  return false;
+}
+
+bool IsHLSLNodeType(clang::QualType type) {
+  if (const HLSLNodeObjectAttr *Attr = getAttr<HLSLNodeObjectAttr>(type))
+    return true;
+  return false;
+}
+
+bool IsHLSLObjectWithImplicitMemberAccess(clang::QualType type) {
+  if (const HLSLResourceAttr *Attr = getAttr<HLSLResourceAttr>(type))
+    return DXIL::IsCTBuffer(Attr->getResKind());
+  return false;
+}
+
+bool IsHLSLObjectWithImplicitROMemberAccess(clang::QualType type) {
+  if (const HLSLResourceAttr *Attr = getAttr<HLSLResourceAttr>(type))
+    return DXIL::IsCTBuffer(Attr->getResKind());
+  return false;
+}
+
+bool IsHLSLRWNodeInputRecordType(clang::QualType type) {
+  return (static_cast<uint32_t>(GetNodeIOType(type)) &
+          (static_cast<uint32_t>(DXIL::NodeIOFlags::ReadWrite) |
+           static_cast<uint32_t>(DXIL::NodeIOFlags::Input))) ==
+         (static_cast<uint32_t>(DXIL::NodeIOFlags::ReadWrite) |
+          static_cast<uint32_t>(DXIL::NodeIOFlags::Input));
+}
+
+bool IsHLSLRONodeInputRecordType(clang::QualType type) {
+  return (static_cast<uint32_t>(GetNodeIOType(type)) &
+          (static_cast<uint32_t>(DXIL::NodeIOFlags::ReadWrite) |
+           static_cast<uint32_t>(DXIL::NodeIOFlags::Input))) ==
+         static_cast<uint32_t>(DXIL::NodeIOFlags::Input);
+}
+
+bool IsHLSLDispatchNodeInputRecordType(clang::QualType type) {
+  return IsHLSLNodeInputType(type) &&
+         (static_cast<uint32_t>(GetNodeIOType(type)) &
+          static_cast<uint32_t>(DXIL::NodeIOFlags::DispatchRecord)) != 0;
+}
+
+bool IsHLSLNodeOutputType(clang::QualType type) {
+  return (static_cast<uint32_t>(GetNodeIOType(type)) &
+          (static_cast<uint32_t>(DXIL::NodeIOFlags::Output) |
+           static_cast<uint32_t>(DXIL::NodeIOFlags::RecordGranularityMask))) ==
+         static_cast<uint32_t>(DXIL::NodeIOFlags::Output);
+}
+
+bool IsHLSLEmptyNodeRecordType(clang::QualType type) {
+  return (static_cast<uint32_t>(GetNodeIOType(type)) &
+          static_cast<uint32_t>(DXIL::NodeIOFlags::EmptyRecord)) ==
+         static_cast<uint32_t>(DXIL::NodeIOFlags::EmptyRecord);
+}
+
+bool IsHLSLStructuredBufferType(clang::QualType type) {
+  if (const HLSLResourceAttr *Attr = getAttr<HLSLResourceAttr>(type))
+    return Attr->getResKind() == DXIL::ResourceKind::StructuredBuffer;
   return false;
 }
 
@@ -568,80 +621,209 @@ bool IsHLSLSubobjectType(clang::QualType type) {
   return GetHLSLSubobjectKind(type, kind, hgType);
 }
 
-bool GetHLSLSubobjectKind(clang::QualType type, DXIL::SubobjectKind &subobjectKind, DXIL::HitGroupType &hgType) {
-  hgType = (DXIL::HitGroupType)(-1);
-  type = type.getCanonicalType();
-  if (const RecordType *RT = type->getAs<RecordType>()) {
-    StringRef name = RT->getDecl()->getName();
-    switch (name.size()) {
-    case 17:
-      return name == "StateObjectConfig" ? (subobjectKind = DXIL::SubobjectKind::StateObjectConfig, true) : false;
-    case 18:
-      return name == "LocalRootSignature" ? (subobjectKind = DXIL::SubobjectKind::LocalRootSignature, true) : false;
-    case 19:
-      return name == "GlobalRootSignature" ? (subobjectKind = DXIL::SubobjectKind::GlobalRootSignature, true) : false;
-    case 29:
-      return name == "SubobjectToExportsAssociation" ? (subobjectKind = DXIL::SubobjectKind::SubobjectToExportsAssociation, true) : false;
-    case 22:
-      return name == "RaytracingShaderConfig" ? (subobjectKind = DXIL::SubobjectKind::RaytracingShaderConfig, true) : false;
-    case 24:
-      return name == "RaytracingPipelineConfig" ? (subobjectKind = DXIL::SubobjectKind::RaytracingPipelineConfig, true) : false;
-    case 25:
-      return name == "RaytracingPipelineConfig1" ? (subobjectKind = DXIL::SubobjectKind::RaytracingPipelineConfig1, true) : false;
-    case 16:
-      if (name == "TriangleHitGroup") {
-        subobjectKind = DXIL::SubobjectKind::HitGroup;
-        hgType = DXIL::HitGroupType::Triangle;
-        return true;
-      }
+bool IsUserDefinedRecordType(clang::QualType QT) {
+  const clang::Type *Ty = QT.getCanonicalType().getTypePtr();
+  if (const RecordType *RT = dyn_cast<RecordType>(Ty)) {
+    const RecordDecl *RD = RT->getDecl();
+    // Built-in ray tracing struct types are considered user defined types.
+    if (RD->isImplicit() && !IsHLSLBuiltinRayAttributeStruct(QT))
       return false;
-    case 27:
-      if (name == "ProceduralPrimitiveHitGroup") {
-        subobjectKind = DXIL::SubobjectKind::HitGroup;
-        hgType = DXIL::HitGroupType::ProceduralPrimitive;
+    if (auto TD = dyn_cast<ClassTemplateSpecializationDecl>(RD))
+      if (TD->getSpecializedTemplate()->isImplicit())
+        return false;
+    return true;
+  }
+  return false;
+}
+
+static bool HasTessFactorSemantic(const ValueDecl *decl) {
+  for (const UnusualAnnotation *it : decl->getUnusualAnnotations()) {
+    if (it->getKind() == UnusualAnnotation::UA_SemanticDecl) {
+      const SemanticDecl *sd = cast<SemanticDecl>(it);
+      StringRef semanticName;
+      unsigned int index = 0;
+      Semantic::DecomposeNameAndIndex(sd->SemanticName, &semanticName, &index);
+      const hlsl::Semantic *pSemantic = hlsl::Semantic::GetByName(semanticName);
+      if (pSemantic && pSemantic->GetKind() == hlsl::Semantic::Kind::TessFactor)
         return true;
-      }
-      return false;
     }
   }
   return false;
 }
 
-bool IsHLSLRayQueryType(clang::QualType type) {
-  type = type.getCanonicalType();
-  if (const RecordType *RT = dyn_cast<RecordType>(type)) {
-    if (const ClassTemplateSpecializationDecl *templateDecl =
-            dyn_cast<ClassTemplateSpecializationDecl>(
-                RT->getAsCXXRecordDecl())) {
-      StringRef name = templateDecl->getName();
-      if (name == "RayQuery")
+static bool HasTessFactorSemanticRecurse(const ValueDecl *decl, QualType Ty) {
+  if (Ty->isBuiltinType() || hlsl::IsHLSLVecMatType(Ty))
+    return false;
+
+  if (const RecordType *RT = Ty->getAs<RecordType>()) {
+    RecordDecl *RD = RT->getDecl();
+    for (FieldDecl *fieldDecl : RD->fields()) {
+      if (HasTessFactorSemanticRecurse(fieldDecl, fieldDecl->getType()))
+        return true;
+    }
+    return false;
+  }
+
+  if (Ty->getAsArrayTypeUnsafe())
+    return HasTessFactorSemantic(decl);
+
+  return false;
+}
+
+bool IsPatchConstantFunctionDecl(const clang::FunctionDecl *FD) {
+  // This checks whether the function is structurally capable of being a patch
+  // constant function, not whether it is in fact the patch constant function
+  // for the entry point of a compiled hull shader (which may not have been
+  // seen yet). So the answer is conservative.
+  if (!FD->getReturnType()->isVoidType()) {
+    // Try to find TessFactor in return type.
+    if (HasTessFactorSemanticRecurse(FD, FD->getReturnType()))
+      return true;
+  }
+  // Try to find TessFactor in out param.
+  for (const ParmVarDecl *param : FD->params()) {
+    if (param->hasAttr<HLSLOutAttr>()) {
+      if (HasTessFactorSemanticRecurse(param, param->getType()))
         return true;
     }
   }
   return false;
 }
+
+bool DoesTypeDefineOverloadedOperator(clang::QualType typeWithOperator,
+                                      clang::OverloadedOperatorKind opc,
+                                      clang::QualType paramType) {
+  if (const RecordType *recordType = typeWithOperator->getAs<RecordType>()) {
+    if (const CXXRecordDecl *cxxRecordDecl =
+            dyn_cast<CXXRecordDecl>(recordType->getDecl())) {
+      for (const auto *method : cxxRecordDecl->methods()) {
+        if (!method->isUserProvided() || method->getNumParams() != 1)
+          continue;
+        // It must be an implicit assignment.
+        if (opc == OO_Equal &&
+            typeWithOperator != method->getParamDecl(0)->getOriginalType() &&
+            typeWithOperator == paramType) {
+          continue;
+        }
+        if (method->getOverloadedOperator() == opc)
+          return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool GetHLSLSubobjectKind(clang::QualType type,
+                          DXIL::SubobjectKind &subobjectKind,
+                          DXIL::HitGroupType &hgType) {
+  type = type.getCanonicalType();
+  if (const RecordType *RT = type->getAs<RecordType>()) {
+    RecordDecl *RD = RT->getDecl();
+    if (!RD->hasAttr<HLSLSubObjectAttr>()) {
+      return false;
+    }
+
+    HLSLSubObjectAttr *Attr = RD->getAttr<HLSLSubObjectAttr>();
+    subobjectKind = static_cast<DXIL::SubobjectKind>(Attr->getSubObjKindUint());
+    hgType = static_cast<DXIL::HitGroupType>(Attr->getHitGroupType());
+    if (subobjectKind == DXIL::SubobjectKind::HitGroup)
+      DXASSERT(DXIL::IsValidHitGroupType(hgType), "invalid hit group type");
+
+    return true;
+  }
+  return false;
+}
+
+clang::RecordDecl *GetRecordDeclFromNodeObjectType(clang::QualType ObjectTy) {
+  ObjectTy = ObjectTy.getCanonicalType();
+  DXASSERT(IsHLSLNodeType(ObjectTy), "Expected Node Object type");
+  if (const CXXRecordDecl *CXXRD = ObjectTy->getAsCXXRecordDecl()) {
+
+    if (const ClassTemplateSpecializationDecl *templateDecl =
+            dyn_cast<ClassTemplateSpecializationDecl>(CXXRD)) {
+
+      auto &TemplateArgs = templateDecl->getTemplateArgs();
+      clang::QualType RecType = TemplateArgs[0].getAsType();
+      if (const RecordType *RT = RecType->getAs<RecordType>())
+        return RT->getDecl();
+    }
+  }
+
+  return nullptr;
+}
+
+bool IsHLSLRayQueryType(clang::QualType type) {
+  return nullptr != getAttr<HLSLRayQueryObjectAttr>(type);
+}
+
+#ifdef ENABLE_SPIRV_CODEGEN
+static llvm::Optional<std::pair<clang::QualType, unsigned>>
+MaybeGetVKBufferPointerParams(clang::QualType type) {
+  const RecordType *RT = dyn_cast<RecordType>(type.getCanonicalType());
+  if (!RT)
+    return llvm::None;
+
+  const ClassTemplateSpecializationDecl *templateDecl =
+      dyn_cast<ClassTemplateSpecializationDecl>(RT->getAsCXXRecordDecl());
+  if (!templateDecl || !templateDecl->getName().equals("BufferPointer"))
+    return llvm::None;
+
+  auto *namespaceDecl =
+      dyn_cast_or_null<NamespaceDecl>(templateDecl->getDeclContext());
+  if (!namespaceDecl || !namespaceDecl->getName().equals("vk"))
+    return llvm::None;
+
+  const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
+  QualType bufferType = argList[0].getAsType();
+  unsigned align =
+      argList.size() > 1 ? argList[1].getAsIntegral().getLimitedValue() : 0;
+  return std::make_pair(bufferType, align);
+}
+
+bool IsVKBufferPointerType(clang::QualType type) {
+  return MaybeGetVKBufferPointerParams(type).hasValue();
+}
+
+QualType GetVKBufferPointerBufferType(clang::QualType type) {
+  auto bpParams = MaybeGetVKBufferPointerParams(type);
+  assert(bpParams.hasValue() &&
+         "cannot get pointer type for type that is not a vk::BufferPointer");
+  return bpParams.getValue().first;
+}
+
+unsigned GetVKBufferPointerAlignment(clang::QualType type) {
+  auto bpParams = MaybeGetVKBufferPointerParams(type);
+  assert(
+      bpParams.hasValue() &&
+      "cannot get pointer alignment for type that is not a vk::BufferPointer");
+  return bpParams.getValue().second;
+}
+#endif
 
 QualType GetHLSLResourceResultType(QualType type) {
   // Don't canonicalize the type as to not lose snorm in Buffer<snorm float>
   const RecordType *RT = type->getAs<RecordType>();
-  const RecordDecl* RD = RT->getDecl();
+  const RecordDecl *RD = RT->getDecl();
 
   if (const ClassTemplateSpecializationDecl *templateDecl =
-    dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
-    
-    if (RD->getName().startswith("FeedbackTexture")) {
+          dyn_cast<ClassTemplateSpecializationDecl>(RD)) {
+
+    const HLSLResourceAttr *Attr = getAttr<HLSLResourceAttr>(type);
+    if (Attr && DXIL::IsFeedbackTexture(Attr->getResKind())) {
       // Feedback textures are write-only and the data is opaque,
       // so there is no result type per se.
       return {};
     }
-    
+
     // Type-templated resource types
 
-    // Prefer getting the template argument from the TemplateSpecializationType sugar,
-    // since this preserves 'snorm' from 'Buffer<snorm float>' which is lost on the
-    // ClassTemplateSpecializationDecl since it's considered type sugar.
-    const TemplateArgument* templateArg = &templateDecl->getTemplateArgs()[0];
-    if (const TemplateSpecializationType *specializationType = type->getAs<TemplateSpecializationType>()) {
+    // Prefer getting the template argument from the TemplateSpecializationType
+    // sugar, since this preserves 'snorm' from 'Buffer<snorm float>' which is
+    // lost on the ClassTemplateSpecializationDecl since it's considered type
+    // sugar.
+    const TemplateArgument *templateArg = &templateDecl->getTemplateArgs()[0];
+    if (const TemplateSpecializationType *specializationType =
+            type->getAs<TemplateSpecializationType>()) {
       if (specializationType->getNumArgs() >= 1) {
         templateArg = &specializationType->getArg(0);
       }
@@ -653,28 +835,54 @@ QualType GetHLSLResourceResultType(QualType type) {
 
   // Non-type-templated resource types like [RW][RasterOrder]ByteAddressBuffer
   // Get the result type from handle field.
-  FieldDecl* HandleFieldDecl = *(RD->field_begin());
-  DXASSERT(HandleFieldDecl->getName() == "h", "Resource must have a handle field");
+  FieldDecl *HandleFieldDecl = *(RD->field_begin());
+  DXASSERT(HandleFieldDecl->getName() == "h",
+           "Resource must have a handle field");
   return HandleFieldDecl->getType();
 }
 
+QualType GetHLSLNodeIOResultType(ASTContext &astContext, QualType type) {
+  if (hlsl::IsHLSLEmptyNodeRecordType(type)) {
+    RecordDecl *RD = astContext.buildImplicitRecord("");
+    RD->startDefinition();
+    RD->completeDefinition();
+    return astContext.getRecordType(RD);
+  } else if (hlsl::IsHLSLNodeType(type)) {
+    const RecordType *recordType = type->getAs<RecordType>();
+    if (const auto *templateDecl =
+            dyn_cast<ClassTemplateSpecializationDecl>(recordType->getDecl())) {
+      const auto &templateArgs = templateDecl->getTemplateArgs();
+      return templateArgs[0].getAsType();
+    }
+  }
+  return type;
+}
+
 unsigned GetHLSLResourceTemplateUInt(clang::QualType type) {
-  const ClassTemplateSpecializationDecl* templateDecl = cast<ClassTemplateSpecializationDecl>(
-    type->castAs<RecordType>()->getDecl());
-  return (unsigned)templateDecl->getTemplateArgs()[0].getAsIntegral().getZExtValue();
+  const ClassTemplateSpecializationDecl *templateDecl =
+      cast<ClassTemplateSpecializationDecl>(
+          type->castAs<RecordType>()->getDecl());
+  return (unsigned)templateDecl->getTemplateArgs()[0]
+      .getAsIntegral()
+      .getZExtValue();
 }
 
 bool IsIncompleteHLSLResourceArrayType(clang::ASTContext &context,
                                        clang::QualType type) {
   if (type->isIncompleteArrayType()) {
     const IncompleteArrayType *IAT = context.getAsIncompleteArrayType(type);
-    QualType EltTy = IAT->getElementType();
-    if (IsHLSLResourceType(EltTy))
-      return true;
+    type = IAT->getElementType();
   }
+
+  while (type->isArrayType())
+    type = cast<ArrayType>(type)->getElementType();
+
+  if (IsHLSLResourceType(type))
+    return true;
   return false;
 }
-QualType GetHLSLInputPatchElementType(QualType type) {
+
+QualType GetHLSLResourceTemplateParamType(QualType type) {
   type = type.getCanonicalType();
   const RecordType *RT = cast<RecordType>(type);
   const ClassTemplateSpecializationDecl *templateDecl =
@@ -682,6 +890,11 @@ QualType GetHLSLInputPatchElementType(QualType type) {
   const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
   return argList[0].getAsType();
 }
+
+QualType GetHLSLInputPatchElementType(QualType type) {
+  return GetHLSLResourceTemplateParamType(type);
+}
+
 unsigned GetHLSLInputPatchCount(QualType type) {
   type = type.getCanonicalType();
   const RecordType *RT = cast<RecordType>(type);
@@ -691,12 +904,7 @@ unsigned GetHLSLInputPatchCount(QualType type) {
   return argList[1].getAsIntegral().getLimitedValue();
 }
 clang::QualType GetHLSLOutputPatchElementType(QualType type) {
-  type = type.getCanonicalType();
-  const RecordType *RT = cast<RecordType>(type);
-  const ClassTemplateSpecializationDecl *templateDecl =
-      cast<ClassTemplateSpecializationDecl>(RT->getAsCXXRecordDecl());
-  const TemplateArgumentList &argList = templateDecl->getTemplateArgs();
-  return argList[0].getAsType();
+  return GetHLSLResourceTemplateParamType(type);
 }
 unsigned GetHLSLOutputPatchCount(QualType type) {
   type = type.getCanonicalType();
@@ -707,7 +915,15 @@ unsigned GetHLSLOutputPatchCount(QualType type) {
   return argList[1].getAsIntegral().getLimitedValue();
 }
 
-_Use_decl_annotations_
+bool IsParamAttributedAsGroupShared(clang::AttributeList *pAttributes) {
+  while (pAttributes != nullptr) {
+    if (pAttributes->getKind() == AttributeList::AT_HLSLGroupShared)
+      return true;
+    pAttributes = pAttributes->getNext();
+  }
+  return false;
+}
+
 bool IsParamAttributedAsOut(clang::AttributeList *pAttributes, bool *pIsIn) {
   bool anyFound = false;
   bool inFound = false;
@@ -728,7 +944,8 @@ bool IsParamAttributedAsOut(clang::AttributeList *pAttributes, bool *pIsIn) {
       inFound = true;
       break;
     default:
-      // Ignore the majority of attributes that don't have in/out characteristics
+      // Ignore the majority of attributes that don't have in/out
+      // characteristics
       break;
     }
     pAttributes = pAttributes->getNext();
@@ -738,45 +955,30 @@ bool IsParamAttributedAsOut(clang::AttributeList *pAttributes, bool *pIsIn) {
   return outFound;
 }
 
-_Use_decl_annotations_
-hlsl::ParameterModifier ParamModFromAttributeList(clang::AttributeList *pAttributes) {
+hlsl::ParameterModifier
+ParamModFromAttributeList(clang::AttributeList *pAttributes) {
+  if (IsParamAttributedAsGroupShared(pAttributes))
+    return ParameterModifier(hlsl::ParameterModifier::Kind::Ref);
   bool isIn, isOut;
   isOut = IsParamAttributedAsOut(pAttributes, &isIn);
   return ParameterModifier::FromInOut(isIn, isOut);
 }
 
-hlsl::ParameterModifier ParamModFromAttrs(llvm::ArrayRef<InheritableAttr *> attributes) {
-  bool isIn = false, isOut = false;
-  for (InheritableAttr * attr : attributes) {
-    if (isa<HLSLInAttr>(attr))
-      isIn = true;
-    else if (isa<HLSLOutAttr>(attr))
-      isOut = true;
-    else if (isa<HLSLInOutAttr>(attr))
-      isIn = isOut = true;
-  }
-  // Without any specifications, default to in.
-  if (!isIn && !isOut) {
-    isIn = true;
-  }
-  return ParameterModifier::FromInOut(isIn, isOut);
-}
-
 HLSLScalarType MakeUnsigned(HLSLScalarType T) {
-    switch (T) {
-    case HLSLScalarType_int:
-        return HLSLScalarType_uint;
-    case HLSLScalarType_int_min16:
-        return HLSLScalarType_uint_min16;
-    case HLSLScalarType_int64:
-        return HLSLScalarType_uint64;
-    case HLSLScalarType_int16:
-        return HLSLScalarType_uint16;
-    default:
-        // Only signed int types are relevant.
-        break;
-    }
-    return T;
+  switch (T) {
+  case HLSLScalarType_int:
+    return HLSLScalarType_uint;
+  case HLSLScalarType_int_min16:
+    return HLSLScalarType_uint_min16;
+  case HLSLScalarType_int64:
+    return HLSLScalarType_uint64;
+  case HLSLScalarType_int16:
+    return HLSLScalarType_uint16;
+  default:
+    // Only signed int types are relevant.
+    break;
+  }
+  return T;
 }
 
-}
+} // namespace hlsl

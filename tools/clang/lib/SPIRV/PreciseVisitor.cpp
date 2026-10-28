@@ -60,6 +60,9 @@ bool isAccessingPrecise(clang::spirv::SpirvAccessChain *inst) {
     } else if (auto *raType = llvm::dyn_cast<RuntimeArrayType>(baseType)) {
       indexes.pop();
       baseType = raType->getElementType();
+    } else if (auto *npaType = llvm::dyn_cast<NodePayloadArrayType>(baseType)) {
+      indexes.pop();
+      baseType = npaType->getElementType();
     } else if (auto *structType = llvm::dyn_cast<StructType>(baseType)) {
       SpirvInstruction *index = indexes.top();
       if (auto *constInt = llvm::dyn_cast<SpirvConstantInteger>(index)) {
@@ -233,14 +236,9 @@ bool PreciseVisitor::visit(SpirvUnaryOp *inst) {
   return true;
 }
 
-bool PreciseVisitor::visit(SpirvNonUniformBinaryOp *inst) {
-  inst->getArg1()->setPrecise(inst->isPrecise());
-  inst->getArg2()->setPrecise(inst->isPrecise());
-  return true;
-}
-
-bool PreciseVisitor::visit(SpirvNonUniformUnaryOp *inst) {
-  inst->getArg()->setPrecise(inst->isPrecise());
+bool PreciseVisitor::visit(SpirvGroupNonUniformOp *inst) {
+  for (auto *operand : inst->getOperands())
+    operand->setPrecise(inst->isPrecise());
   return true;
 }
 
@@ -248,6 +246,20 @@ bool PreciseVisitor::visit(SpirvExtInst *inst) {
   if (inst->isPrecise())
     for (auto *operand : inst->getOperands())
       operand->setPrecise();
+  return true;
+}
+
+bool PreciseVisitor::visit(SpirvFunctionCall *call) {
+  // If a formal parameter for the function is precise, then the corresponding
+  // actual parameter should be marked as precise.
+  auto function = call->getFunction();
+  for (uint32_t i = 0; i < call->getArgs().size(); ++i) {
+    auto formalParameter = function->getParameters()[i];
+    if (!formalParameter->isPrecise()) {
+      continue;
+    }
+    call->getArgs()[i]->setPrecise();
+  }
   return true;
 }
 

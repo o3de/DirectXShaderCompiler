@@ -1,4 +1,4 @@
-// Run: %dxc -T hs_6_0 -E SubDToBezierHS
+// RUN: %dxc -T hs_6_0 -E SubDToBezierHS -fcgl  %s -spirv | FileCheck %s
 
 #define MAX_POINTS 16
 
@@ -31,6 +31,7 @@ struct HS_CONSTANT_DATA_OUTPUT
 };
 
 HS_CONSTANT_DATA_OUTPUT PCF(OutputPatch<BEZIER_CONTROL_POINT, MAX_POINTS> op) {
+// CHECK: %op = OpFunctionParameter %_ptr_Function__arr_BEZIER_CONTROL_POINT_uint_16
   HS_CONSTANT_DATA_OUTPUT Output;
   // Must initialize Edges and Inside; otherwise HLSL validation will fail.
   Output.Edges[0]  = 1.0;
@@ -42,13 +43,13 @@ HS_CONSTANT_DATA_OUTPUT PCF(OutputPatch<BEZIER_CONTROL_POINT, MAX_POINTS> op) {
 
   uint x = 5;
 
-// CHECK:      [[op_1_loc:%\d+]] = OpAccessChain %_ptr_Output_v3float %temp_var_hullMainRetVal %uint_1 %int_0
-// CHECK-NEXT:          {{%\d+}} = OpLoad %v3float [[op_1_loc]]
+// CHECK:      [[op_1_loc:%[0-9]+]] = OpAccessChain %_ptr_Function_v3float %op %uint_1 %int_0
+// CHECK-NEXT:          {{%[0-9]+}} = OpLoad %v3float [[op_1_loc]]
   float3 out1pos = op[1].vPosition;
 
-// CHECK:             [[x:%\d+]] = OpLoad %uint %x
-// CHECK-NEXT: [[op_x_loc:%\d+]] = OpAccessChain %_ptr_Output_uint %temp_var_hullMainRetVal [[x]] %int_1
-// CHECK-NEXT:          {{%\d+}} = OpLoad %uint [[op_x_loc]]
+// CHECK:             [[x:%[0-9]+]] = OpLoad %uint %x
+// CHECK-NEXT: [[op_x_loc:%[0-9]+]] = OpAccessChain %_ptr_Function_uint %op [[x]] %int_1
+// CHECK-NEXT:          {{%[0-9]+}} = OpLoad %uint [[op_x_loc]]
   uint out5id = op[x].pointID;
 
   return Output;
@@ -63,13 +64,13 @@ BEZIER_CONTROL_POINT SubDToBezierHS(InputPatch<VS_CONTROL_POINT_OUTPUT, MAX_POIN
   BEZIER_CONTROL_POINT result;
   uint y = 5;
 
-// CHECK:      [[ip_1_loc:%\d+]] = OpAccessChain %_ptr_Function_v3float %ip %uint_1 %int_0
-// CHECK-NEXT:          {{%\d+}} = OpLoad %v3float [[ip_1_loc]]
+// CHECK:      [[ip_1_loc:%[0-9]+]] = OpAccessChain %_ptr_Function_v3float %ip %uint_1 %int_0
+// CHECK-NEXT:          {{%[0-9]+}} = OpLoad %v3float [[ip_1_loc]]
   result.vPosition = ip[1].vPosition;
 
-// CHECK:             [[y:%\d+]] = OpLoad %uint %y
-// CHECK-NEXT: [[ip_y_loc:%\d+]] = OpAccessChain %_ptr_Function_v3float %ip [[y]] %int_2
-// CHECK-NEXT:          {{%\d+}} = OpLoad %v3float [[ip_y_loc]]
+// CHECK:             [[y:%[0-9]+]] = OpLoad %uint %y
+// CHECK-NEXT: [[ip_y_loc:%[0-9]+]] = OpAccessChain %_ptr_Function_v3float %ip [[y]] %int_2
+// CHECK-NEXT:          {{%[0-9]+}} = OpLoad %v3float [[ip_y_loc]]
   result.vPosition = ip[y].vTangent;
 
   return result;

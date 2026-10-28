@@ -62,6 +62,9 @@ SpirvContext::~SpirvContext() {
   for (auto *raType : runtimeArrayTypes)
     raType->~RuntimeArrayType();
 
+  for (auto *npaType : nodePayloadArrayTypes)
+    npaType->~NodePayloadArrayType();
+
   for (auto *fnType : functionTypes)
     fnType->~FunctionType();
 
@@ -95,6 +98,15 @@ SpirvContext::~SpirvContext() {
 
   for (auto &typePair : typeTemplateParams)
     typePair.second->releaseMemory();
+
+  for (auto &pair : spirvIntrinsicTypesById) {
+    assert(pair.second);
+    pair.second->~SpirvIntrinsicType();
+  }
+
+  for (auto *spirvIntrinsicType : spirvIntrinsicTypes) {
+    spirvIntrinsicType->~SpirvIntrinsicType();
+  }
 }
 
 inline uint32_t log2ForBitwidth(uint32_t bitwidth) {
@@ -264,6 +276,19 @@ SpirvContext::getRuntimeArrayType(const SpirvType *elemType,
   return *(inserted.first);
 }
 
+const NodePayloadArrayType *
+SpirvContext::getNodePayloadArrayType(const SpirvType *elemType,
+                                      const ParmVarDecl *nodeDecl) {
+  NodePayloadArrayType type(elemType, nodeDecl);
+  auto found = nodePayloadArrayTypes.find(&type);
+  if (found != nodePayloadArrayTypes.end())
+    return *found;
+
+  auto inserted = nodePayloadArrayTypes.insert(
+      new (this) NodePayloadArrayType(elemType, nodeDecl));
+  return *(inserted.first);
+}
+
 const StructType *
 SpirvContext::getStructType(llvm::ArrayRef<StructType::FieldInfo> fields,
                             llvm::StringRef name, bool isReadOnly,
@@ -312,11 +337,43 @@ const SpirvPointerType *SpirvContext::getPointerType(const SpirvType *pointee,
   return pointerTypes[pointee][sc] = new (this) SpirvPointerType(pointee, sc);
 }
 
+const UntypedPointerKHRType *
+SpirvContext::getUntypedPointerKHRType(spv::StorageClass sc) {
+  auto found = untypedPointerKHRTypes.find(sc);
+  if (found != untypedPointerKHRTypes.end()) {
+    return found->second;
+  }
+  return untypedPointerKHRTypes[sc] = new (this) UntypedPointerKHRType(sc);
+}
+
 const HybridPointerType *SpirvContext::getPointerType(QualType pointee,
                                                       spv::StorageClass sc) {
   const HybridPointerType *result = new (this) HybridPointerType(pointee, sc);
   hybridPointerTypes.push_back(result);
   return result;
+}
+
+const ForwardPointerType *
+SpirvContext::getForwardPointerType(QualType pointee) {
+  assert(hlsl::IsVKBufferPointerType(pointee));
+
+  auto foundPointee = forwardPointerTypes.find(pointee);
+  if (foundPointee != forwardPointerTypes.end()) {
+    return foundPointee->second;
+  }
+
+  return forwardPointerTypes[pointee] = new (this) ForwardPointerType(pointee);
+}
+
+const SpirvPointerType *SpirvContext::getForwardReference(QualType type) {
+  return forwardReferences[type];
+}
+
+void SpirvContext::registerForwardReference(
+    QualType type, const SpirvPointerType *pointerType) {
+  assert(pointerType->getStorageClass() ==
+         spv::StorageClass::PhysicalStorageBuffer);
+  forwardReferences[type] = pointerType;
 }
 
 FunctionType *
@@ -338,10 +395,11 @@ const StructType *SpirvContext::getByteAddressBufferType(bool isWritable) {
       getRuntimeArrayType(getUIntType(32), /* ArrayStride */ 4);
 
   // Create a struct containing the runtime array as its only member.
-  return getStructType(
-      {StructType::FieldInfo(raType, /*name*/ "", /*offset*/ 0)},
-      isWritable ? "type.RWByteAddressBuffer" : "type.ByteAddressBuffer",
-      !isWritable, StructInterfaceType::StorageBuffer);
+  return getStructType({StructType::FieldInfo(raType, /*fieldIndex*/ 0,
+                                              /*name*/ "", /*offset*/ 0)},
+                       isWritable ? "type.RWByteAddressBuffer"
+                                  : "type.ByteAddressBuffer",
+                       !isWritable, StructInterfaceType::StorageBuffer);
 }
 
 const StructType *SpirvContext::getACSBufferCounterType() {
@@ -350,7 +408,8 @@ const StructType *SpirvContext::getACSBufferCounterType() {
 
   // Create a struct containing the integer counter as its only member.
   const StructType *type =
-      getStructType({StructType::FieldInfo(int32Type, "counter", /*offset*/ 0)},
+      getStructType({StructType::FieldInfo(int32Type, /*fieldIndex*/ 0,
+                                           "counter", /*offset*/ 0)},
                     "type.ACSBuffer.counter",
                     /*isReadOnly*/ false, StructInterfaceType::StorageBuffer);
 
@@ -441,6 +500,21 @@ SpirvContext::getDebugTypeVector(const SpirvType *spirvType,
 }
 
 SpirvDebugType *
+SpirvContext::getDebugTypeMatrix(const SpirvType *spirvType,
+                                 SpirvDebugInstruction *vectorType,
+                                 uint32_t vectorCount) {
+  // Reuse existing debug type if possible.
+  if (debugTypes.find(spirvType) != debugTypes.end())
+    return debugTypes[spirvType];
+
+  auto *eTy = dyn_cast<SpirvDebugTypeVector>(vectorType);
+  assert(eTy && "Element type must be a SpirvDebugTypeVector.");
+  auto *debugType = new (this) SpirvDebugTypeMatrix(eTy, vectorCount);
+  debugTypes[spirvType] = debugType;
+  return debugType;
+}
+
+SpirvDebugType *
 SpirvContext::getDebugTypeFunction(const SpirvType *spirvType, uint32_t flags,
                                    SpirvDebugType *ret,
                                    llvm::ArrayRef<SpirvDebugType *> params) {
@@ -525,6 +599,43 @@ void SpirvContext::moveDebugTypesToModule(SpirvModule *module) {
   debugTypes.clear();
   typeTemplates.clear();
   typeTemplateParams.clear();
+}
+
+const SpirvIntrinsicType *SpirvContext::getOrCreateSpirvIntrinsicType(
+    unsigned typeId, unsigned typeOpCode,
+    llvm::ArrayRef<SpvIntrinsicTypeOperand> operands) {
+  if (spirvIntrinsicTypesById[typeId] == nullptr) {
+    spirvIntrinsicTypesById[typeId] =
+        new (this) SpirvIntrinsicType(typeOpCode, operands);
+  }
+  return spirvIntrinsicTypesById[typeId];
+}
+
+const SpirvIntrinsicType *SpirvContext::getOrCreateSpirvIntrinsicType(
+    unsigned typeOpCode, llvm::ArrayRef<SpvIntrinsicTypeOperand> operands) {
+  SpirvIntrinsicType type(typeOpCode, operands);
+
+  auto found =
+      std::find_if(spirvIntrinsicTypes.begin(), spirvIntrinsicTypes.end(),
+                   [&type](const SpirvIntrinsicType *cachedType) {
+                     return type == *cachedType;
+                   });
+
+  if (found != spirvIntrinsicTypes.end())
+    return *found;
+
+  spirvIntrinsicTypes.push_back(new (this)
+                                    SpirvIntrinsicType(typeOpCode, operands));
+
+  return spirvIntrinsicTypes.back();
+}
+
+SpirvIntrinsicType *
+SpirvContext::getCreatedSpirvIntrinsicType(unsigned typeId) {
+  if (spirvIntrinsicTypesById.find(typeId) == spirvIntrinsicTypesById.end()) {
+    return nullptr;
+  }
+  return spirvIntrinsicTypesById[typeId];
 }
 
 } // end namespace spirv

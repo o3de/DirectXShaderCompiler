@@ -28,6 +28,7 @@
 #include <ios>
 #include <sys/stat.h>
 #include <system_error>
+#include <float.h> // HLSL Change: add for '_fpclass'
 
 // <fcntl.h> may provide O_BINARY.
 #if defined(HAVE_FCNTL_H)
@@ -87,7 +88,7 @@ void raw_ostream::SetBuffered() {
     SetUnbuffered();
 }
 
-void raw_ostream::SetBufferAndMode(_In_opt_ char *BufferStart, size_t Size,
+void raw_ostream::SetBufferAndMode(char *BufferStart, size_t Size,
                                    BufferKind Mode) {
   assert(((Mode == Unbuffered && !BufferStart && Size == 0) ||
           (Mode != Unbuffered && BufferStart && Size != 0)) &&
@@ -133,13 +134,18 @@ raw_ostream &raw_ostream::operator<<(unsigned long N) {
 }
 
 raw_ostream &raw_ostream::operator<<(long N) {
+  // A positive signed long has the same value when casted to its unsigned
+  // counterpart. If its negative, then we'll handle it in the below if block.
+  unsigned long UN = static_cast<unsigned long>(N);
+
   if (N < 0 && writeBase == 10) {
     *this << '-';
-    // Avoid undefined behavior on LONG_MIN with a cast.
-    N = -(unsigned long)N;
+    // Since N is negative and we're storing the result in an unsigned Long,
+    // we can use the equivalence of -N == ~N + 1 to get the positive value.
+    UN = ~N + 1UL;
   }
 
-  return this->operator<<(static_cast<unsigned long>(N));
+  return this->operator<<(UN);
 }
 
 raw_ostream &raw_ostream::operator<<(unsigned long long N) {
@@ -168,13 +174,18 @@ raw_ostream &raw_ostream::operator<<(unsigned long long N) {
 }
 
 raw_ostream &raw_ostream::operator<<(long long N) {
+  // A positive signed long has the same value when casted to its unsigned
+  // counterpart. If its negative, then we'll handle it in the below if block.
+  unsigned long long UN = static_cast<unsigned long long>(N);
+
   if (N < 0 && writeBase == 10) {
     *this << '-';
-    // Avoid undefined behavior on INT64_MIN with a cast.
-    N = -(unsigned long long)N;
+    // Since N is negative and we're storing the result in an unsigned Long,
+    // we can use the equivalence of -N == ~N + 1 to get the positive value.
+    UN = ~N + 1ULL;
   }
 
-  return this->operator<<(static_cast<unsigned long long>(N));
+  return this->operator<<(UN);
 }
 
 // HLSL Change Starts - Generalize non-base10 printing.
@@ -372,10 +383,10 @@ void raw_ostream::copy_to_buffer(const char *Ptr, size_t Size) {
   // Handle short strings specially, memcpy isn't very good at very short
   // strings.
   switch (Size) {
-  case 4: OutBufCur[3] = Ptr[3]; // FALL THROUGH
-  case 3: OutBufCur[2] = Ptr[2]; // FALL THROUGH
-  case 2: OutBufCur[1] = Ptr[1]; // FALL THROUGH
-  case 1: OutBufCur[0] = Ptr[0]; // FALL THROUGH
+  case 4: OutBufCur[3] = Ptr[3]; LLVM_FALLTHROUGH; // HLSL Change
+  case 3: OutBufCur[2] = Ptr[2]; LLVM_FALLTHROUGH; // HLSL Change
+  case 2: OutBufCur[1] = Ptr[1]; LLVM_FALLTHROUGH; // HLSL Change
+  case 1: OutBufCur[0] = Ptr[0]; LLVM_FALLTHROUGH; // HLSL Change
   case 0: break;
   default:
     memcpy(OutBufCur, Ptr, Size);
@@ -453,7 +464,7 @@ raw_ostream &raw_ostream::operator<<(const FormattedNumber &FN) {
     while (N) {
       uintptr_t x = N % 16;
       assert(CurPtr > NumberBuffer && "else FN values inconsistent"); // HLSL Change
-      _Analysis_assume_(CurPtr > NumberBuffer); // HLSL Change
+      assert(CurPtr > NumberBuffer); // HLSL Change
       *--CurPtr = (x < 10 ? '0' + x : A + x - 10);
       N /= 16;
     }
@@ -469,7 +480,10 @@ raw_ostream &raw_ostream::operator<<(const FormattedNumber &FN) {
     char *EndPtr = NumberBuffer+sizeof(NumberBuffer);
     char *CurPtr = EndPtr;
     bool Neg = (FN.DecValue < 0);
-    uint64_t N = Neg ? -static_cast<uint64_t>(FN.DecValue) : FN.DecValue;
+    // If the value is negative, and because we are storing the result of the ~
+    // operation in an unsigned value, we can use the equivalence of
+    // -N == ~N + 1 to get the positive value of the negative number
+    uint64_t N = Neg ? (~FN.DecValue + 1UL) : FN.DecValue;
     while (N) {
       *--CurPtr = '0' + char(N % 10);
       N /= 10;
@@ -603,7 +617,7 @@ raw_fd_ostream::~raw_fd_ostream() {
   // to avoid report_fatal_error calls should check for errors with
   // has_error() and clear the error flag with clear_error() before
   // destructing raw_ostream objects which may have errors.
-  if (has_error())
+  if (has_error() && ShouldClose) // HLSL Change - ignore error on !ShouldClose
     report_fatal_error("IO failure on output stream.", /*GenCrashDiag=*/false);
 }
 

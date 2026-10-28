@@ -923,6 +923,22 @@ public:
                                  equivalentType);
   }
 
+  // HLSL Change Start
+  QualType
+  VisitAttributedLinAlgMatrixType(const AttributedLinAlgMatrixType *T) {
+    QualType wrappedTy = recurse(T->getWrappedType());
+    if (wrappedTy.isNull())
+      return QualType();
+
+    if (wrappedTy.getAsOpaquePtr() == T->getWrappedType().getAsOpaquePtr())
+      return QualType(T, 0);
+
+    return Ctx.getAttributedLinAlgMatrixType(wrappedTy, T->getComponentType(),
+                                             T->getRows(), T->getCols(),
+                                             T->getUse(), T->getScope());
+  }
+  // HLSL Change End
+
   QualType VisitSubstTemplateTypeParmType(const SubstTemplateTypeParmType *T) {
     QualType replacementType = recurse(T->getReplacementType());
     if (replacementType.isNull())
@@ -1563,6 +1579,10 @@ namespace {
     }
     AutoType *VisitAttributedType(const AttributedType *T) {
       return Visit(T->getModifiedType());
+    }
+    AutoType *
+    VisitAttributedLinAlgMatrixType(const AttributedLinAlgMatrixType *T) {
+      return Visit(T->getWrappedType());
     }
     AutoType *VisitAdjustedType(const AdjustedType *T) {
       return Visit(T->getOriginalType());
@@ -2497,13 +2517,13 @@ StringRef BuiltinType::getName(const PrintingPolicy &Policy) const {
   case Char_S:            return "char";
   case Char_U:            return "char";
   case SChar:             return "signed char";
-  case Short:             return "short";
+  case Short:             return /* "short" */ "int16_t" /* HLSL Change */;
   case Int:               return "int";
   case Long:              return "long";
   case LongLong:          return "long long";
   case Int128:            return "__int128";
   case UChar:             return "unsigned char";
-  case UShort:            return "unsigned short";
+  case UShort:            return /* "unsigned short" */ "uint16_t" /* HLSL Change */;
   case UInt:              return "unsigned int";
   case ULong:             return "unsigned long";
   case ULongLong:         return "unsigned long long";
@@ -2548,7 +2568,9 @@ StringRef BuiltinType::getName(const PrintingPolicy &Policy) const {
   case LitInt:            return "literal int";
   case Int8_4Packed:      return "int8_t4_packed";
   case UInt8_4Packed:     return "uint8_t4_packed";
-  // HLSL Change Ends
+  case LinAlgMatrix:
+    return "__builtin_LinAlgMatrix";
+    // HLSL Change Ends
   }
   
   llvm_unreachable("Invalid builtin type.");
@@ -2945,6 +2967,7 @@ bool AttributedType::isHLSLTypeSpec() const {
   case attr_hlsl_snorm:
   case attr_hlsl_unorm:
   case attr_hlsl_globallycoherent:
+  case attr_hlsl_reordercoherent:
     return true;
   }
   llvm_unreachable("invalid attr kind");
@@ -2975,7 +2998,8 @@ bool AttributedType::isCallingConv() const {
   case attr_hlsl_snorm:
   case attr_hlsl_unorm:
   case attr_hlsl_globallycoherent:
-  // HLSL Change Ends
+  case attr_hlsl_reordercoherent:
+    // HLSL Change Ends
     return false;
 
   case attr_pcs:
@@ -2993,6 +3017,39 @@ bool AttributedType::isCallingConv() const {
   }
   llvm_unreachable("invalid attr kind");
 }
+
+// HLSL Change Start
+void AttributedLinAlgMatrixType::appendMangledAttributes(
+    llvm::raw_ostream &OS) const {
+  OS << "C" << static_cast<unsigned>(getComponentType()) << "M"
+     << static_cast<unsigned>(getRows()) << "N"
+     << static_cast<unsigned>(getCols()) << "U"
+     << static_cast<unsigned>(getUse()) << "S"
+     << static_cast<unsigned>(getScope());
+}
+
+DependentAttributedLinAlgMatrixType::DependentAttributedLinAlgMatrixType(
+    const ASTContext &Context, QualType WrappedType, Expr *ComponentTyExpr,
+    Expr *RowsExpr, Expr *ColsExpr, Expr *UseExpr, Expr *ScopeExpr)
+    : Type(DependentAttributedLinAlgMatrix, QualType(), /*Dependent=*/true,
+           /*InstantiationDependent=*/true, /*VariablyModified*/ false,
+           /*ContainsUnexpandedParameterPack=*/false),
+      Context(Context), WrappedType(WrappedType),
+      ComponentTyExpr(ComponentTyExpr), RowsExpr(RowsExpr), ColsExpr(ColsExpr),
+      UseExpr(UseExpr), ScopeExpr(ScopeExpr) {}
+
+void DependentAttributedLinAlgMatrixType::Profile(
+    llvm::FoldingSetNodeID &ID, const ASTContext &Context, QualType WrappedType,
+    Expr *ComponentTyExpr, Expr *RowsExpr, Expr *ColsExpr, Expr *UseExpr,
+    Expr *ScopeExpr) {
+  ID.AddPointer(WrappedType.getAsOpaquePtr());
+  ComponentTyExpr->Profile(ID, Context, true);
+  RowsExpr->Profile(ID, Context, true);
+  ColsExpr->Profile(ID, Context, true);
+  UseExpr->Profile(ID, Context, true);
+  ScopeExpr->Profile(ID, Context, true);
+}
+// HLSL Change End
 
 CXXRecordDecl *InjectedClassNameType::getDecl() const {
   return cast<CXXRecordDecl>(getInterestingTagDecl(Decl));
@@ -3161,7 +3218,7 @@ public:
   friend CachedProperties merge(CachedProperties L, CachedProperties R) {
     Linkage MergedLinkage = minLinkage(L.L, R.L);
     return CachedProperties(MergedLinkage,
-                         L.hasLocalOrUnnamedType() | R.hasLocalOrUnnamedType());
+                         L.hasLocalOrUnnamedType() || R.hasLocalOrUnnamedType());
   }
 };
 }
@@ -3298,6 +3355,8 @@ static CachedProperties computeCachedProperties(const Type *T) {
     return Cache::get(cast<ObjCObjectPointerType>(T)->getPointeeType());
   case Type::Atomic:
     return Cache::get(cast<AtomicType>(T)->getValueType());
+  case Type::AttributedLinAlgMatrix:
+    return Cache::get(cast<AttributedLinAlgMatrixType>(T)->getWrappedType());
   }
 
   llvm_unreachable("unhandled type class");
@@ -3474,8 +3533,8 @@ bool Type::canHaveNullability() const {
   case Type::Builtin:
     switch (cast<BuiltinType>(type.getTypePtr())->getKind()) {
       // Signed, unsigned, and floating-point types cannot have nullability.
-#define SIGNED_TYPE(Id, SingletonId) case BuiltinType::Id:
-#define UNSIGNED_TYPE(Id, SingletonId) case BuiltinType::Id:
+#define SIGNED_TYPE(Id, SingletonId) case BuiltinType::Id: LLVM_C_FALLTHROUGH;
+#define UNSIGNED_TYPE(Id, SingletonId) case BuiltinType::Id: LLVM_C_FALLTHROUGH;
 #define FLOATING_TYPE(Id, SingletonId) case BuiltinType::Id:
 #define BUILTIN_TYPE(Id, SingletonId)
 #include "clang/AST/BuiltinTypes.def"
@@ -3502,6 +3561,7 @@ bool Type::canHaveNullability() const {
     case BuiltinType::OCLImage3d:
     case BuiltinType::OCLSampler:
     case BuiltinType::OCLEvent:
+    case BuiltinType::LinAlgMatrix:
     case BuiltinType::BuiltinFn:
     case BuiltinType::NullPtr:
       return false;
@@ -3522,6 +3582,8 @@ bool Type::canHaveNullability() const {
   case Type::FunctionNoProto:
   case Type::Record:
   case Type::Enum:
+  case Type::AttributedLinAlgMatrix:
+  case Type::DependentAttributedLinAlgMatrix:
   case Type::InjectedClassName:
   case Type::PackExpansion:
   case Type::ObjCObject:

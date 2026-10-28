@@ -544,7 +544,12 @@ bool Sema::CheckParameterPacksForExpansion(
   RetainExpansion = false;
   std::pair<IdentifierInfo *, SourceLocation> FirstPack;
   bool HaveFirstPack = false;
-  
+
+  if (getLangOpts().HLSL) {
+    Diag(EllipsisLoc, diag::err_hlsl_variadic_templates);
+    return true;
+  }
+
   for (ArrayRef<UnexpandedParameterPack>::iterator i = Unexpanded.begin(),
                                                  end = Unexpanded.end();
                                                   i != end; ++i) {
@@ -859,7 +864,7 @@ ExprResult Sema::ActOnSizeofParameterPackExpr(Scope *S,
                    PDiag(diag::note_parameter_pack_here));
       ParameterPack = Corrected.getCorrectionDecl();
     }
-
+    break;
   case LookupResult::FoundOverloaded:
   case LookupResult::FoundUnresolvedValue:
     break;

@@ -1517,6 +1517,7 @@ bool CastExpr::CastConsistency() const {
     assert(getSubExpr()->getType()->isPointerType());
     assert(getType()->getPointeeType().getAddressSpace() !=
            getSubExpr()->getType()->getPointeeType().getAddressSpace());
+    goto CheckNoBasePath;
   // These should not have an inheritance path.
   case CK_Dynamic:
   case CK_ToUnion:
@@ -1715,7 +1716,11 @@ const char *CastExpr::getCastKindName() const {
     return "HLSLCC_FloatingToBoolean";
   case CK_HLSLCC_FloatingCast:
     return "HLSLCC_FloatingCast";
-  // HLSL Change Ends
+  case CK_VK_BufferPointerToIntegral:
+    return "VK_BufferPointerToIntegral";
+  case CK_VK_IntegralToBufferPointer:
+    return "VK_IntegralToBufferPointer";
+    // HLSL Change Ends
   }
 
   llvm_unreachable("Unhandled cast kind!");
@@ -1921,6 +1926,7 @@ InitListExpr::InitListExpr(const ASTContext &C, SourceLocation lbraceloc,
     LBraceLoc(lbraceloc), RBraceLoc(rbraceloc), AltForm(nullptr, true)
 {
   sawArrayRangeDesignator(false);
+  sawVectorInitWithCXXFunctionalCastExpr(false); // HLSL change.
   for (unsigned I = 0; I != initExprs.size(); ++I) {
     if (initExprs[I]->isTypeDependent())
       ExprBits.TypeDependent = true;
@@ -2188,6 +2194,7 @@ bool Expr::isUnusedResultAWarning(const Expr *&WarnE, SourceLocation &Loc,
     }
 
     // Fallthrough for generic call handling.
+    LLVM_FALLTHROUGH; // HLSL Change
   }
   case CallExprClass:
   case CXXMemberCallExprClass:
@@ -3109,7 +3116,7 @@ bool Expr::HasSideEffects(const ASTContext &Ctx,
     if (DCE->getTypeAsWritten()->isReferenceType() &&
         DCE->getCastKind() == CK_Dynamic)
       return true;
-  } // Fall through.
+  } LLVM_FALLTHROUGH; // HLSL Change.
   case ImplicitCastExprClass:
   case CStyleCastExprClass:
   case CXXStaticCastExprClass:
@@ -3876,25 +3883,21 @@ GenericSelectionExpr::GenericSelectionExpr(const ASTContext &Context,
   std::copy(AssocExprs.begin(), AssocExprs.end(), SubExprs+END_EXPR);
 }
 
-GenericSelectionExpr::GenericSelectionExpr(const ASTContext &Context,
-                               SourceLocation GenericLoc, Expr *ControllingExpr,
-                               ArrayRef<TypeSourceInfo*> AssocTypes,
-                               ArrayRef<Expr*> AssocExprs,
-                               SourceLocation DefaultLoc,
-                               SourceLocation RParenLoc,
-                               bool ContainsUnexpandedParameterPack)
-  : Expr(GenericSelectionExprClass,
-         Context.DependentTy,
-         VK_RValue,
-         OK_Ordinary,
-         /*isTypeDependent=*/true,
-         /*isValueDependent=*/true,
-         /*isInstantiationDependent=*/true,
-         ContainsUnexpandedParameterPack),
-    AssocTypes(new (Context) TypeSourceInfo*[AssocTypes.size()]),
-    SubExprs(new (Context) Stmt*[END_EXPR+AssocExprs.size()]),
-    NumAssocs(AssocExprs.size()), ResultIndex(-1U), GenericLoc(GenericLoc),
-    DefaultLoc(DefaultLoc), RParenLoc(RParenLoc) {
+GenericSelectionExpr::GenericSelectionExpr(
+    const ASTContext &Context, SourceLocation GenericLoc, Expr *ControllingExpr,
+    ArrayRef<TypeSourceInfo *> AssocTypes, ArrayRef<Expr *> AssocExprs,
+    SourceLocation DefaultLoc, SourceLocation RParenLoc,
+    bool ContainsUnexpandedParameterPack)
+    : Expr(GenericSelectionExprClass, Context.DependentTy, VK_RValue,
+           OK_Ordinary,
+           /*isTypeDependent=*/true,
+           /*isValueDependent=*/true,
+           /*isInstantiationDependent=*/true, ContainsUnexpandedParameterPack),
+      AssocTypes(new(Context) TypeSourceInfo *[AssocTypes.size()]),
+      SubExprs(new(Context) Stmt *[END_EXPR + AssocExprs.size()]),
+      NumAssocs(AssocExprs.size()),
+      ResultIndex(std::numeric_limits<unsigned>::max()), GenericLoc(GenericLoc),
+      DefaultLoc(DefaultLoc), RParenLoc(RParenLoc) {
   SubExprs[CONTROLLING] = ControllingExpr;
   assert(AssocTypes.size() == AssocExprs.size());
   std::copy(AssocTypes.begin(), AssocTypes.end(), this->AssocTypes);

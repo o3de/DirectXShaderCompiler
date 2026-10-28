@@ -12,6 +12,7 @@
 
 #include "AlignmentSizeCalculator.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/SPIRV/SpirvBuilder.h"
 #include "clang/SPIRV/SpirvContext.h"
 #include "clang/SPIRV/SpirvVisitor.h"
 #include "llvm/ADT/Optional.h"
@@ -23,9 +24,10 @@ namespace spirv {
 class LowerTypeVisitor : public Visitor {
 public:
   LowerTypeVisitor(ASTContext &astCtx, SpirvContext &spvCtx,
-                   const SpirvCodeGenOptions &opts)
+                   const SpirvCodeGenOptions &opts, SpirvBuilder &builder)
       : Visitor(opts, spvCtx), astContext(astCtx), spvContext(spvCtx),
-        alignmentCalc(astCtx, opts), useArrayForMat1xN(false) {}
+        alignmentCalc(astCtx, opts), useArrayForMat1xN(false),
+        spvBuilder(builder) {}
 
   // Visiting different SPIR-V constructs.
   bool visit(SpirvModule *, Phase) override { return true; }
@@ -60,6 +62,12 @@ private:
     return astContext.getDiagnostics().Report(srcLoc, diagId);
   }
 
+  // This method sorts a field list in the following order:
+  //  - fields with register annotation first, sorted by register index.
+  //  - then fields without annotation, in order of declaration.
+  std::vector<const HybridStructType::FieldInfo *>
+  sortFields(llvm::ArrayRef<HybridStructType::FieldInfo> fields);
+
   /// Lowers the given Hybrid type into a SPIR-V type.
   ///
   /// Uses the above lowerType method to lower the QualType components of hybrid
@@ -69,7 +77,37 @@ private:
 
   /// Lowers the given HLSL resource type into its SPIR-V type.
   const SpirvType *lowerResourceType(QualType type, SpirvLayoutRule rule,
+                                     llvm::Optional<bool> isRowMajor,
                                      SourceLocation);
+
+  /// Lowers the fields of a RecordDecl into SPIR-V StructType field
+  /// information.
+  llvm::SmallVector<StructType::FieldInfo, 4>
+  lowerStructFields(const RecordDecl *structType, SpirvLayoutRule rule);
+
+  /// Creates the default AST type from a TemplateName for HLSL templates
+  /// which have optional parameters (e.g. Texture2D).
+  QualType createASTTypeFromTemplateName(TemplateName templateName);
+
+  /// If the given type is an integral_constant or a Literal<integral_constant>,
+  /// return the constant value as a SpirvConstant, which will be set as a
+  /// literal constant if wrapped in Literal.
+  bool getVkIntegralConstantValue(QualType type, SpirvConstant *&result,
+                                  SourceLocation srcLoc);
+
+  /// Lowers the given vk::SpirvType or vk::SpirvOpaqueType into its SPIR-V
+  /// type.
+  const SpirvType *
+  lowerInlineSpirvType(llvm::StringRef name, unsigned int opcode,
+                       const ClassTemplateSpecializationDecl *specDecl,
+                       SpirvLayoutRule rule, llvm::Optional<bool> isRowMajor,
+                       SourceLocation srcLoc);
+
+  /// Lowers the given type defined in vk namespace into its SPIR-V type.
+  const SpirvType *lowerVkTypeInVkNamespace(QualType type, llvm::StringRef name,
+                                            SpirvLayoutRule rule,
+                                            llvm::Optional<bool> isRowMajor,
+                                            SourceLocation srcLoc);
 
   /// For the given sampled type, returns the corresponding image format
   /// that can be used to create an image object.
@@ -85,11 +123,27 @@ private:
   populateLayoutInformation(llvm::ArrayRef<HybridStructType::FieldInfo> fields,
                             SpirvLayoutRule rule);
 
+  /// Create a clang::StructType::FieldInfo from HybridStructType::FieldInfo.
+  /// This function only considers the field as standalone.
+  /// Offset and layout constraint from the parent struct are not considered.
+  StructType::FieldInfo lowerField(const HybridStructType::FieldInfo *field,
+                                   SpirvLayoutRule rule,
+                                   const uint32_t fieldIndex);
+
+  /// Get a lowered SpirvPointer from the args to a SpirvOpaqueType.
+  /// The pointer will use the given layout rule. `isRowMajor` is used to
+  /// lower the pointee type.
+  const SpirvType *getSpirvPointerFromInlineSpirvType(
+      ArrayRef<TemplateArgument> args, SpirvLayoutRule rule,
+      Optional<bool> isRowMajor, SourceLocation location);
+
 private:
   ASTContext &astContext;                /// AST context
   SpirvContext &spvContext;              /// SPIR-V context
   AlignmentSizeCalculator alignmentCalc; /// alignment calculator
   bool useArrayForMat1xN;                /// SPIR-V array for HLSL Matrix 1xN
+  SpirvBuilder &spvBuilder;
+  SmallVector<QualType, 4> visitedTypeStack; // for type recursion detection
 };
 
 } // end namespace spirv

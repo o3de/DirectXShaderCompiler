@@ -129,7 +129,9 @@ void initializeDxilFixConstArrayInitializerPass(PassRegistry&);
 Pass *createDxilConditionalMem2RegPass(bool NoOpt);
 void initializeDxilConditionalMem2RegPass(PassRegistry&);
 
-Pass *createDxilLoopUnrollPass(unsigned MaxIterationAttempt, bool OnlyWarnOnFail, bool StructurizeLoopExits);
+Pass *createDxilLoopUnrollPass(unsigned MaxIterationAttempt,
+                               bool OnlyWarnOnFail, bool StructurizeLoopExits,
+                               bool UnrollCountIsHint);
 void initializeDxilLoopUnrollPass(PassRegistry&);
 
 Pass *createDxilEraseDeadRegionPass();
@@ -144,11 +146,17 @@ void initializeDxilInsertPreservesPass(PassRegistry&);
 Pass *createDxilFinalizePreservesPass();
 void initializeDxilFinalizePreservesPass(PassRegistry&);
 
+Pass *createDxilReinsertNopsPass();
+void initializeDxilReinsertNopsPass(PassRegistry&);
+
 Pass *createDxilPreserveToSelectPass();
 void initializeDxilPreserveToSelectPass(PassRegistry&);
 
 Pass *createDxilRemoveDeadBlocksPass();
 void initializeDxilRemoveDeadBlocksPass(PassRegistry&);
+
+Pass *createDxilRemoveUnstructuredLoopExitsPass();
+void initializeDxilRemoveUnstructuredLoopExitsPass(PassRegistry &);
 
 void initializeDxilRewriteOutputArgDebugInfoPass(PassRegistry&);
 Pass *createDxilRewriteOutputArgDebugInfoPass();
@@ -178,6 +186,11 @@ void initializeMultiDimArrayToOneDimArrayPass(PassRegistry&);
 //
 ModulePass *createResourceToHandlePass();
 void initializeResourceToHandlePass(PassRegistry&);
+//===----------------------------------------------------------------------===//
+// Flatten resource into handle.
+//
+ModulePass *createLowerWaveMatTypePass();
+void initializeLowerWaveMatTypePass(PassRegistry &);
 
 //===----------------------------------------------------------------------===//
 // Hoist a local array initialized with constant values to a global array with
@@ -214,6 +227,7 @@ Pass *createIndVarSimplifyPass();
 //    %Z = add int 2, %X
 //
 FunctionPass *createInstructionCombiningPass();
+FunctionPass *createInstructionCombiningPass(bool HLSLSkipSinkSelect); // HLSL Change
 
 //===----------------------------------------------------------------------===//
 //
@@ -322,6 +336,8 @@ extern char &DemoteRegisterToMemoryHlslID;
 // For example:  4 + (x + 5)  ->  x + (4 + 5)
 //
 FunctionPass *createReassociatePass();
+FunctionPass *
+createReassociatePass(bool HLSLEnableAggressiveReassociation); // HLSL Change
 
 //===----------------------------------------------------------------------===//
 //

@@ -64,9 +64,14 @@
 // };
 //
 // template <typename KeyT, typename ValT, unsigned N, typename Traits>
-// class IntervalMap::const_iterator :
-//   public std::iterator<std::bidirectional_iterator_tag, ValT> {
+// class IntervalMap::const_iterator {
 // public:
+//   using iterator_category = std::bidirectional_iterator_tag;
+//   using value_type = ValT;
+//   using difference_type = std::ptrdiff_t;
+//   using pointer = value_type *;
+//   using reference = value_type &;
+//
 //   bool operator==(const const_iterator &) const;
 //   bool operator!=(const const_iterator &) const;
 //   bool valid() const;
@@ -315,7 +320,11 @@ public:
       return Count;
     } else {
       // We want to shrink, copy to sib.
-      unsigned Count = std::min(std::min(unsigned(-Add), Size), N - SSize);
+      // Count <= INT_MAX: Since Add is an int, unsigned(-Add) <= 2^31, so
+      // std::min result <= INT_MAX. Meaning its safe to store the result in an
+      // int to avoid the compiler warning for '-Count' if we were to use an
+      // unsigned value instead.
+      int Count = std::min(std::min(unsigned(-Add), Size), N - SSize);
       transferToLeftSib(Size, Sib, SSize, Count);
       return -Count;
     }
@@ -1282,11 +1291,17 @@ clear() {
 //===----------------------------------------------------------------------===//
 
 template <typename KeyT, typename ValT, unsigned N, typename Traits>
-class IntervalMap<KeyT, ValT, N, Traits>::const_iterator :
-  public std::iterator<std::bidirectional_iterator_tag, ValT> {
-protected:
+class IntervalMap<KeyT, ValT, N, Traits>::const_iterator {
   friend class IntervalMap;
 
+public:
+  using iterator_category = std::bidirectional_iterator_tag;
+  using value_type = ValT;
+  using difference_type = std::ptrdiff_t;
+  using pointer = value_type *;
+  using reference = value_type &;
+
+protected:
   // The map referred to.
   IntervalMap *map;
 

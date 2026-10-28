@@ -1,5 +1,8 @@
 # See docs/CMake.html for instructions about how to build LLVM with CMake.
-cmake_minimum_required(VERSION 2.8.12.2)
+cmake_minimum_required(VERSION 3.17.2) # HLSL Change - Require CMake 3.17.2.
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (NOT "${DXC_CMAKE_BEGINS_INCLUDE}" STREQUAL "")
   include(${DXC_CMAKE_BEGINS_INCLUDE})
@@ -14,15 +17,6 @@ if(POLICY CMP0022)
   cmake_policy(SET CMP0022 NEW) # automatic when 2.8.12 is required
 endif()
 
-if (POLICY CMP0051)
-  # CMake 3.1 and higher include generator expressions of the form
-  # $<TARGETLIB:obj> in the SOURCES property.  These need to be
-  # stripped everywhere that access the SOURCES property, so we just
-  # defer to the OLD behavior of not including generator expressions
-  # in the output for now.
-  cmake_policy(SET CMP0051 OLD)
-endif()
-
 if(CMAKE_VERSION VERSION_LESS 3.1.20141117)
   set(cmake_3_2_USES_TERMINAL)
 else()
@@ -30,9 +24,6 @@ else()
 endif()
 
 project(LLVM)
-
-# This requires a more recent version than CMake 3.4 but is a noop in prior versions. # HLSL Change
-set(VS_STARTUP_PROJECT "dndxc" CACHE STRING "VS startup project in solution")         # HLSL Change
 
 # The following only works with the Ninja generator in CMake >= 3.0.
 set(LLVM_PARALLEL_COMPILE_JOBS "" CACHE STRING
@@ -100,10 +91,33 @@ option(HLSL_SUPPORT_QUERY_GIT_COMMIT_INFO "Supports querying Git commit info." O
 if ( HLSL_SUPPORT_QUERY_GIT_COMMIT_INFO )
   add_definitions(-DSUPPORT_QUERY_GIT_COMMIT_INFO)
 endif()
+
+option(DXC_DISABLE_ALLOCATOR_OVERRIDES "Disable usage of allocator overrides" OFF)
+mark_as_advanced(DXC_DISABLE_ALLOCATOR_OVERRIDES)
+
+option(DXC_CODEGEN_EXCEPTIONS_TRAP "An exception in code generation generates a trap, ending the compiler process" OFF)
+mark_as_advanced(DXC_CODEGEN_EXCEPTIONS_TRAP)
+
 # adjust link option to enable debugging from kernel mode; not compatible with incremental linking
-if(NOT CMAKE_VERSION VERSION_LESS "3.13" AND WIN32)
+if(NOT CMAKE_VERSION VERSION_LESS "3.13" AND MSVC AND NOT CMAKE_C_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64EC")
   add_link_options(/DEBUGTYPE:CV,FIXUP,PDATA /INCREMENTAL:NO)
 endif()
+
+# enable control flow guard
+if(WIN32)
+  if(MSVC)
+    add_compile_options(/guard:cf)
+    add_link_options(/guard:cf)
+  else()
+    add_compile_options(-fcf-protection)
+  endif()
+endif(WIN32)
+
+# Enable CET Shadow Stack
+if(MSVC AND NOT (CMAKE_C_COMPILER_ARCHITECTURE_ID MATCHES "ARM.*"))
+  add_link_options(/CETCOMPAT)
+endif()
+
 # HLSL Change Ends
 
 # HLSL Change Starts - set flag for Appveyor CI
@@ -302,6 +316,9 @@ else()
   option(LLVM_ENABLE_ASSERTIONS "Enable assertions" ON)
 endif()
 
+option(LLVM_ASSERTIONS_TRAP "Force assertions to always trap, rather than the default unspecified behavior (e.g. RaiseException on Windows)" OFF)
+option(LLVM_ASSERTIONS_NO_STRINGS "Make assertion macro drops strings to reduce binary size" OFF)
+
 set(LLVM_ABI_BREAKING_CHECKS "WITH_ASSERTS" CACHE STRING
   "Enable abi-breaking checks.  Can be WITH_ASSERTS, FORCE_ON or FORCE_OFF.")
 
@@ -332,6 +349,7 @@ endif( LLVM_USE_OPROFILE )
 
 set(LLVM_USE_SANITIZER "" CACHE STRING
   "Define the sanitizer used to build binaries and tests.")
+option(LLVM_OPTIMIZE_SANITIZED_BUILDS "Enable -O1 on sanitized builds" On)
 
 option(LLVM_USE_SPLIT_DWARF
   "Use -gsplit-dwarf when compiling llvm." OFF)
@@ -379,6 +397,8 @@ option(LLVM_BUILD_TESTS
   "Build LLVM unit tests. If OFF, just generate build targets." OFF)
 option(LLVM_INCLUDE_TESTS "Generate build targets for the LLVM unit tests." ON)
 
+option(HLSL_INCLUDE_TESTS  "Generate build targets for the HLSL unit tests." ON)
+
 option (LLVM_BUILD_DOCS "Build the llvm documentation." OFF)
 option (LLVM_INCLUDE_DOCS "Generate build targets for llvm documentation." ON)
 option (LLVM_ENABLE_DOXYGEN "Use doxygen to generate llvm API documentation." OFF)
@@ -399,6 +419,21 @@ if(CMAKE_CROSSCOMPILING OR (LLVM_OPTIMIZED_TABLEGEN AND LLVM_ENABLE_ASSERTIONS))
   set(LLVM_USE_HOST_TOOLS ON)
 endif()
 
+if (LLVM_BUILD_INSTRUMENTED OR LLVM_BUILD_INSTRUMENTED_COVERAGE)
+  if(NOT LLVM_PROFILE_MERGE_POOL_SIZE)
+    # A pool size of 1-2 is probably sufficient on a SSD. 3-4 should be fine
+    # for spining disks. Anything higher may only help on slower mediums.
+    set(LLVM_PROFILE_MERGE_POOL_SIZE "4")
+  endif()
+  if(NOT LLVM_PROFILE_FILE_PATTERN)
+    if(NOT LLVM_PROFILE_DATA_DIR)
+      set(LLVM_PROFILE_FILE_PATTERN "%${LLVM_PROFILE_MERGE_POOL_SIZE}m.profraw")
+    else()
+      file(TO_NATIVE_PATH "${LLVM_PROFILE_DATA_DIR}/%${LLVM_PROFILE_MERGE_POOL_SIZE}m.profraw" LLVM_PROFILE_FILE_PATTERN)
+    endif()
+  endif()
+endif()
+
 # All options referred to from HandleLLVMOptions have to be specified
 # BEFORE this include, otherwise options will not be correctly set on
 # first cmake run
@@ -413,7 +448,7 @@ set(TARGET_TRIPLE "${LLVM_DEFAULT_TARGET_TRIPLE}")
 include(HandleLLVMOptions)
 
 # Verify that we can find a Python 3 interpreter and force cmake to use it.
-find_package(PythonInterp 3 REQUIRED)
+find_package(Python3 REQUIRED)
 
 ######
 # LLVMBuild Integration
@@ -447,7 +482,7 @@ endif (LLVM_USE_OPROFILE)
 message(STATUS "Constructing LLVMBuild project information")
 
 execute_process(
-  COMMAND ${PYTHON_EXECUTABLE} ${LLVMBUILDTOOL}
+  COMMAND ${Python3_EXECUTABLE} ${LLVMBUILDTOOL}
             --native-target Unknown
             --enable-targets "${LLVM_TARGETS_TO_BUILD}"
             --enable-optional-components "${LLVMOPTIONALCOMPONENTS}"
@@ -541,6 +576,9 @@ configure_file(
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Config/llvm-config.h.cmake
   ${LLVM_INCLUDE_DIR}/llvm/Config/llvm-config.h)
 configure_file(
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Config/abi-breaking.h.cmake
+  ${LLVM_INCLUDE_DIR}/llvm/Config/abi-breaking.h)
+configure_file(
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Support/DataTypes.h.cmake
   ${LLVM_INCLUDE_DIR}/llvm/Support/DataTypes.h)
 
@@ -551,8 +589,10 @@ set( CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${LLVM_BINARY_DIR}/lib${LLVM_LIBDIR_SUFFIX} 
 
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 if (APPLE)
-  set(CMAKE_INSTALL_NAME_DIR "@rpath")
-  set(CMAKE_INSTALL_RPATH "@executable_path/../lib")
+  if(NOT DEFINED CMAKE_INSTALL_RPATH)
+    set(CMAKE_INSTALL_NAME_DIR "@rpath")
+    set(CMAKE_INSTALL_RPATH "@executable_path/../lib")
+    endif(NOT DEFINED CMAKE_INSTALL_RPATH)
 else(UNIX)
   if(NOT DEFINED CMAKE_INSTALL_RPATH)
     set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib${LLVM_LIBDIR_SUFFIX}")
@@ -577,9 +617,7 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 # HLSL Change Starts - override assert to RaiseException instead of abort
 # for better test behavior
-if(WIN32 AND NOT UNIX)
-  include_directories(BEFORE "${LLVM_MAIN_INCLUDE_DIR}/llvm/llvm_assert")
-endif()
+include_directories(BEFORE "${LLVM_MAIN_INCLUDE_DIR}/llvm/llvm_assert")
 # HLSL Change Ends
 
 include_directories( ${LLVM_INCLUDE_DIR} ${LLVM_MAIN_INCLUDE_DIR})
@@ -607,9 +645,9 @@ endif( ${CMAKE_SYSTEM_NAME} MATCHES SunOS )
 set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "")
 
 # enable warnings as errors for debug build
-if (WIN32)
+if (MSVC)
   SET(CMAKE_CXX_FLAGS_DEBUG  "${CMAKE_CXX_FLAGS_DEBUG} /WX")
-endif (WIN32)
+endif (MSVC)
 
 include(AddLLVM)
 include(TableGen)
@@ -620,6 +658,10 @@ if( MINGW )
   llvm_replace_compiler_option(CMAKE_CXX_FLAGS_RELEASE "-O3" "-O2")
 endif()
 
+if(LLVM_INCLUDE_TESTS AND WIN32)
+  add_definitions(/DMSFT_SUPPORTS_CHILD_PROCESSES)
+endif()
+
 # Put this before tblgen. Else we have a circular dependence.
 add_subdirectory(lib/Support)
 add_subdirectory(lib/MSSupport) # HLSL Change
@@ -628,8 +670,21 @@ add_subdirectory(lib/TableGen)
 add_subdirectory(utils/TableGen)
 
 add_subdirectory(include/llvm)
-add_subdirectory(include/dxc/Support) # HLSL Change
-add_subdirectory(include/dxc/Tracing) # HLSL Change
+# HLSL - Change Start
+add_subdirectory(include/dxc)
+
+# This over-specifies the dependency graph, but since generating these doesn't
+# really depend on anything else in the build it is safe.
+list(APPEND LLVM_COMMON_DEPENDS HCTGen) 
+
+add_subdirectory(utils/hct)
+
+if(EXISTS "${LLVM_MAIN_SRC_DIR}/external")
+  add_subdirectory(external) # SPIRV change
+endif()
+include_directories(AFTER ${DIRECTX_HEADER_INCLUDE_DIR}/directx ${DIRECTX_HEADER_INCLUDE_DIR}/wsl/stubs)
+
+# HLSL - Change End
 
 add_subdirectory(lib)
 
@@ -637,13 +692,13 @@ if (HLSL_EMBED_VERSION)
   add_subdirectory(utils/version)
 endif()
 
-if( LLVM_INCLUDE_UTILS )
-  # add_subdirectory(utils/FileCheck) # HLSL Change
+if(LLVM_INCLUDE_UTILS AND LLVM_INCLUDE_TESTS) # HLSL Change - only when testing
+  add_subdirectory(utils/FileCheck)
   # add_subdirectory(utils/FileUpdate) # HLSL Change
-  # add_subdirectory(utils/count) # HLSL Change
-  # add_subdirectory(utils/not) # HLSL Change
-  # add_subdirectory(utils/llvm-lit) # HLSL Change
-  # add_subdirectory(utils/yaml-bench) # HLSL Change
+  add_subdirectory(utils/count)
+  add_subdirectory(utils/not)
+  add_subdirectory(utils/llvm-lit)
+  add_subdirectory(utils/yaml-bench)
 else()
   if ( LLVM_INCLUDE_TESTS )
     message(FATAL_ERROR "Including tests when not building utils will not work.
@@ -651,7 +706,7 @@ else()
   endif()
 endif()
 
-if(LLVM_INCLUDE_TESTS)
+if(LLVM_INCLUDE_TESTS OR HLSL_INCLUDE_TESTS OR SPIRV_BUILD_TESTS) # HLSL Change
   add_subdirectory(utils/unittest)
 endif()
 
@@ -669,10 +724,6 @@ if(WITH_POLLY)
   endif()
 endif(WITH_POLLY)
 
-if(EXISTS "${LLVM_MAIN_SRC_DIR}/external")
-  add_subdirectory(external) # SPIRV change
-endif()
-
 if( LLVM_INCLUDE_TOOLS )
   add_subdirectory(tools)
 endif()
@@ -682,7 +733,7 @@ if( LLVM_INCLUDE_EXAMPLES AND 0 ) # HLSL Change - never build examples
   add_subdirectory(examples)
 endif()
 
-if( LLVM_INCLUDE_TESTS AND 0 ) # HLSL Change - never build tests/unittests
+if( LLVM_INCLUDE_TESTS )
   add_subdirectory(test)
   add_subdirectory(unittests)
   if (MSVC)
@@ -704,11 +755,14 @@ if( LLVM_INCLUDE_TESTS AND 0 ) # HLSL Change - never build tests/unittests
     DEPENDS ${LLVM_LIT_DEPENDS}
     ARGS ${LLVM_LIT_EXTRA_ARGS}
     )
+  add_custom_target(test-depends DEPENDS ${LLVM_LIT_DEPENDS}) # HLSL Change
 endif()
 
 if (LLVM_INCLUDE_DOCS)
   add_subdirectory(docs)
 endif()
+
+add_hlsl_hctgen(DxilDocs OUTPUT docs/DXIL.rst CODE_TAG) # HLSL Change
 
 add_subdirectory(cmake/modules)
 
@@ -746,6 +800,28 @@ if (NOT LLVM_INSTALL_TOOLCHAIN_ONLY)
                               -DCMAKE_INSTALL_COMPONENT=llvm-headers
                               -P "${CMAKE_BINARY_DIR}/cmake_install.cmake")
   endif()
+endif()
+
+include(CoverageReport)
+
+# HLSL Change begin - Set default distribution value.
+set(LLVM_DISTRIBUTION_COMPONENTS "dxc;dxcompiler;dxc-headers" CACHE STRING "")
+# HLSL Change end - Set default distribution value.
+
+# This must be at the end of the LLVM root CMakeLists file because it must run
+# after all targets are created.
+if(LLVM_DISTRIBUTION_COMPONENTS)
+  # HLSL Change - Deleted restriction for non-IDE builds. This works with Visual
+  # Studio for DXC because of the limited number of targets.
+  
+  add_custom_target(install-distribution)
+  foreach(target ${LLVM_DISTRIBUTION_COMPONENTS})
+    if(TARGET install-${target})
+      add_dependencies(install-distribution install-${target})
+    else()
+      message(FATAL_ERROR "Specified distribution component '${target}' doesn't have an install target")
+    endif()
+  endforeach()
 endif()
 
 # Disable regeneration target for official builds as they always fun a full clean build.

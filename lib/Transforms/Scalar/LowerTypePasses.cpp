@@ -7,36 +7,37 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "dxc/HLSL/HLOperations.h"
-#include "dxc/HLSL/HLModule.h"
 #include "dxc/DXIL/DxilConstants.h"
+#include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/DXIL/DxilUtil.h"
+#include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/HLOperations.h"
 #include "dxc/HlslIntrinsicOp.h"
-#include "llvm/Pass.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Local.h"
-#include "llvm/Analysis/ValueTracking.h"
 #include <vector>
 
 using namespace llvm;
 using namespace hlsl;
 
-static ArrayType* CreateNestArrayTy(Type* FinalEltTy,
-  ArrayRef<ArrayType*> nestArrayTys) {
-  Type* newAT = FinalEltTy;
-  for (auto ArrayTy = nestArrayTys.rbegin(), E = nestArrayTys.rend(); ArrayTy != E;
-    ++ArrayTy)
+static ArrayType *CreateNestArrayTy(Type *FinalEltTy,
+                                    ArrayRef<ArrayType *> nestArrayTys) {
+  Type *newAT = FinalEltTy;
+  for (auto ArrayTy = nestArrayTys.rbegin(), E = nestArrayTys.rend();
+       ArrayTy != E; ++ArrayTy)
     newAT = ArrayType::get(newAT, (*ArrayTy)->getNumElements());
   return cast<ArrayType>(newAT);
 }
@@ -47,21 +48,22 @@ static ArrayType* CreateNestArrayTy(Type* FinalEltTy,
 namespace {
 class LowerTypePass : public ModulePass {
 public:
-  explicit LowerTypePass(char &ID)
-      : ModulePass(ID) {}
+  explicit LowerTypePass(char &ID) : ModulePass(ID) {}
 
   bool runOnModule(Module &M) override;
+
 private:
   bool runOnFunction(Function &F, bool HasDbgInfo);
   AllocaInst *lowerAlloca(AllocaInst *A);
   GlobalVariable *lowerInternalGlobal(GlobalVariable *GV);
+
 protected:
   virtual bool needToLower(Value *V) = 0;
   virtual void lowerUseWithNewValue(Value *V, Value *NewV) = 0;
   virtual Type *lowerType(Type *Ty) = 0;
   virtual Constant *lowerInitVal(Constant *InitVal, Type *NewTy) = 0;
   virtual StringRef getGlobalPrefix() = 0;
-  virtual void initialize(Module &M) {};
+  virtual void initialize(Module &M){};
 };
 
 AllocaInst *LowerTypePass::lowerAlloca(AllocaInst *A) {
@@ -116,7 +118,9 @@ bool LowerTypePass::runOnFunction(Function &F, bool HasDbgInfo) {
     if (HasDbgInfo) {
       // Migrate debug info.
       DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(A);
-      if (DDI) DDI->setOperand(0, MetadataAsValue::get(Context, LocalAsMetadata::get(NewA)));
+      if (DDI)
+        DDI->setOperand(
+            0, MetadataAsValue::get(Context, LocalAsMetadata::get(NewA)));
     }
     // Replace users.
     lowerUseWithNewValue(A, NewA);
@@ -136,7 +140,6 @@ bool LowerTypePass::runOnModule(Module &M) {
     Finder.processModule(M);
   }
 
-  std::vector<AllocaInst*> multiDimAllocas;
   for (Function &F : M.functions()) {
     if (F.isDeclaration())
       continue;
@@ -159,6 +162,7 @@ bool LowerTypePass::runOnModule(Module &M) {
       HLModule::UpdateGlobalVariableDebugInfo(GV, Finder, NewGV);
     }
     // Replace users.
+    GV->removeDeadConstantUsers();
     lowerUseWithNewValue(GV, NewGV);
     // Remove GV.
     GV->removeDeadConstantUsers();
@@ -168,8 +172,7 @@ bool LowerTypePass::runOnModule(Module &M) {
   return true;
 }
 
-}
-
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // DynamicIndexingVector to Array.
@@ -178,18 +181,23 @@ bool LowerTypePass::runOnModule(Module &M) {
 namespace {
 class DynamicIndexingVectorToArray : public LowerTypePass {
   bool ReplaceAllVectors;
+  bool SupportsVectors;
+
 public:
   explicit DynamicIndexingVectorToArray(bool ReplaceAll = false)
-      : LowerTypePass(ID), ReplaceAllVectors(ReplaceAll) {}
+      : LowerTypePass(ID), ReplaceAllVectors(ReplaceAll),
+        SupportsVectors(false) {}
   static char ID; // Pass identification, replacement for typeid
   void applyOptions(PassOptions O) override;
   void dumpConfig(raw_ostream &OS) override;
+
 protected:
   bool needToLower(Value *V) override;
   void lowerUseWithNewValue(Value *V, Value *NewV) override;
   Type *lowerType(Type *Ty) override;
   Constant *lowerInitVal(Constant *InitVal, Type *NewTy) override;
   StringRef getGlobalPrefix() override { return ".v"; }
+  void initialize(Module &M) override;
 
 private:
   bool HasVectorDynamicIndexing(Value *V);
@@ -200,9 +208,20 @@ private:
   void ReplaceVectorWithArray(Value *Vec, Value *Array);
   void ReplaceVectorArrayWithArray(Value *VecArray, Value *Array);
   void ReplaceStaticIndexingOnVector(Value *V);
-  void ReplaceAddrSpaceCast(ConstantExpr *CE,
-                            Value *A, IRBuilder<> &Builder);
+  void ReplaceAddrSpaceCast(ConstantExpr *CE, Value *A, IRBuilder<> &Builder);
 };
+
+void DynamicIndexingVectorToArray::initialize(Module &M) {
+  // Set vector support according to available Dxil version.
+  // Use HLModule or metadata for version info.
+  // Otherwise retrieve from dxil module or metadata.
+  unsigned Major = 0, Minor = 0;
+  if (M.HasHLModule())
+    M.GetHLModule().GetShaderModel()->GetDxilVersion(Major, Minor);
+  else
+    dxilutil::LoadDxilVersion(&M, Major, Minor);
+  SupportsVectors = (Major == 1 && Minor >= 9);
+}
 
 void DynamicIndexingVectorToArray::applyOptions(PassOptions O) {
   GetPassOptionBool(O, "ReplaceAllVectors", &ReplaceAllVectors,
@@ -303,9 +322,21 @@ void DynamicIndexingVectorToArray::ReplaceStaticIndexingOnVector(Value *V) {
 }
 
 bool DynamicIndexingVectorToArray::needToLower(Value *V) {
+  bool MustReplaceVector = ReplaceAllVectors;
   Type *Ty = V->getType()->getPointerElementType();
-  if (dyn_cast<VectorType>(Ty)) {
-    if (isa<GlobalVariable>(V) || ReplaceAllVectors) {
+
+  if (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
+    // Array must be replaced even without dynamic indexing to remove vector
+    // type in dxil.
+    MustReplaceVector = true;
+    Ty = dxilutil::GetArrayEltTy(AT);
+  }
+
+  if (isa<VectorType>(Ty)) {
+    // Only needed for 2+ vectors where native vectors unsupported.
+    if (SupportsVectors && Ty->getVectorNumElements() > 1)
+      return false;
+    if (isa<GlobalVariable>(V) || MustReplaceVector) {
       return true;
     }
     // Don't lower local vector which only static indexing.
@@ -316,18 +347,14 @@ bool DynamicIndexingVectorToArray::needToLower(Value *V) {
       ReplaceStaticIndexingOnVector(V);
       return false;
     }
-  } else if (ArrayType *AT = dyn_cast<ArrayType>(Ty)) {
-    // Array must be replaced even without dynamic indexing to remove vector
-    // type in dxil.
-    // TODO: optimize static array index in later pass.
-    Type *EltTy = dxilutil::GetArrayEltTy(AT);
-    return isa<VectorType>(EltTy);
   }
   return false;
 }
 
-void DynamicIndexingVectorToArray::ReplaceVecGEP(Value *GEP, ArrayRef<Value *> idxList,
-                                       Value *A, IRBuilder<> &Builder) {
+void DynamicIndexingVectorToArray::ReplaceVecGEP(Value *GEP,
+                                                 ArrayRef<Value *> idxList,
+                                                 Value *A,
+                                                 IRBuilder<> &Builder) {
   Value *newGEP = Builder.CreateGEP(A, idxList);
   if (GEP->getType()->getPointerElementType()->isVectorTy()) {
     ReplaceVectorWithArray(GEP, newGEP);
@@ -337,22 +364,24 @@ void DynamicIndexingVectorToArray::ReplaceVecGEP(Value *GEP, ArrayRef<Value *> i
 }
 
 void DynamicIndexingVectorToArray::ReplaceAddrSpaceCast(ConstantExpr *CE,
-                                              Value *A, IRBuilder<> &Builder) {
+                                                        Value *A,
+                                                        IRBuilder<> &Builder) {
   // create new AddrSpaceCast.
   Value *NewAddrSpaceCast = Builder.CreateAddrSpaceCast(
-    A,
-    PointerType::get(A->getType()->getPointerElementType(),
-                      CE->getType()->getPointerAddressSpace()));
+      A, PointerType::get(A->getType()->getPointerElementType(),
+                          CE->getType()->getPointerAddressSpace()));
   ReplaceVectorWithArray(CE, NewAddrSpaceCast);
 }
 
-void DynamicIndexingVectorToArray::ReplaceVectorWithArray(Value *Vec, Value *A) {
-  unsigned size = Vec->getType()->getPointerElementType()->getVectorNumElements();
+void DynamicIndexingVectorToArray::ReplaceVectorWithArray(Value *Vec,
+                                                          Value *A) {
+  unsigned size =
+      Vec->getType()->getPointerElementType()->getVectorNumElements();
   for (auto U = Vec->user_begin(); U != Vec->user_end();) {
     User *User = (*U++);
 
     // GlobalVariable user.
-    if (ConstantExpr * CE = dyn_cast<ConstantExpr>(User)) {
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(User)) {
       if (User->user_empty())
         continue;
       if (GEPOperator *GEP = dyn_cast<GEPOperator>(User)) {
@@ -413,8 +442,9 @@ void DynamicIndexingVectorToArray::ReplaceVectorWithArray(Value *Vec, Value *A) 
 }
 
 void DynamicIndexingVectorToArray::ReplaceVecArrayGEP(Value *GEP,
-                                            ArrayRef<Value *> idxList, Value *A,
-                                            IRBuilder<> &Builder) {
+                                                      ArrayRef<Value *> idxList,
+                                                      Value *A,
+                                                      IRBuilder<> &Builder) {
   Value *newGEP = Builder.CreateGEP(A, idxList);
   Type *Ty = GEP->getType()->getPointerElementType();
   if (Ty->isVectorTy()) {
@@ -427,7 +457,8 @@ void DynamicIndexingVectorToArray::ReplaceVecArrayGEP(Value *GEP,
   }
 }
 
-void DynamicIndexingVectorToArray::ReplaceVectorArrayWithArray(Value *VA, Value *A) {
+void DynamicIndexingVectorToArray::ReplaceVectorArrayWithArray(Value *VA,
+                                                               Value *A) {
   for (auto U = VA->user_begin(); U != VA->user_end();) {
     User *User = *(U++);
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(User)) {
@@ -441,6 +472,10 @@ void DynamicIndexingVectorToArray::ReplaceVectorArrayWithArray(Value *VA, Value 
       ReplaceVecArrayGEP(GEPOp, idxList, A, Builder);
     } else if (BitCastInst *BCI = dyn_cast<BitCastInst>(User)) {
       BCI->setOperand(0, A);
+    } else if (auto *CI = dyn_cast<CallInst>(User)) {
+      IRBuilder<> B(CI);
+      auto *Cast = B.CreateBitCast(A, VA->getType());
+      CI->replaceUsesOfWith(VA, Cast);
     } else {
       DXASSERT(0, "Array pointer should only used by GEP");
     }
@@ -481,7 +516,8 @@ Type *DynamicIndexingVectorToArray::lowerType(Type *Ty) {
   return nullptr;
 }
 
-Constant *DynamicIndexingVectorToArray::lowerInitVal(Constant *InitVal, Type *NewTy) {
+Constant *DynamicIndexingVectorToArray::lowerInitVal(Constant *InitVal,
+                                                     Type *NewTy) {
   Type *VecTy = InitVal->getType();
   ArrayType *ArrayTy = cast<ArrayType>(NewTy);
   if (VecTy->isVectorTy()) {
@@ -506,16 +542,16 @@ bool DynamicIndexingVectorToArray::HasVectorDynamicIndexing(Value *V) {
   return dxilutil::HasDynamicIndexing(V);
 }
 
-}
+} // namespace
 
 char DynamicIndexingVectorToArray::ID = 0;
 
 INITIALIZE_PASS(DynamicIndexingVectorToArray, "dynamic-vector-to-array",
-  "Replace dynamic indexing vector with array", false,
-  false)
+                "Replace dynamic indexing vector with array", false, false)
 
 // Public interface to the DynamicIndexingVectorToArray pass
-ModulePass *llvm::createDynamicIndexingVectorToArrayPass(bool ReplaceAllVector) {
+ModulePass *
+llvm::createDynamicIndexingVectorToArrayPass(bool ReplaceAllVector) {
   return new DynamicIndexingVectorToArray(ReplaceAllVector);
 }
 
@@ -535,7 +571,29 @@ protected:
   Type *lowerType(Type *Ty) override;
   Constant *lowerInitVal(Constant *InitVal, Type *NewTy) override;
   StringRef getGlobalPrefix() override { return ".1dim"; }
+  bool isSafeToLowerArray(Value *V);
 };
+
+// Recurse users, looking for any direct users of array or sub-array type,
+// other than lifetime markers:
+bool MultiDimArrayToOneDimArray::isSafeToLowerArray(Value *V) {
+  if (!V->getType()->getPointerElementType()->isArrayTy())
+    return true;
+  for (auto it = V->user_begin(); it != V->user_end();) {
+    User *U = *it++;
+    if (isa<BitCastOperator>(U)) {
+      // Bitcast is ok because source type can be changed.
+      continue;
+    } else if (isa<GEPOperator>(U) || isa<AddrSpaceCastInst>(U) ||
+               isa<ConstantExpr>(U)) {
+      if (!isSafeToLowerArray(U))
+        return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
 
 bool MultiDimArrayToOneDimArray::needToLower(Value *V) {
   Type *Ty = V->getType()->getPointerElementType();
@@ -546,8 +604,8 @@ bool MultiDimArrayToOneDimArray::needToLower(Value *V) {
     return false;
   } else {
     // Merge all GEP.
-    HLModule::MergeGepUse(V);
-    return true;
+    dxilutil::MergeGepUse(V);
+    return isSafeToLowerArray(V);
   }
 }
 
@@ -559,7 +617,7 @@ void ReplaceMultiDimGEP(User *GEP, Value *OneDim, IRBuilder<> &Builder) {
   Value *ArrayIdx = GEPIt.getOperand();
   ++GEPIt;
   Value *VecIdx = nullptr;
-  SmallVector<Value*,8> StructIdxs;
+  SmallVector<Value *, 8> StructIdxs;
   for (; GEPIt != E; ++GEPIt) {
     if (GEPIt->isArrayTy()) {
       unsigned arraySize = GEPIt->getArrayNumElements();
@@ -591,7 +649,8 @@ void ReplaceMultiDimGEP(User *GEP, Value *OneDim, IRBuilder<> &Builder) {
   GEP->replaceAllUsesWith(NewGEP);
 }
 
-void MultiDimArrayToOneDimArray::lowerUseWithNewValue(Value *MultiDim, Value *OneDim) {
+void MultiDimArrayToOneDimArray::lowerUseWithNewValue(Value *MultiDim,
+                                                      Value *OneDim) {
   LLVMContext &Context = MultiDim->getContext();
   // All users should be element type.
   // Replace users of AI or GV.
@@ -612,9 +671,8 @@ void MultiDimArrayToOneDimArray::lowerUseWithNewValue(Value *MultiDim, Value *On
         ReplaceMultiDimGEP(U, OneDim, Builder);
       } else if (CE->getOpcode() == Instruction::AddrSpaceCast) {
         Value *NewAddrSpaceCast = Builder.CreateAddrSpaceCast(
-          OneDim,
-          PointerType::get(OneDim->getType()->getPointerElementType(),
-                           CE->getType()->getPointerAddressSpace()));
+            OneDim, PointerType::get(OneDim->getType()->getPointerElementType(),
+                                     CE->getType()->getPointerAddressSpace()));
         lowerUseWithNewValue(CE, NewAddrSpaceCast);
       } else {
         DXASSERT(0, "not implemented");
@@ -655,7 +713,8 @@ void FlattenMultiDimConstArray(Constant *V, std::vector<Constant *> &Elts) {
   }
 }
 
-Constant *MultiDimArrayToOneDimArray::lowerInitVal(Constant *InitVal, Type *NewTy) {
+Constant *MultiDimArrayToOneDimArray::lowerInitVal(Constant *InitVal,
+                                                   Type *NewTy) {
   if (InitVal) {
     // MultiDim array init should be done by store.
     if (isa<ConstantAggregateZero>(InitVal))
@@ -673,13 +732,12 @@ Constant *MultiDimArrayToOneDimArray::lowerInitVal(Constant *InitVal, Type *NewT
   return InitVal;
 }
 
-}
+} // namespace
 
 char MultiDimArrayToOneDimArray::ID = 0;
 
 INITIALIZE_PASS(MultiDimArrayToOneDimArray, "multi-dim-one-dim",
-  "Flatten multi-dim array into one-dim array", false,
-  false)
+                "Flatten multi-dim array into one-dim array", false, false)
 
 // Public interface to the SROA_Parameter_HLSL pass
 ModulePass *llvm::createMultiDimArrayToOneDimArrayPass() {
@@ -703,6 +761,7 @@ protected:
   Constant *lowerInitVal(Constant *InitVal, Type *NewTy) override;
   StringRef getGlobalPrefix() override { return ".res"; }
   void initialize(Module &M) override;
+
 private:
   void ReplaceResourceWithHandle(Value *ResPtr, Value *HandlePtr);
   void ReplaceResourceGEPWithHandleGEP(Value *GEP, ArrayRef<Value *> idxList,
@@ -711,7 +770,7 @@ private:
 
   Type *m_HandleTy;
   HLModule *m_pHLM;
-  bool  m_bIsLib;
+  bool m_bIsLib;
 };
 
 void ResourceToHandle::initialize(Module &M) {
@@ -775,7 +834,8 @@ void ResourceToHandle::ReplaceResourceWithHandle(Value *ResPtr,
           SI->replaceUsesOfWith(LI, TmpRes);
         } else {
           CallInst *CI = cast<CallInst>(ldU);
-          DXASSERT(hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction()) == HLOpcodeGroup::HLCreateHandle,
+          DXASSERT(hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction()) ==
+                       HLOpcodeGroup::HLCreateHandle,
                    "must be createHandle");
           CI->replaceAllUsesWith(Handle);
           CI->eraseFromParent();
@@ -801,8 +861,8 @@ void ResourceToHandle::ReplaceResourceWithHandle(Value *ResPtr,
       HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
       // Allow user function to use res ptr as argument.
       if (group == HLOpcodeGroup::NotHL) {
-          Value *TmpResPtr = Builder.CreateBitCast(HandlePtr, ResPtr->getType());
-          CI->replaceUsesOfWith(ResPtr, TmpResPtr);
+        Value *TmpResPtr = Builder.CreateBitCast(HandlePtr, ResPtr->getType());
+        CI->replaceUsesOfWith(ResPtr, TmpResPtr);
       } else {
         DXASSERT(0, "invalid operation on resource");
       }
@@ -851,13 +911,12 @@ void ResourceToHandle::lowerUseWithNewValue(Value *V, Value *NewV) {
   }
 }
 
-}
+} // namespace
 
 char ResourceToHandle::ID = 0;
 
 INITIALIZE_PASS(ResourceToHandle, "resource-handle",
-  "Lower resource into handle", false,
-  false)
+                "Lower resource into handle", false, false)
 
 // Public interface to the ResourceToHandle pass
 ModulePass *llvm::createResourceToHandlePass() {

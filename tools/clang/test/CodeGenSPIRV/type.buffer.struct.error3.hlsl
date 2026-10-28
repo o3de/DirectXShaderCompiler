@@ -1,4 +1,4 @@
-// Run: %dxc -T ps_6_0 -E main
+// RUN: not %dxc -T ps_6_0 -E main -fcgl  %s -spirv  2>&1 | FileCheck %s
 
 struct B {
     float2 b;
@@ -15,4 +15,4 @@ float4 main(): SV_Target {
     return MyBuffer[0].a.x;
 }
 
-// CHECK: :7:8: error: unsupported struct element type for resource template instantiation
+// CHECK: :12:8: error: elements of typed buffers and textures must be scalars or vectors

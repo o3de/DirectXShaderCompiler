@@ -41,6 +41,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/Support/CrashRecoveryContext.h"
+#include "llvm/Support/TimeProfiler.h"
 using namespace clang;
 using namespace sema;
 
@@ -240,6 +241,10 @@ void Sema::Initialize() {
                          Context.getAtomicType(Context.getPointerDiffType()));
     }
   }
+
+  // HLSL Change - '__builtin_LinAlgMatrix'
+  if (PP.getLangOpts().HLSL)
+    addImplicitTypedef("__builtin_LinAlgMatrix", Context.LinAlgMatrixTy);
 
   DeclarationName BuiltinVaList = &Context.Idents.get("__builtin_va_list");
   if (IdResolver.begin(BuiltinVaList) == IdResolver.end())
@@ -683,7 +688,14 @@ void Sema::ActOnEndOfTranslationUnit() {
       PendingInstantiations.insert(PendingInstantiations.begin(),
                                    Pending.begin(), Pending.end());
     }
-    PerformPendingInstantiations();
+
+    // HLSL Change Begin - Support hierarchial time tracing.
+    {
+      llvm::TimeTraceScope TimeScope("PerformPendingInstantiations",
+                                     StringRef(""));
+      PerformPendingInstantiations();
+    }
+    // HLSL Change Ends - Support hierarchial time tracing.
 
     if (LateTemplateParserCleanup)
       LateTemplateParserCleanup(OpaqueParser);

@@ -11,8 +11,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/Sema/SemaInternal.h"
 #include "TypeLocBuilder.h"
+#include "dxc/DXIL/DxilSemantic.h" // HLSL Change
+#include "dxc/HlslIntrinsicOp.h"   // HLSL Change
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
@@ -42,13 +43,14 @@
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
+#include "clang/Sema/SemaHLSL.h" // HLSL Change
+#include "clang/Sema/SemaInternal.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Triple.h"
 #include <algorithm>
 #include <cstring>
 #include <functional>
-#include "clang/Sema/SemaHLSL.h" // HLSL Change
 using namespace clang;
 using namespace sema;
 
@@ -365,6 +367,7 @@ ParsedType Sema::getTypeName(const IdentifierInfo &II, SourceLocation NameLoc,
       }
     }
     // If typo correction failed or was not performed, fall through
+    LLVM_FALLTHROUGH; // HLSL Change
   case LookupResult::FoundOverloaded:
   case LookupResult::FoundUnresolvedValue:
     Result.suppressDiagnostics();
@@ -445,6 +448,12 @@ ParsedType Sema::getTypeName(const IdentifierInfo &II, SourceLocation NameLoc,
     (void)DiagnoseUseOfDecl(IDecl, NameLoc);
     if (!HasTrailingDot)
       T = Context.getObjCInterfaceType(IDecl);
+  } else if (getLangOpts().HLSL) { // HLSL - omit empty template argument lists
+    if (TemplateDecl *TD = dyn_cast<TemplateDecl>(IIDecl)) {
+      QualType DefaultTy = getHLSLDefaultSpecialization(TD);
+      if (!DefaultTy.isNull())
+        T = DefaultTy;
+    } // HLSL Change end
   }
 
   if (T.isNull()) {
@@ -4965,8 +4974,6 @@ NamedDecl *Sema::HandleDeclarator(Scope *S, Declarator &D,
   if (!New)
     return nullptr;
 
-  TransferUnusualAttributes(D, New); // HLSL Change
-
   // If this has an identifier and is not an invalid redeclaration or 
   // function template specialization, add it to the scope stack.
   if (New->getDeclName() && AddToScope &&
@@ -5180,6 +5187,8 @@ Sema::ActOnTypedefDeclarator(Scope* S, Declarator& D, DeclContext* DC,
   bool Redeclaration = D.isRedeclaration();
   NamedDecl *ND = ActOnTypedefNameDecl(S, DC, NewTD, Previous, Redeclaration);
   D.setRedeclaration(Redeclaration);
+
+  TransferUnusualAttributes(D, ND); // HLSL Change
   return ND;
 }
 
@@ -5323,7 +5332,7 @@ bool Sema::inferObjCARCLifetime(ValueDecl *decl) {
   Qualifiers::ObjCLifetime lifetime = type.getObjCLifetime();
   if (lifetime == Qualifiers::OCL_Autoreleasing) {
     // Various kinds of declaration aren't allowed to be __autoreleasing.
-    unsigned kind = -1U;
+    unsigned kind = ~0U;
     if (VarDecl *var = dyn_cast<VarDecl>(decl)) {
       if (var->hasAttr<BlocksAttr>())
         kind = 0; // __block
@@ -5335,7 +5344,7 @@ bool Sema::inferObjCARCLifetime(ValueDecl *decl) {
       kind = 2; // field
     }
 
-    if (kind != -1U) {
+    if (kind != ~0U) {
       Diag(decl->getLocation(), diag::err_arc_autoreleasing_var)
         << kind;
     }
@@ -6195,6 +6204,7 @@ Sema::ActOnVariableDeclarator(Scope *S, Declarator &D, DeclContext *DC,
     return NewTemplate;
   }
 
+  TransferUnusualAttributes(D, NewVD); // HLSL Change
   return NewVD;
 }
 
@@ -6405,6 +6415,21 @@ static bool checkForConflictWithNonVisibleExternC(Sema &S, const T *ND,
     return checkGlobalOrExternCConflict(S, ND, /*IsGlobal*/false, Previous);
 
   // Neither global nor extern "C": nothing to do.
+  return false;
+}
+
+static bool IsDynamicHeapInitializer(const Expr *Init, bool &IsSampler) {
+  if (!Init)
+    return false;
+  QualType T = Init->IgnoreParenImpCasts()->getType();
+  if (hlsl::IsHLSLDynamicSamplerType(T)) {
+    IsSampler = true;
+    return true;
+  }
+  if (hlsl::IsHLSLDynamicResourceType(T)) {
+    IsSampler = false;
+    return true;
+  }
   return false;
 }
 
@@ -8101,6 +8126,15 @@ Sema::ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
     AddToScope = false;
   }
 
+  // HLSL Change Starts
+  TransferUnusualAttributes(D, NewFD);
+
+  if (getLangOpts().HLSL && D.isFunctionDefinition() && D.hasName() &&
+      NewFD->getDeclContext()->getRedeclContext()->isTranslationUnit()) {
+    hlsl::DiagnoseEntry(*this, NewFD);
+  }
+  // HLSL Change Ends
+
   return NewFD;
 }
 
@@ -9008,6 +9042,27 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init,
       RealDecl->setInvalidDecl();
       return;
     }
+
+    if (getLangOpts().HLSL) {
+      bool IsSampler = false;
+      if (IsDynamicHeapInitializer(DeduceInit, IsSampler)) {
+        Diag(VDecl->getLocation(), diag::err_hlsl_auto_descriptor_heap)
+            << IsSampler;
+        VDecl->setInvalidDecl();
+        return;
+      }
+
+      // A dependent deduced type cannot be classified yet; defer the check to
+      // instantiation, when 'auto' is re-deduced to a concrete type.
+      if (!DeducedType->isDependentType() &&
+          !hlsl::IsTypeDeducibleWithAuto(*this, DeducedType)) {
+        Diag(VDecl->getLocation(), diag::err_hlsl_auto_undeducible_type)
+            << DeducedType;
+        VDecl->setInvalidDecl();
+        return;
+      }
+    }
+
     VDecl->setType(DeducedType);
     assert(VDecl->isLinkageValid());
 
@@ -9029,7 +9084,6 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init,
 
     // If this is a redeclaration, check that the type we just deduced matches
     // the previously declared type.
-    assert(!getLangOpts().HLSL && "auto types are not supported - merge type below is inconsequential"); // HLSL Change
     if (VarDecl *Old = VDecl->getPreviousDecl()) {
       // We never need to merge the type, because we cannot form an incomplete
       // array of auto, nor deduce such a type.
@@ -9146,6 +9200,14 @@ void Sema::AddInitializerToDecl(Decl *RealDecl, Expr *Init,
   // Get the decls type and save a reference for later, since
   // CheckInitializerTypes may change it.
   QualType DclT = VDecl->getType(), SavT = DclT;
+
+  // HLSL Change begin
+  // When initializing an HLSL resource type we should diagnose mismatches in
+  // globally and reorder coherent annotations _unless_ the source is a dynamic
+  // resource placeholder type where we safely infer the coherence
+  // annotations.
+  DiagnoseCoherenceMismatch(Init, DclT, Init->getExprLoc());
+  // HLSL Change end
   
   // Expressions default to 'id' when we're in a debugger
   // and we are assigning it to a variable of Objective-C pointer type.
@@ -9508,7 +9570,7 @@ void Sema::ActOnUninitializedDecl(Decl *RealDecl,
       // that has an in-class initializer, so we type-check this like
       // a declaration. 
       //
-      // Fall through
+      LLVM_FALLTHROUGH; // HLSL Change
       
     case VarDecl::DeclarationOnly:
       // It's only a declaration. 
@@ -11703,7 +11765,7 @@ Decl *Sema::ActOnTag(Scope *S, unsigned TagSpec, TagUseKind TUK,
   }
 
   // HLSL Change Starts
-  if (getLangOpts().HLSLVersion == 2015 && TUK == TUK_Declaration) {
+  if (getLangOpts().HLSLVersion == hlsl::LangStd::v2015 && TUK == TUK_Declaration) {
     Diag(NameLoc, diag::err_hlsl_unsupported_construct)
         << "struct declaration without definition";
   }
@@ -13658,7 +13720,8 @@ EnumConstantDecl *Sema::CheckEnumConstant(EnumDecl *Enum,
     else {
       SourceLocation ExpLoc;
       // HLSL Change - check constant expression for enum
-      if ((getLangOpts().HLSLVersion >= 2017 || getLangOpts().CPlusPlus11) &&
+      if ((getLangOpts().HLSLVersion >= hlsl::LangStd::v2017 ||
+           getLangOpts().CPlusPlus11) &&
           Enum->isFixed() && !getLangOpts().MSVCCompat) {
         // C++11 [dcl.enum]p5: If the underlying type is fixed, [...] the
         // constant-expression in the enumerator-definition shall be a converted
@@ -13672,8 +13735,8 @@ EnumConstantDecl *Sema::CheckEnumConstant(EnumDecl *Enum,
         else
           Val = Converted.get();
       } else if (!Val->isValueDependent() &&
-                 !(Val = VerifyIntegerConstantExpression(Val,
-                                                         &EnumVal).get())) {
+                 !(Val =
+                       VerifyIntegerConstantExpression(Val, &EnumVal).get())) {
         // C99 6.7.2.2p2: Make sure we have an integer constant expression.
       } else {
         if (Enum->isFixed()) {
@@ -14604,3 +14667,20 @@ AvailabilityResult Sema::getCurContextAvailability() const {
   return D ? D->getAvailability() : AR_Available;
 }
 
+// HLSL Change Begin
+void Sema::DiagnoseSemanticDecl(hlsl::SemanticDecl *Decl) {
+  StringRef SemName = Decl->SemanticName;
+
+  StringRef BaseSemName; // The 'FOO' in 'FOO1'
+  uint32_t SemIndex;     // The '1' in 'FOO1'
+
+  // Split name and index.
+  hlsl::Semantic::DecomposeNameAndIndex(SemName, &BaseSemName, &SemIndex);
+
+  // The valid semantic indices for SV_Target[n] are 0 <= n <= 7.
+  if (BaseSemName.equals("SV_Target") && SemIndex > 7) {
+    Diag(Decl->Loc, diag::err_hlsl_unsupported_semantic_index)
+        << SemName << SemIndex << "7";
+  }
+}
+// HLSL Change Ends

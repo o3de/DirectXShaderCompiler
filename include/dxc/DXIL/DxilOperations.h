@@ -16,15 +16,16 @@ class LLVMContext;
 class Module;
 class Type;
 class StructType;
+class PointerType;
 class Function;
 class Constant;
 class Value;
 class Instruction;
 class CallInst;
-}
-#include "llvm/IR/Attributes.h"
-#include "llvm/ADT/StringRef.h"
+} // namespace llvm
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/IR/Attributes.h"
 
 #include "DxilConstants.h"
 #include <unordered_map>
@@ -36,21 +37,59 @@ class OP {
 public:
   using OpCode = DXIL::OpCode;
   using OpCodeClass = DXIL::OpCodeClass;
+  using OpCodeTableID = DXIL::OpCodeTableID;
 
 public:
   OP() = delete;
   OP(llvm::LLVMContext &Ctx, llvm::Module *pModule);
 
-  void RefreshCache();
+  // InitWithMinPrecision sets the low-precision mode and calls
+  // FixOverloadNames() and RefreshCache() to set up caches for any existing
+  // DXIL operations and types used in the module.
+  void InitWithMinPrecision(bool bMinPrecision);
+
+  // FixOverloadNames fixes the names of DXIL operation overloads, particularly
+  // when they depend on user defined type names. User defined type names can be
+  // modified by name collisions from multiple modules being loaded into the
+  // same llvm context, such as during module linking.
   void FixOverloadNames();
 
+  // RefreshCache places DXIL types and operation overloads from the module into
+  // caches.
+  void RefreshCache();
+
+  // The single llvm::Type * "OverloadType" has one of these forms:
+  // No overloads (NumOverloadDims == 0):
+  //  - TS_Void: VoidTy
+  // For single overload dimension (NumOverloadDims == 1):
+  //  - TS_F*, TS_I*: a scalar numeric type (half, float, i1, i64, etc.),
+  //  - TS_UDT: a pointer to a StructType representing a User Defined Type,
+  //  - TS_Object: a named StructType representing a built-in object, or
+  //  - TS_Vector: a vector type (<4 x float>, <16 x i16>, etc.)
+  // For multiple overload dimensions (TS_Extended, NumOverloadDims > 1):
+  //  - an unnamed StructType containing each type for the corresponding
+  //    dimension, such as: type { i32, <2 x float> }
+  //  - contained type options are the same as for single dimension.
+
   llvm::Function *GetOpFunc(OpCode OpCode, llvm::Type *pOverloadType);
-  const llvm::SmallMapVector<llvm::Type *, llvm::Function *, 8> &GetOpFuncList(OpCode OpCode) const;
+
+  // N-dimension convenience version of GetOpFunc:
+  llvm::Function *GetOpFunc(OpCode OpCode,
+                            llvm::ArrayRef<llvm::Type *> OverloadTypes);
+
+  const llvm::SmallMapVector<llvm::Type *, llvm::Function *, 8> &
+  GetOpFuncList(OpCode OpCode) const;
   bool IsDxilOpUsed(OpCode opcode) const;
   void RemoveFunction(llvm::Function *F);
   llvm::LLVMContext &GetCtx() { return m_Ctx; }
+  llvm::Module *GetModule() { return m_pModule; }
   llvm::Type *GetHandleType() const;
+  llvm::Type *GetHitObjectType() const;
+  llvm::Type *GetNodeHandleType() const;
+  llvm::Type *GetNodeRecordHandleType() const;
   llvm::Type *GetResourcePropertiesType() const;
+  llvm::Type *GetNodePropertiesType() const;
+  llvm::Type *GetNodeRecordPropertiesType() const;
   llvm::Type *GetResourceBindingType() const;
   llvm::Type *GetDimensionsType() const;
   llvm::Type *GetSamplePosType() const;
@@ -62,8 +101,13 @@ public:
 
   llvm::Type *GetResRetType(llvm::Type *pOverloadType);
   llvm::Type *GetCBufferRetType(llvm::Type *pOverloadType);
-  llvm::Type *GetVectorType(unsigned numElements, llvm::Type *pOverloadType);
+  llvm::Type *GetStructVectorType(unsigned numElements,
+                                  llvm::Type *pOverloadType);
   bool IsResRetType(llvm::Type *Ty);
+
+  // Construct an unnamed struct type containing the set of member types.
+  llvm::StructType *
+  GetExtendedOverloadType(llvm::ArrayRef<llvm::Type *> OverloadTypes);
 
   // Try to get the opcode class for a function.
   // Return true and set `opClass` if the given function is a dxil function.
@@ -72,8 +116,6 @@ public:
 
   // To check if operation uses strict precision types
   bool UseMinPrecision();
-  // Set if operation uses strict precision types or not.
-  void SetMinPrecision(bool bMinPrecision);
 
   // Get the size of the type for a given layout
   uint64_t GetAllocSizeForType(llvm::Type *Ty);
@@ -90,6 +132,8 @@ public:
   llvm::Constant *GetFloatConst(float v);
   llvm::Constant *GetDoubleConst(double v);
 
+  static OP::OpCode getOpCode(unsigned OpCode);
+  static OP::OpCode getOpCode(const llvm::Instruction *I);
   static llvm::Type *GetOverloadType(OpCode OpCode, llvm::Function *F);
   static OpCode GetDxilOpFuncCallInst(const llvm::Instruction *I);
   static const char *GetOpCodeName(OpCode OpCode);
@@ -97,27 +141,37 @@ public:
   static OpCodeClass GetOpCodeClass(OpCode OpCode);
   static const char *GetOpCodeClassName(OpCode OpCode);
   static llvm::Attribute::AttrKind GetMemAccessAttr(OpCode opCode);
+  static bool IsDxilOpConvergent(OpCode C);
   static bool IsOverloadLegal(OpCode OpCode, llvm::Type *pType);
   static bool CheckOpCodeTable();
   static bool IsDxilOpFuncName(llvm::StringRef name);
   static bool IsDxilOpFunc(const llvm::Function *F);
+  static bool IsDxilOpLinAlgFuncName(llvm::StringRef Name);
+  static bool IsDxilOpLinAlgFunc(const llvm::Function *F);
   static bool IsDxilOpFuncCallInst(const llvm::Instruction *I);
   static bool IsDxilOpFuncCallInst(const llvm::Instruction *I, OpCode opcode);
   static bool IsDxilOpWave(OpCode C);
   static bool IsDxilOpGradient(OpCode C);
   static bool IsDxilOpFeedback(OpCode C);
-  static bool IsDxilOpTypeName(llvm::StringRef name);
-  static bool IsDxilOpType(llvm::StructType *ST);
-  static bool IsDupDxilOpType(llvm::StructType *ST);
-  static llvm::StructType *GetOriginalDxilOpType(llvm::StructType *ST,
-                                                 llvm::Module &M);
+  static bool IsDxilOpBarrier(OpCode C);
+  static bool BarrierRequiresGroup(const llvm::CallInst *CI);
+  static bool BarrierRequiresNode(const llvm::CallInst *CI);
+  static bool BarrierRequiresReorder(const llvm::CallInst *CI);
+  static DXIL::BarrierMode TranslateToBarrierMode(const llvm::CallInst *CI);
   static void GetMinShaderModelAndMask(OpCode C, bool bWithTranslation,
                                        unsigned &major, unsigned &minor,
                                        unsigned &mask);
-  static void GetMinShaderModelAndMask(const llvm::CallInst *CI, bool bWithTranslation,
-                                       unsigned valMajor, unsigned valMinor,
-                                       unsigned &major, unsigned &minor,
-                                       unsigned &mask);
+  static void GetMinShaderModelAndMask(const llvm::CallInst *CI,
+                                       bool bWithTranslation, unsigned valMajor,
+                                       unsigned valMinor, unsigned &major,
+                                       unsigned &minor, unsigned &mask);
+
+  static bool IsDxilOpExtendedOverload(OpCode C);
+
+  // Return true if the overload name suffix for this operation may be
+  // constructed based on a user-defined or user-influenced type name
+  // that may not represent the same type in different linked modules.
+  static bool MayHaveNonCanonicalOverload(OpCode OC);
 
 private:
   // Per-module properties.
@@ -125,7 +179,12 @@ private:
   llvm::Module *m_pModule;
 
   llvm::Type *m_pHandleType;
+  llvm::Type *m_pHitObjectType;
+  llvm::Type *m_pNodeHandleType;
+  llvm::Type *m_pNodeRecordHandleType;
   llvm::Type *m_pResourcePropertiesType;
+  llvm::Type *m_pNodePropertiesType;
+  llvm::Type *m_pNodeRecordPropertiesType;
   llvm::Type *m_pResourceBindingType;
   llvm::Type *m_pDimensionsType;
   llvm::Type *m_pSamplePosType;
@@ -137,40 +196,107 @@ private:
 
   DXIL::LowPrecisionMode m_LowPrecisionMode;
 
-  static const unsigned kUserDefineTypeSlot = 9;
-  static const unsigned kObjectTypeSlot = 10;
-  static const unsigned kNumTypeOverloads = 11; // void, h,f,d, i1, i8,i16,i32,i64, udt, obj
+  // Overload types are split into "basic" overload types and special types
+  // Basic: void, half, float, double, i1, i8, i16, i32, i64
+  //  - These have one canonical overload per TypeSlot
+  // Special: udt, obj, vec, extended
+  //  - These may have many overloads per type slot
+  enum TypeSlot : unsigned {
+    TS_F16 = 0,
+    TS_F32 = 1,
+    TS_F64 = 2,
+    TS_I1 = 3,
+    TS_I8 = 4,
+    TS_I16 = 5,
+    TS_I32 = 6,
+    TS_I64 = 7,
+    TS_BasicCount,
+    TS_UDT = 8,      // Ex: %"struct.MyStruct" *
+    TS_Object = 9,   // Ex: %"class.StructuredBuffer<Foo>"
+    TS_Vector = 10,  // Ex: <8 x i16>
+    TS_MaskBitCount, // Types used in Mask end here
+    // TS_Extended is only used to identify the unnamed struct type used to wrap
+    // multiple overloads when using GetTypeSlot.
+    TS_Extended, // Ex: type { float, <16 x i32> }
+    TS_Invalid = UINT_MAX,
+  };
 
-  llvm::Type *m_pResRetType[kNumTypeOverloads];
-  llvm::Type *m_pCBufferRetType[kNumTypeOverloads];
+  llvm::Type *m_pResRetType[TS_BasicCount];
+  llvm::Type *m_pCBufferRetType[TS_BasicCount];
 
   struct OpCodeCacheItem {
     llvm::SmallMapVector<llvm::Type *, llvm::Function *, 8> pOverloads;
   };
   OpCodeCacheItem m_OpCodeClassCache[(unsigned)OpCodeClass::NumOpClasses];
   std::unordered_map<const llvm::Function *, OpCodeClass> m_FunctionToOpClass;
-  void UpdateCache(OpCodeClass opClass, llvm::Type * Ty, llvm::Function *F);
-private:
-  // Static properties.
+  void UpdateCache(OpCodeClass opClass, llvm::Type *Ty, llvm::Function *F);
+
+public:
+  struct OverloadMask {
+    // mask of type slot bits as (1 << TypeSlot)
+    uint16_t SlotMask;
+    static_assert(TS_MaskBitCount <= (sizeof(SlotMask) * 8));
+    bool operator[](unsigned TypeSlot) const {
+      return (TypeSlot < TS_MaskBitCount) ? (bool)(SlotMask & (1 << TypeSlot))
+                                          : 0;
+    }
+    operator bool() const { return SlotMask != 0; }
+  };
   struct OpCodeProperty {
     OpCode opCode;
     const char *pOpCodeName;
     OpCodeClass opCodeClass;
     const char *pOpCodeClassName;
-    bool bAllowOverload[kNumTypeOverloads];   // void, h,f,d, i1, i8,i16,i32,i64, udt
     llvm::Attribute::AttrKind FuncAttr;
-  };
-  static const OpCodeProperty m_OpCodeProps[(unsigned)OpCode::NumOpCodes];
 
-  static const char *m_OverloadTypeName[kNumTypeOverloads];
+    // Number of overload dimensions used by the operation.
+    unsigned int NumOverloadDims;
+
+    // Mask of supported overload types for each overload dimension.
+    OverloadMask AllowedOverloads[DXIL::kDxilMaxOloadDims];
+
+    // Mask of scalar components allowed for each demension where
+    // AllowedOverloads[n][TS_Vector] is true.
+    OverloadMask AllowedVectorElements[DXIL::kDxilMaxOloadDims];
+  };
+  struct OpCodeTable {
+    OpCodeTableID ID;
+    const OpCodeProperty *Table;
+    unsigned Count;
+  };
+
+  // Look up table using high 16-bits as table ID, low 16-bits as OpCode.
+  // Return true if valid.
+  // unsigned versions are for use with whatever value was in a DXIL Op
+  // instruction.
+  // OpIndex is the low 16-bits, for index lookup within the table.
+  static bool DecodeOpCode(unsigned EncodedOpCode, OpCodeTableID &TableID,
+                           unsigned &OpIndex,
+                           unsigned *OptTableIndex = nullptr);
+  static bool DecodeOpCode(OpCode EncodedOpCode, OpCodeTableID &TableID,
+                           unsigned &OpIndex,
+                           unsigned *OptTableIndex = nullptr);
+  static bool IsValidOpCode(unsigned EncodedOpCode);
+  static bool IsValidOpCode(OpCode EncodedOpCode);
+
+private:
+  // Static properties.
+  static OpCodeTable g_OpCodeTables[DXIL::NumOpCodeTables];
+  static const OpCodeProperty &GetOpCodeProps(unsigned opCode);
+  static const OpCodeProperty &GetOpCodeProps(OpCode opCode);
+
+  static const char *m_OverloadTypeName[TS_BasicCount];
   static const char *m_NamePrefix;
   static const char *m_TypePrefix;
   static const char *m_MatrixTypePrefix;
+  static const char *m_LinAlgNamePrefix;
   static unsigned GetTypeSlot(llvm::Type *pType);
   static const char *GetOverloadTypeName(unsigned TypeSlot);
-  static llvm::StringRef GetTypeName(llvm::Type *Ty, std::string &str);
-  static llvm::StringRef ConstructOverloadName(llvm::Type *Ty, DXIL::OpCode opCode,
-                                               std::string &funcNameStorage);
+  static llvm::StringRef GetTypeName(llvm::Type *Ty,
+                                     llvm::SmallVectorImpl<char> &Storage);
+  static llvm::StringRef
+  ConstructOverloadName(llvm::Type *Ty, DXIL::OpCode opCode,
+                        llvm::SmallVectorImpl<char> &Storage);
 };
 
 } // namespace hlsl

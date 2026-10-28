@@ -30,6 +30,13 @@ endif( NOT MSVC )
 # HLSL Change - add ignored sources
 set(HLSL_IGNORE_SOURCES DynamicLibrary.cpp PluginLoader.cpp)
 
+# HLSL Change Begin - Add implicit filesystem when tests are enabled
+if (LLVM_INCLUDE_TESTS)
+  set_source_files_properties(Path.cpp
+    PROPERTIES COMPILE_DEFINITIONS "MS_IMPLICIT_DISK_FILESYSTEM")
+endif()
+# HLSL Change End
+
 add_llvm_library(LLVMSupport
   APFloat.cpp
   APInt.cpp
@@ -124,6 +131,7 @@ add_llvm_library(LLVMSupport
   TargetRegistry.cpp
   ThreadLocal.cpp
   Threading.cpp
+  TimeProfiler.cpp # HLSL Change - Support hierarchial time tracing.
   TimeValue.cpp
   Valgrind.cpp
   Watchdog.cpp
@@ -137,6 +145,8 @@ add_llvm_library(LLVMSupport
   )
 
 set_property(TARGET LLVMSupport PROPERTY LLVM_SYSTEM_LIBS "${system_libs}")
-if(WIN32)
+if(MSVC)
 set_property(TARGET LLVMSupport PROPERTY COMPILE_FLAGS /EHsc )
-endif(WIN32)
+endif(MSVC)
+
+target_link_libraries(LLVMSupport PUBLIC LLVMMSSupport) # HLSL Change

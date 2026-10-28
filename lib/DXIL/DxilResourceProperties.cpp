@@ -8,17 +8,18 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "dxc/DXIL/DxilResourceProperties.h"
-#include "llvm/IR/Constant.h"
-#include "dxc/DXIL/DxilShaderModel.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Constants.h"
-#include "dxc/DXIL/DxilResourceBase.h"
-#include "dxc/DXIL/DxilResource.h"
 #include "dxc/DXIL/DxilCBuffer.h"
-#include "dxc/DXIL/DxilSampler.h"
-#include "dxc/DXIL/DxilOperations.h"
 #include "dxc/DXIL/DxilInstructions.h"
+#include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilResource.h"
+#include "dxc/DXIL/DxilResourceBase.h"
+#include "dxc/DXIL/DxilSampler.h"
+#include "dxc/DXIL/DxilShaderModel.h"
 #include "dxc/DXIL/DxilUtil.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Module.h"
 
 using namespace llvm;
 
@@ -73,19 +74,20 @@ unsigned DxilResourceProperties::getElementStride() const {
   }
 }
 
-bool DxilResourceProperties::operator==(const DxilResourceProperties &RP) const {
-  return RawDword0 == RP.RawDword0 &&
-         RawDword1 == RP.RawDword1;
+bool DxilResourceProperties::operator==(
+    const DxilResourceProperties &RP) const {
+  return RawDword0 == RP.RawDword0 && RawDword1 == RP.RawDword1;
 }
 
-bool DxilResourceProperties::operator!=(const DxilResourceProperties &RP) const {
-  return !(*this == RP) ;
+bool DxilResourceProperties::operator!=(
+    const DxilResourceProperties &RP) const {
+  return !(*this == RP);
 }
 
 namespace resource_helper {
 
 // The constant is as struct with int32 fields.
-// ShaderModel 6.6 has 2 fileds.
+// ShaderModel 6.6 has 2 fields.
 Constant *getAsConstant(const DxilResourceProperties &RP, Type *Ty,
                         const ShaderModel &) {
   StructType *ST = cast<StructType>(Ty);
@@ -101,6 +103,17 @@ Constant *getAsConstant(const DxilResourceProperties &RP, Type *Ty,
     break;
   }
   return nullptr;
+}
+
+llvm::Type *GetResourcePropertiesType(Module &M) {
+  LLVMContext &Ctx = M.getContext();
+  StringRef Name = "dx.types.ResourceProperties";
+  if (StructType *ST = M.getTypeByName(Name))
+    return ST;
+
+  Type *Int32Ty = Type::getInt32Ty(Ctx);
+  Type *Elements[] = {Int32Ty, Int32Ty};
+  return StructType::create(Ctx, Elements, Name);
 }
 
 DxilResourceProperties loadPropsFromConstant(const Constant &C) {
@@ -142,7 +155,6 @@ DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *Res) {
     return RP;
   }
 
-
   auto SetResProperties = [&RP](const DxilResource &Res) {
     switch (Res.GetKind()) {
     default:
@@ -154,8 +166,7 @@ DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *Res) {
     case DXIL::ResourceKind::RTAccelerationStructure:
 
       break;
-    case DXIL::ResourceKind::StructuredBuffer:
-    {
+    case DXIL::ResourceKind::StructuredBuffer: {
       RP.StructStrideInBytes = Res.GetElementStride();
       RP.Basic.BaseAlignLog2 = Res.GetBaseAlignLog2();
       break;
@@ -173,13 +184,16 @@ DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *Res) {
       Type *Ty = Res.GetRetType();
       RP.Typed.CompCount = dxilutil::GetResourceComponentCount(Ty);
       RP.Typed.CompType = (uint8_t)Res.GetCompType().GetKind();
+      RP.Typed.SampleCount = (uint8_t)Res.GetSampleCount();
       break;
     }
   };
 
-  switch (Res->GetClass()) { case DXIL::ResourceClass::Invalid: return RP;
+  switch (Res->GetClass()) {
+  case DXIL::ResourceClass::Invalid:
+    return RP;
   case DXIL::ResourceClass::SRV: {
-    const DxilResource *SRV = (const DxilResource*)(Res);
+    const DxilResource *SRV = (const DxilResource *)(Res);
     RP.Basic.ResourceKind = (uint8_t)Res->GetKind();
     SetResProperties(*SRV);
   } break;
@@ -188,13 +202,14 @@ DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *Res) {
     RP.Basic.IsUAV = true;
     RP.Basic.ResourceKind = (uint8_t)Res->GetKind();
     RP.Basic.IsGloballyCoherent = UAV->IsGloballyCoherent();
+    RP.Basic.IsReorderCoherent = UAV->IsReorderCoherent();
     RP.Basic.SamplerCmpOrHasCounter = UAV->HasCounter();
     RP.Basic.IsROV = UAV->IsROV();
     SetResProperties(*UAV);
   } break;
   case DXIL::ResourceClass::Sampler: {
     RP.Basic.ResourceKind = (uint8_t)Res->GetKind();
-    const DxilSampler *Sampler = (const DxilSampler*)Res;
+    const DxilSampler *Sampler = (const DxilSampler *)Res;
     if (Sampler->GetSamplerKind() == DXIL::SamplerKind::Comparison)
       RP.Basic.SamplerCmpOrHasCounter = true;
     else if (Sampler->GetSamplerKind() == DXIL::SamplerKind::Invalid)
@@ -207,6 +222,68 @@ DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *Res) {
   } break;
   }
   return RP;
+}
+
+// Merge 2 props on a chain of annotateHandle.
+DxilResourceProperties tryMergeProps(DxilResourceProperties curProps,
+                                     DxilResourceProperties prevProps) {
+  DxilResourceProperties props;
+  if (curProps.Basic.ResourceKind != prevProps.Basic.ResourceKind) {
+    return props;
+  }
+
+  if (curProps.Basic.IsUAV != prevProps.Basic.IsUAV)
+    return props;
+
+  if (curProps.Basic.IsUAV) {
+    // Or hasCounter.
+    if (curProps.Basic.SamplerCmpOrHasCounter !=
+        prevProps.Basic.SamplerCmpOrHasCounter) {
+      curProps.Basic.SamplerCmpOrHasCounter = true;
+      prevProps.Basic.SamplerCmpOrHasCounter = true;
+    }
+    // curProps follow prevProps.
+    if (curProps.Basic.IsGloballyCoherent !=
+        prevProps.Basic.IsGloballyCoherent) {
+      curProps.Basic.IsGloballyCoherent = prevProps.Basic.IsGloballyCoherent;
+    }
+    if (curProps.Basic.IsReorderCoherent != prevProps.Basic.IsReorderCoherent)
+      curProps.Basic.IsReorderCoherent = prevProps.Basic.IsReorderCoherent;
+  }
+
+  if (curProps.Basic.ResourceKind == (uint8_t)DXIL::ResourceKind::CBuffer) {
+    // use max cbuffer size.
+    if (curProps.CBufferSizeInBytes != prevProps.CBufferSizeInBytes) {
+      curProps.CBufferSizeInBytes =
+          std::max(curProps.CBufferSizeInBytes, prevProps.CBufferSizeInBytes);
+      prevProps.CBufferSizeInBytes = curProps.CBufferSizeInBytes;
+    }
+  }
+
+  // If still not match after merge.
+  // return null.
+  if (curProps.RawDword0 != prevProps.RawDword0 ||
+      curProps.RawDword1 != prevProps.RawDword1)
+    return props;
+  return curProps;
+}
+// Merge 2 props on a chain of annotateHandle.
+Constant *tryMergeProps(const Constant *curPropsConst,
+                        const Constant *prevPropsConst, Type *Ty,
+                        const ShaderModel &SM) {
+  if (curPropsConst == prevPropsConst)
+    return const_cast<Constant *>(curPropsConst);
+
+  DxilResourceProperties curProps = loadPropsFromConstant(*curPropsConst);
+  DxilResourceProperties prevProps = loadPropsFromConstant(*prevPropsConst);
+
+  DxilResourceProperties props = tryMergeProps(curProps, prevProps);
+
+  if (!props.isValid()) {
+    return nullptr;
+  }
+
+  return getAsConstant(props, Ty, SM);
 }
 
 } // namespace resource_helper

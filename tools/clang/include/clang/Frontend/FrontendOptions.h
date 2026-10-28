@@ -92,7 +92,7 @@ class FrontendInputFile {
   bool IsSystem;
 
 public:
-  FrontendInputFile() : Buffer(nullptr), Kind(IK_None) { }
+  FrontendInputFile() : Buffer(nullptr), Kind(IK_None), IsSystem(false) {}
   FrontendInputFile(StringRef File, InputKind Kind, bool IsSystem = false)
     : File(File.str()), Buffer(nullptr), Kind(Kind), IsSystem(IsSystem) { }
   FrontendInputFile(llvm::MemoryBuffer *buffer, InputKind Kind,
@@ -128,6 +128,8 @@ public:
                                            /// metrics and statistics.
   unsigned ShowTimers : 1;                 ///< Show timers for individual
                                            /// actions.
+  unsigned TimeTrace : 1;                  /// HLSL Change
+                                           /// Output time trace profile.
   unsigned ShowVersion : 1;                ///< Show the -version text.
   unsigned FixWhatYouCan : 1;              ///< Apply fixes even if there are
                                            /// unfixable errors.
@@ -252,11 +254,17 @@ public:
   /// \brief File name of the file that will provide record layouts
   /// (in the format produced by -fdump-record-layouts).
   std::string OverrideRecordLayoutsFile;
-  
+
+  /// If given, the minimum time granularity (in microseconds) traced by
+  /// time profiler is set to this value.
+  unsigned TimeTraceGranularity;
+
 public:
   FrontendOptions() :
     DisableFree(false), RelocatablePCH(false), ShowHelp(false),
-    ShowStats(false), ShowTimers(false), ShowVersion(false),
+// HLSL Change Begin - Support hierarchial time tracing.
+    ShowStats(false), ShowTimers(false), TimeTrace(false), ShowVersion(false),
+// HLSL Change End - Support hierarchial time tracing.
     FixWhatYouCan(false), FixOnlyWarnings(false), FixAndRecompile(false),
     FixToTemporaries(false), ARCMTMigrateEmitARCErrors(false),
     SkipFunctionBodies(false), UseGlobalModuleIndex(true),

@@ -17,17 +17,19 @@
 #include <algorithm>
 #include <iterator>
 
+#include "LowerTypeVisitor.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace clang {
 namespace spirv {
 
-InitListHandler::InitListHandler(const ASTContext &ctx, SpirvEmitter &emitter)
+InitListHandler::InitListHandler(ASTContext &ctx, SpirvEmitter &emitter)
     : astContext(ctx), theEmitter(emitter),
       spvBuilder(emitter.getSpirvBuilder()),
       diags(emitter.getDiagnosticsEngine()) {}
 
-SpirvInstruction *InitListHandler::processInit(const InitListExpr *expr) {
+SpirvInstruction *InitListHandler::processInit(const InitListExpr *expr,
+                                               SourceRange rangeOverride) {
   initializers.clear();
   scalars.clear();
 
@@ -36,7 +38,9 @@ SpirvInstruction *InitListHandler::processInit(const InitListExpr *expr) {
   // tail of the vector. This is more efficient than using a deque.
   std::reverse(std::begin(initializers), std::end(initializers));
 
-  return doProcess(expr->getType(), expr->getExprLoc());
+  SourceRange range =
+      (rangeOverride != SourceRange()) ? rangeOverride : expr->getSourceRange();
+  return doProcess(expr->getType(), expr->getExprLoc(), range);
 }
 
 SpirvInstruction *InitListHandler::processCast(QualType toType,
@@ -44,14 +48,17 @@ SpirvInstruction *InitListHandler::processCast(QualType toType,
   initializers.clear();
   scalars.clear();
 
-  initializers.push_back(theEmitter.loadIfGLValue(expr));
+  auto *initializer = theEmitter.loadIfGLValue(expr);
+  if (initializer)
+    initializers.push_back(initializer);
 
   return doProcess(toType, expr->getExprLoc());
 }
 
 SpirvInstruction *InitListHandler::doProcess(QualType type,
-                                             SourceLocation srcLoc) {
-  auto *init = createInitForType(type, srcLoc);
+                                             SourceLocation srcLoc,
+                                             SourceRange range) {
+  auto *init = createInitForType(type, srcLoc, range);
 
   if (init) {
     // For successful translation, we should have consumed all initializers and
@@ -70,13 +77,13 @@ void InitListHandler::flatten(const InitListExpr *expr) {
     const Expr *init = expr->getInit(i);
     if (const auto *subInitList = dyn_cast<InitListExpr>(init)) {
       flatten(subInitList);
-    } else if (const auto *subInitList = dyn_cast<InitListExpr>(
-                   // Ignore constructor casts which are no-ops
-                   // For cases like: <type>(<initializer-list>)
-                   init->IgnoreParenNoopCasts(theEmitter.getASTContext()))) {
-      flatten(subInitList);
     } else {
-      initializers.push_back(theEmitter.loadIfGLValue(init));
+      auto *initializer = theEmitter.loadIfGLValue(init);
+      if (!initializer) {
+        initializers.clear();
+        return;
+      }
+      initializers.push_back(initializer);
     }
   }
 }
@@ -101,8 +108,8 @@ void InitListHandler::decompose(SpirvInstruction *inst,
   // Vector cases, including mat1xN and matNx1 where N > 1.
   else if (isVectorType(type, &elemType, &elemCount)) {
     for (uint32_t i = 0; i < elemCount; ++i) {
-      auto *element =
-          spvBuilder.createCompositeExtract(elemType, inst, {i}, loc);
+      auto *element = spvBuilder.createCompositeExtract(
+          elemType, inst, {i}, loc, inst->getSourceRange());
       scalars.emplace_back(element, elemType);
     }
   }
@@ -127,12 +134,16 @@ bool InitListHandler::tryToSplitStruct() {
     return false;
 
   auto *init = initializers.back();
+  if (!init)
+    return false;
+
   const QualType initType = init->getAstResultType();
   if (!initType->isStructureType() ||
       // Sampler types will pass the above check but we cannot split it.
       isSampler(initType) ||
       // Can not split structuredOrByteBuffer
-      isAKindOfStructuredOrByteBuffer(initType))
+      isAKindOfStructuredOrByteBuffer(initType) ||
+      hlsl::IsVKBufferPointerType(initType))
     return false;
 
   // We are certain the current intializer will be replaced by now.
@@ -147,6 +158,7 @@ bool InitListHandler::tryToSplitStruct() {
   for (auto *field : structDecl->fields()) {
     auto *extract =
         spvBuilder.createCompositeExtract(field->getType(), init, {i}, loc);
+    extract->setLayoutRule(init->getLayoutRule());
     fields.push_back(extract);
     ++i;
   }
@@ -162,6 +174,9 @@ bool InitListHandler::tryToSplitConstantArray() {
     return false;
 
   auto *init = initializers.back();
+  if (!init)
+    return false;
+
   const QualType initType = init->getAstResultType();
   if (!initType->isConstantArrayType())
     return false;
@@ -193,7 +208,8 @@ bool InitListHandler::tryToSplitConstantArray() {
 }
 
 SpirvInstruction *InitListHandler::createInitForType(QualType type,
-                                                     SourceLocation srcLoc) {
+                                                     SourceLocation srcLoc,
+                                                     SourceRange range) {
   type = type.getCanonicalType();
 
   if (type->isBuiltinType())
@@ -202,15 +218,15 @@ SpirvInstruction *InitListHandler::createInitForType(QualType type,
   QualType elemType = {};
   uint32_t elemCount = 0;
   if (isVectorType(type, &elemType, &elemCount))
-    return createInitForVectorType(elemType, elemCount, srcLoc);
+    return createInitForVectorType(elemType, elemCount, srcLoc, range);
 
   // The purpose of this check is for vectors of size 1 (for which isVectorType
   // is false).
   if (isScalarType(type, &elemType))
-    return createInitForVectorType(elemType, 1, srcLoc);
+    return createInitForVectorType(elemType, 1, srcLoc, range);
 
   if (hlsl::IsHLSLMatType(type)) {
-    return createInitForMatrixType(type, srcLoc);
+    return createInitForMatrixType(type, srcLoc, range);
   }
 
   // Samplers, (RW)Buffers, (RW)Textures
@@ -223,11 +239,16 @@ SpirvInstruction *InitListHandler::createInitForType(QualType type,
     return createInitForBufferOrImageType(type, srcLoc);
   }
 
+  // If the type is a buffer pointer add a special case.
+  if (hlsl::IsVKBufferPointerType(type)) {
+    return createInitForBufferOrImageType(type, srcLoc);
+  }
+
   if (type->isStructureType())
-    return createInitForStructType(type, srcLoc);
+    return createInitForStructType(type, srcLoc, range);
 
   if (type->isConstantArrayType())
-    return createInitForConstantArrayType(type, srcLoc);
+    return createInitForConstantArrayType(type, srcLoc, range);
 
   emitError("initializer for type %0 unimplemented", srcLoc) << type;
   return nullptr;
@@ -248,6 +269,10 @@ InitListHandler::createInitForBuiltinType(QualType type,
   while (tryToSplitStruct() || tryToSplitConstantArray())
     ;
 
+  if (initializers.empty()) {
+    return nullptr;
+  }
+
   auto init = initializers.back();
   initializers.pop_back();
 
@@ -261,7 +286,8 @@ InitListHandler::createInitForBuiltinType(QualType type,
 
 SpirvInstruction *
 InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
-                                         SourceLocation srcLoc) {
+                                         SourceLocation srcLoc,
+                                         SourceRange range) {
   // If we don't have leftover scalars, we can try to see if there is a vector
   // of the same size in the original initializer list so that we can use it
   // directly. For all other cases, we need to construct a new vector as the
@@ -270,6 +296,10 @@ InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
     // Keep splitting structs or arrays
     while (tryToSplitStruct() || tryToSplitConstantArray())
       ;
+
+    // Not enough elements in the initializer list. Giving up.
+    if (initializers.empty())
+      return nullptr;
 
     auto init = initializers.back();
     const auto initType = init->getAstResultType();
@@ -283,7 +313,7 @@ InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
       /// in all type casting methods in SpirvEmitter.
       const auto toVecType =
           theEmitter.getASTContext().getExtVectorType(elemType, count);
-      return theEmitter.castToType(init, initType, toVecType, srcLoc);
+      return theEmitter.castToType(init, initType, toVecType, srcLoc, range);
     }
   }
 
@@ -300,12 +330,11 @@ InitListHandler::createInitForVectorType(QualType elemType, uint32_t count,
   const QualType vecType = astContext.getExtVectorType(elemType, count);
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(vecType, elements, srcLoc);
+  return spvBuilder.createCompositeConstruct(vecType, elements, srcLoc, range);
 }
 
-SpirvInstruction *
-InitListHandler::createInitForMatrixType(QualType matrixType,
-                                         SourceLocation srcLoc) {
+SpirvInstruction *InitListHandler::createInitForMatrixType(
+    QualType matrixType, SourceLocation srcLoc, SourceRange range) {
   uint32_t rowCount = 0, colCount = 0;
   hlsl::GetHLSLMatRowColCount(matrixType, rowCount, colCount);
   const QualType elemType = hlsl::GetHLSLMatElementType(matrixType);
@@ -317,6 +346,10 @@ InitListHandler::createInitForMatrixType(QualType matrixType,
     while (tryToSplitStruct() || tryToSplitConstantArray())
       ;
 
+    // Not enough elements in the initializer list. Giving up.
+    if (initializers.empty())
+      return nullptr;
+
     auto init = initializers.back();
 
     if (hlsl::IsHLSLMatType(init->getAstResultType())) {
@@ -326,29 +359,32 @@ InitListHandler::createInitForMatrixType(QualType matrixType,
       if (rowCount == initRowCount && colCount == initColCount) {
         initializers.pop_back();
         return theEmitter.castToType(init, init->getAstResultType(), matrixType,
-                                     srcLoc);
+                                     srcLoc, range);
       }
     }
   }
 
   if (rowCount == 1)
-    return createInitForVectorType(elemType, colCount, srcLoc);
+    return createInitForVectorType(elemType, colCount, srcLoc, range);
   if (colCount == 1)
-    return createInitForVectorType(elemType, rowCount, srcLoc);
+    return createInitForVectorType(elemType, rowCount, srcLoc, range);
 
   llvm::SmallVector<SpirvInstruction *, 4> vectors;
   for (uint32_t i = 0; i < rowCount; ++i) {
     // All elements are vectors, which should already be casted to the correct
     // type if necessary.
-    vectors.push_back(createInitForVectorType(elemType, colCount, srcLoc));
+    vectors.push_back(
+        createInitForVectorType(elemType, colCount, srcLoc, range));
   }
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(matrixType, vectors, srcLoc);
+  return spvBuilder.createCompositeConstruct(matrixType, vectors, srcLoc,
+                                             range);
 }
 
 SpirvInstruction *
-InitListHandler::createInitForStructType(QualType type, SourceLocation srcLoc) {
+InitListHandler::createInitForStructType(QualType type, SourceLocation srcLoc,
+                                         SourceRange range) {
   assert(type->isStructureType() && !isSampler(type));
 
   // Same as the vector case, first try to see if we already have a struct at
@@ -358,13 +394,17 @@ InitListHandler::createInitForStructType(QualType type, SourceLocation srcLoc) {
     while (tryToSplitConstantArray())
       ;
 
-    auto init = initializers.back();
-    // We can only avoid decomposing and reconstructing when the type is
-    // exactly the same.
-    if (type.getCanonicalType() ==
-        init->getAstResultType().getCanonicalType()) {
-      initializers.pop_back();
-      return init;
+    // Note: an empty initializer list can be valid. Ex: initializing an
+    // empty struct.
+    if (!initializers.empty()) {
+      auto init = initializers.back();
+      // We can only avoid decomposing and reconstructing when the type is
+      // exactly the same.
+      if (type.getCanonicalType() ==
+          init->getAstResultType().getCanonicalType()) {
+        initializers.pop_back();
+        return init;
+      }
     }
 
     // Otherwise, if the next initializer is a struct, it is not of the same
@@ -374,21 +414,61 @@ InitListHandler::createInitForStructType(QualType type, SourceLocation srcLoc) {
     tryToSplitStruct();
   }
 
-  llvm::SmallVector<SpirvInstruction *, 4> fields;
-  const RecordDecl *structDecl = type->getAsStructureType()->getDecl();
-  for (const auto *field : structDecl->fields()) {
-    fields.push_back(createInitForType(field->getType(), field->getLocation()));
-    if (!fields.back())
-      return nullptr;
-  }
+  const RecordType *recordType = type->getAs<RecordType>();
+  assert(recordType);
 
-  // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(type, fields, srcLoc);
+  LowerTypeVisitor lowerTypeVisitor(astContext, theEmitter.getSpirvContext(),
+                                    theEmitter.getSpirvOptions(),
+                                    theEmitter.getSpirvBuilder());
+  const SpirvType *spirvType =
+      lowerTypeVisitor.lowerType(type, SpirvLayoutRule::Void, false, srcLoc);
+
+  llvm::SmallVector<SpirvInstruction *, 4> fields;
+  const StructType *structType = dyn_cast<StructType>(spirvType);
+  assert(structType != nullptr);
+  forEachSpirvField(
+      recordType, structType,
+      [this, &fields, srcLoc, range](size_t spirvFieldIndex,
+                                     const QualType &fieldType,
+                                     const StructType::FieldInfo &fieldInfo) {
+        SpirvInstruction *init = createInitForType(fieldType, srcLoc, range);
+        if (!init)
+          return false;
+
+        // For non bit-fields, `init` will be the value for the component.
+        if (!fieldInfo.bitfield.hasValue()) {
+          assert(fields.size() == fieldInfo.fieldIndex);
+          fields.push_back(init);
+          return true;
+        }
+
+        // For a bit fields we need to insert it into the container.
+        // The first time we see this bit field, init is used as the value.
+        // This assumes that 0 is the first offset in the bitfield.
+        if (fields.size() <= fieldInfo.fieldIndex) {
+          assert(fieldInfo.bitfield->offsetInBits == 0);
+          fields.push_back(init);
+          return true;
+        }
+
+        // For the remaining bitfields, we need to insert them into the existing
+        // container, which is the last element in `fields`.
+        assert(fields.size() == fieldInfo.fieldIndex + 1);
+        fields.back() = spvBuilder.createBitFieldInsert(
+            fieldType, fields.back(), init, fieldInfo.bitfield->offsetInBits,
+            fieldInfo.bitfield->sizeInBits, srcLoc, range);
+        return true;
+      },
+      true);
+
+  for (const auto *field : fields)
+    if (field == nullptr)
+      return nullptr;
+  return spvBuilder.createCompositeConstruct(type, fields, srcLoc, range);
 }
 
-SpirvInstruction *
-InitListHandler::createInitForConstantArrayType(QualType type,
-                                                SourceLocation srcLoc) {
+SpirvInstruction *InitListHandler::createInitForConstantArrayType(
+    QualType type, SourceLocation srcLoc, SourceRange range) {
   assert(type->isConstantArrayType());
 
   // Same as the vector case, first try to see if we already have an array at
@@ -397,6 +477,10 @@ InitListHandler::createInitForConstantArrayType(QualType type,
     // Keep splitting structs
     while (tryToSplitStruct())
       ;
+
+    // Not enough elements in the initializer list. Giving up.
+    if (initializers.empty())
+      return nullptr;
 
     auto init = initializers.back();
     // We can only avoid decomposing and reconstructing when the type is
@@ -420,17 +504,22 @@ InitListHandler::createInitForConstantArrayType(QualType type,
   const auto size = static_cast<uint32_t>(arrType->getSize().getZExtValue());
 
   llvm::SmallVector<SpirvInstruction *, 4> elements;
-  for (uint32_t i = 0; i < size; ++i)
-    elements.push_back(createInitForType(elemType, srcLoc));
+  for (uint32_t i = 0; i < size; ++i) {
+    auto *it = createInitForType(elemType, srcLoc, range);
+    if (!it)
+      return nullptr;
+    elements.push_back(it);
+  }
 
   // TODO: use OpConstantComposite when all components are constants
-  return spvBuilder.createCompositeConstruct(type, elements, srcLoc);
+  return spvBuilder.createCompositeConstruct(type, elements, srcLoc, range);
 }
 
 SpirvInstruction *
 InitListHandler::createInitForBufferOrImageType(QualType type,
                                                 SourceLocation srcLoc) {
-  assert(isOpaqueType(type) || isAKindOfStructuredOrByteBuffer(type));
+  assert(isOpaqueType(type) || isAKindOfStructuredOrByteBuffer(type) ||
+         hlsl::IsVKBufferPointerType(type));
 
   // Samplers, (RW)Buffers, and (RW)Textures are translated into OpTypeSampler
   // and OpTypeImage. They should be treated similar as builtin types.
@@ -451,8 +540,16 @@ InitListHandler::createInitForBufferOrImageType(QualType type,
   while (tryToSplitStruct() || tryToSplitConstantArray())
     ;
 
+  // Not enough elements in the initializer list. Giving up.
+  if (initializers.empty()) {
+    return nullptr;
+  }
+
   auto init = initializers.back();
   initializers.pop_back();
+
+  if (!init)
+    return nullptr;
 
   if (init->getAstResultType().getCanonicalType() != type.getCanonicalType()) {
     emitError("Cannot cast initializer type %0 into variable type %1", srcLoc)

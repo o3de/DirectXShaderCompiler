@@ -14,14 +14,26 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "dxc/DXIL/DxilConstants.h"
+#include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilTypeSystem.h"
+#include "dxc/DXIL/DxilUtil.h"
+#include "dxc/HLSL/HLLowerUDT.h"
+#include "dxc/HLSL/HLMatrixLowerHelper.h"
+#include "dxc/HLSL/HLMatrixType.h"
+#include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/HLOperations.h"
+#include "dxc/HLSL/HLUtil.h"
+#include "dxc/HlslIntrinsicOp.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/Loads.h"
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DIBuilder.h"
@@ -33,10 +45,10 @@
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
@@ -45,26 +57,14 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
-#include "llvm/Transforms/Utils/Local.h"
-#include "dxc/HLSL/HLOperations.h"
-#include "dxc/DXIL/DxilConstants.h"
-#include "dxc/HLSL/HLModule.h"
-#include "dxc/DXIL/DxilUtil.h"
-#include "dxc/DXIL/DxilModule.h"
-#include "dxc/HlslIntrinsicOp.h"
-#include "dxc/DXIL/DxilTypeSystem.h"
-#include "dxc/HLSL/HLMatrixLowerHelper.h"
-#include "dxc/HLSL/HLMatrixType.h"
-#include "dxc/DXIL/DxilOperations.h"
-#include "dxc/HLSL/HLLowerUDT.h"
-#include "dxc/HLSL/HLUtil.h"
 #include <deque>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
-#include <queue>
 
 using namespace llvm;
 using namespace hlsl;
@@ -76,20 +76,21 @@ namespace {
 
 class SROA_Helper {
 public:
-  // Split V into AllocaInsts with Builder and save the new AllocaInsts into Elts.
-  // Then do SROA on V.
+  // Split V into AllocaInsts with Builder and save the new AllocaInsts into
+  // Elts. Then do SROA on V.
   static bool DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
                                   Type *&BrokenUpTy, uint64_t &NumInstances,
                                   IRBuilder<> &Builder, bool bFlatVector,
-                                  bool hasPrecise, DxilTypeSystem &typeSys,
-                                  const DataLayout &DL,
+                                  bool SupportsVectors, bool hasPrecise,
+                                  DxilTypeSystem &typeSys, const DataLayout &DL,
                                   SmallVector<Value *, 32> &DeadInsts,
                                   DominatorTree *DT);
 
-  static bool DoScalarReplacement(GlobalVariable *GV, std::vector<Value *> &Elts,
+  static bool DoScalarReplacement(GlobalVariable *GV,
+                                  std::vector<Value *> &Elts,
                                   IRBuilder<> &Builder, bool bFlatVector,
-                                  bool hasPrecise, DxilTypeSystem &typeSys,
-                                  const DataLayout &DL,
+                                  bool SupportsVectors, bool hasPrecise,
+                                  DxilTypeSystem &typeSys, const DataLayout &DL,
                                   SmallVector<Value *, 32> &DeadInsts,
                                   DominatorTree *DT);
   static unsigned GetEltAlign(unsigned ValueAlign, const DataLayout &DL,
@@ -101,20 +102,22 @@ public:
   static void MarkEmptyStructUsers(Value *V,
                                    SmallVector<Value *, 32> &DeadInsts);
   static bool IsEmptyStructType(Type *Ty, DxilTypeSystem &typeSys);
+
 private:
   SROA_Helper(Value *V, ArrayRef<Value *> Elts,
               SmallVector<Value *, 32> &DeadInsts, DxilTypeSystem &ts,
               const DataLayout &dl, DominatorTree *dt)
-    : OldVal(V), NewElts(Elts), DeadInsts(DeadInsts), typeSys(ts), DL(dl), DT(dt) {}
+      : OldVal(V), NewElts(Elts), DeadInsts(DeadInsts), typeSys(ts), DL(dl),
+        DT(dt) {}
   void RewriteForScalarRepl(Value *V, IRBuilder<> &Builder);
 
 private:
   // Must be a pointer type val.
-  Value * OldVal;
+  Value *OldVal;
   // Flattened elements for OldVal.
-  ArrayRef<Value*> NewElts;
+  ArrayRef<Value *> NewElts;
   SmallVector<Value *, 32> &DeadInsts;
-  DxilTypeSystem  &typeSys;
+  DxilTypeSystem &typeSys;
   const DataLayout &DL;
   DominatorTree *DT;
 
@@ -126,10 +129,9 @@ private:
   void RewriteMemIntrin(MemIntrinsic *MI, Value *OldV);
   void RewriteCall(CallInst *CI);
   void RewriteBitCast(BitCastInst *BCI);
-  void RewriteCallArg(CallInst *CI, unsigned ArgIdx, bool bIn, bool bOut);
 };
 
-}
+} // namespace
 
 static unsigned getNestedLevelInStruct(const Type *ty) {
   unsigned lvl = 0;
@@ -144,118 +146,139 @@ static unsigned getNestedLevelInStruct(const Type *ty) {
 
 // After SROA'ing a given value into a series of elements,
 // creates the debug info for the storage of the individual elements.
-static void addDebugInfoForElements(Value *ParentVal,
-    Type *BrokenUpTy, uint64_t NumInstances,
-    ArrayRef<Value*> Elems, const DataLayout &DatLayout,
-    DIBuilder *DbgBuilder) {
+static void addDebugInfoForElements(Value *ParentVal, Type *BrokenUpTy,
+                                    uint64_t NumInstances,
+                                    ArrayRef<Value *> Elems,
+                                    const DataLayout &DatLayout,
+                                    DIBuilder *DbgBuilder) {
 
   // Extract the data we need from the parent value,
   // depending on whether it is an alloca, argument or global variable.
-  Type *ParentTy;
-  unsigned ParentBitPieceOffset = 0;
-  std::vector<DxilDIArrayDim> DIArrayDims;
-  DIVariable *ParentDbgVariable;
-  DIExpression *ParentDbgExpr;
-  DILocation *ParentDbgLocation;
-  Instruction *DbgDeclareInsertPt = nullptr;
+
   if (isa<GlobalVariable>(ParentVal)) {
-    llvm_unreachable("Not implemented: sroa debug info propagation for global vars.");
-  }
-  else {
+    llvm_unreachable(
+        "Not implemented: sroa debug info propagation for global vars.");
+  } else {
+    Type *ParentTy = nullptr;
+
     if (AllocaInst *ParentAlloca = dyn_cast<AllocaInst>(ParentVal))
       ParentTy = ParentAlloca->getAllocatedType();
     else
       ParentTy = cast<Argument>(ParentVal)->getType();
 
-    DbgDeclareInst *ParentDbgDeclare = llvm::FindAllocaDbgDeclare(ParentVal);
-    if (ParentDbgDeclare == nullptr) return;
+    SmallVector<DbgDeclareInst *, 4> Declares;
+    llvm::FindAllocaDbgDeclare(ParentVal, Declares);
 
-    // Get the bit piece offset
-    if ((ParentDbgExpr = ParentDbgDeclare->getExpression())) {
-      if (ParentDbgExpr->isBitPiece()) {
-        ParentBitPieceOffset = ParentDbgExpr->getBitPieceOffset();
-      }
-    }
-    
-    ParentDbgVariable = ParentDbgDeclare->getVariable();
-    ParentDbgLocation = ParentDbgDeclare->getDebugLoc();
-    DbgDeclareInsertPt = ParentDbgDeclare;
+    for (DbgDeclareInst *ParentDbgDeclare : Declares) {
+      unsigned ParentBitPieceOffset = 0;
+      DIVariable *ParentDbgVariable = nullptr;
+      DIExpression *ParentDbgExpr = nullptr;
+      DILocation *ParentDbgLocation = nullptr;
+      Instruction *DbgDeclareInsertPt = nullptr;
 
-    // Read the extra layout metadata, if any
-    unsigned ParentBitPieceOffsetFromMD = 0;
-    if (DxilMDHelper::GetVariableDebugLayout(ParentDbgDeclare, ParentBitPieceOffsetFromMD, DIArrayDims)) {
-      // The offset is redundant for local variables and only necessary for global variables.
-      DXASSERT(ParentBitPieceOffsetFromMD == ParentBitPieceOffset,
-        "Bit piece offset mismatch between llvm.dbg.declare and DXIL metadata.");
-    }
-  }
-
-  // If the type that was broken up is nested in arrays,
-  // then each element will also be an array,
-  // but the continuity between successive elements of the original aggregate
-  // will have been broken, such that we must store the stride to rebuild it.
-  // For example: [2 x {i32, float}] => [2 x i32], [2 x float], each with stride 64 bits
-  if (NumInstances > 1 && Elems.size() > 1) {
-    // Existing dimensions already account for part of the stride
-    uint64_t NewDimNumElements = NumInstances;
-    for (const DxilDIArrayDim& ArrayDim : DIArrayDims) {
-      DXASSERT(NewDimNumElements % ArrayDim.NumElements == 0,
-        "Debug array stride is inconsistent with the number of elements.");
-      NewDimNumElements /= ArrayDim.NumElements;
-    }
-
-    // Add a stride dimension
-    DxilDIArrayDim NewDIArrayDim = {};
-    NewDIArrayDim.StrideInBits = (unsigned)DatLayout.getTypeAllocSizeInBits(BrokenUpTy);
-    NewDIArrayDim.NumElements = (unsigned)NewDimNumElements;
-    DIArrayDims.emplace_back(NewDIArrayDim);
-  }
-  else {
-    DIArrayDims.clear();
-  }
-
-  // Create the debug info for each element
-  for (unsigned ElemIdx = 0; ElemIdx < Elems.size(); ++ElemIdx) {
-    // Figure out the offset of the element in the broken up type
-    unsigned ElemBitPieceOffset = ParentBitPieceOffset;
-    if (StructType *ParentStructTy = dyn_cast<StructType>(BrokenUpTy)) {
-      DXASSERT_NOMSG(Elems.size() == ParentStructTy->getNumElements());
-      ElemBitPieceOffset += (unsigned)DatLayout.getStructLayout(ParentStructTy)->getElementOffsetInBits(ElemIdx);
-    }
-    else if (VectorType *ParentVecTy = dyn_cast<VectorType>(BrokenUpTy)) {
-      DXASSERT_NOMSG(Elems.size() == ParentVecTy->getNumElements());
-      ElemBitPieceOffset += (unsigned)DatLayout.getTypeStoreSizeInBits(ParentVecTy->getElementType()) * ElemIdx;
-    }
-    else if (ArrayType *ParentArrayTy = dyn_cast<ArrayType>(BrokenUpTy)) {
-      DXASSERT_NOMSG(Elems.size() == ParentArrayTy->getNumElements());
-      ElemBitPieceOffset += (unsigned)DatLayout.getTypeStoreSizeInBits(ParentArrayTy->getElementType()) * ElemIdx;
-    }
-
-    // The bit_piece can only represent the leading contiguous bytes.
-    // If strides are involved, we'll need additional metadata.
-    Type *ElemTy = Elems[ElemIdx]->getType()->getPointerElementType();
-    unsigned ElemBitPieceSize = (unsigned)DatLayout.getTypeStoreSizeInBits(ElemTy);
-    for (const DxilDIArrayDim& ArrayDim : DIArrayDims)
-      ElemBitPieceSize /= ArrayDim.NumElements;
-
-    if (AllocaInst *ElemAlloca = dyn_cast<AllocaInst>(Elems[ElemIdx])) {
-      // Local variables get an @llvm.dbg.declare plus optional metadata for layout stride information.
-      DIExpression *ElemDbgExpr = nullptr;
-      if (ElemBitPieceOffset == 0 && DatLayout.getTypeAllocSizeInBits(ParentTy) == ElemBitPieceSize) {
-        ElemDbgExpr = DbgBuilder->createExpression();
-      }
-      else {
-        ElemDbgExpr = DbgBuilder->createBitPieceExpression(ElemBitPieceOffset, ElemBitPieceSize);
+      std::vector<DxilDIArrayDim> DIArrayDims;
+      // Get the bit piece offset
+      if ((ParentDbgExpr = ParentDbgDeclare->getExpression())) {
+        if (ParentDbgExpr->isBitPiece()) {
+          ParentBitPieceOffset = ParentDbgExpr->getBitPieceOffset();
+        }
       }
 
-      DXASSERT_NOMSG(DbgBuilder != nullptr);
-      DbgDeclareInst *EltDDI = cast<DbgDeclareInst>(DbgBuilder->insertDeclare(
-        ElemAlloca, cast<DILocalVariable>(ParentDbgVariable), ElemDbgExpr, ParentDbgLocation, DbgDeclareInsertPt));
+      ParentDbgVariable = ParentDbgDeclare->getVariable();
+      ParentDbgLocation = ParentDbgDeclare->getDebugLoc();
+      DbgDeclareInsertPt = ParentDbgDeclare;
 
-      if (!DIArrayDims.empty()) DxilMDHelper::SetVariableDebugLayout(EltDDI, ElemBitPieceOffset, DIArrayDims);
-    }
-    else {
-      llvm_unreachable("Non-AllocaInst SROA'd elements.");
+      // Read the extra layout metadata, if any
+      unsigned ParentBitPieceOffsetFromMD = 0;
+      if (DxilMDHelper::GetVariableDebugLayout(
+              ParentDbgDeclare, ParentBitPieceOffsetFromMD, DIArrayDims)) {
+        // The offset is redundant for local variables and only necessary for
+        // global variables.
+        DXASSERT(ParentBitPieceOffsetFromMD == ParentBitPieceOffset,
+                 "Bit piece offset mismatch between llvm.dbg.declare and DXIL "
+                 "metadata.");
+      }
+
+      // If the type that was broken up is nested in arrays,
+      // then each element will also be an array,
+      // but the continuity between successive elements of the original
+      // aggregate will have been broken, such that we must store the stride to
+      // rebuild it. For example: [2 x {i32, float}] => [2 x i32], [2 x float],
+      // each with stride 64 bits
+      if (NumInstances > 1 && Elems.size() > 1) {
+        // Existing dimensions already account for part of the stride
+        uint64_t NewDimNumElements = NumInstances;
+        for (const DxilDIArrayDim &ArrayDim : DIArrayDims) {
+          DXASSERT(NewDimNumElements % ArrayDim.NumElements == 0,
+                   "Debug array stride is inconsistent with the number of "
+                   "elements.");
+          NewDimNumElements /= ArrayDim.NumElements;
+        }
+
+        // Add a stride dimension
+        DxilDIArrayDim NewDIArrayDim = {};
+        NewDIArrayDim.StrideInBits =
+            (unsigned)DatLayout.getTypeAllocSizeInBits(BrokenUpTy);
+        NewDIArrayDim.NumElements = (unsigned)NewDimNumElements;
+        DIArrayDims.emplace_back(NewDIArrayDim);
+      } else {
+        DIArrayDims.clear();
+      }
+
+      // Create the debug info for each element
+      for (unsigned ElemIdx = 0; ElemIdx < Elems.size(); ++ElemIdx) {
+        // Figure out the offset of the element in the broken up type
+        unsigned ElemBitPieceOffset = ParentBitPieceOffset;
+        if (StructType *ParentStructTy = dyn_cast<StructType>(BrokenUpTy)) {
+          DXASSERT_NOMSG(Elems.size() == ParentStructTy->getNumElements());
+          ElemBitPieceOffset +=
+              (unsigned)DatLayout.getStructLayout(ParentStructTy)
+                  ->getElementOffsetInBits(ElemIdx);
+        } else if (VectorType *ParentVecTy = dyn_cast<VectorType>(BrokenUpTy)) {
+          DXASSERT_NOMSG(Elems.size() == ParentVecTy->getNumElements());
+          ElemBitPieceOffset += (unsigned)DatLayout.getTypeStoreSizeInBits(
+                                    ParentVecTy->getElementType()) *
+                                ElemIdx;
+        } else if (ArrayType *ParentArrayTy = dyn_cast<ArrayType>(BrokenUpTy)) {
+          DXASSERT_NOMSG(Elems.size() == ParentArrayTy->getNumElements());
+          ElemBitPieceOffset += (unsigned)DatLayout.getTypeStoreSizeInBits(
+                                    ParentArrayTy->getElementType()) *
+                                ElemIdx;
+        }
+
+        // The bit_piece can only represent the leading contiguous bytes.
+        // If strides are involved, we'll need additional metadata.
+        Type *ElemTy = Elems[ElemIdx]->getType()->getPointerElementType();
+        unsigned ElemBitPieceSize =
+            (unsigned)DatLayout.getTypeStoreSizeInBits(ElemTy);
+        for (const DxilDIArrayDim &ArrayDim : DIArrayDims)
+          ElemBitPieceSize /= ArrayDim.NumElements;
+
+        if (AllocaInst *ElemAlloca = dyn_cast<AllocaInst>(Elems[ElemIdx])) {
+          // Local variables get an @llvm.dbg.declare plus optional metadata for
+          // layout stride information.
+          DIExpression *ElemDbgExpr = nullptr;
+          if (ElemBitPieceOffset == 0 &&
+              DatLayout.getTypeAllocSizeInBits(ParentTy) == ElemBitPieceSize) {
+            ElemDbgExpr = DbgBuilder->createExpression();
+          } else {
+            ElemDbgExpr = DbgBuilder->createBitPieceExpression(
+                ElemBitPieceOffset, ElemBitPieceSize);
+          }
+
+          DXASSERT_NOMSG(DbgBuilder != nullptr);
+          DbgDeclareInst *EltDDI =
+              cast<DbgDeclareInst>(DbgBuilder->insertDeclare(
+                  ElemAlloca, cast<DILocalVariable>(ParentDbgVariable),
+                  ElemDbgExpr, ParentDbgLocation, DbgDeclareInsertPt));
+
+          if (!DIArrayDims.empty())
+            DxilMDHelper::SetVariableDebugLayout(EltDDI, ElemBitPieceOffset,
+                                                 DIArrayDims);
+        } else {
+          llvm_unreachable("Non-AllocaInst SROA'd elements.");
+        }
+      }
     }
   }
 }
@@ -264,7 +287,7 @@ static void addDebugInfoForElements(Value *ParentVal,
 /// Ignores initial ptr index.
 static unsigned FindFirstStructMemberIdxInGEP(GEPOperator *GEP) {
   StructType *ST = dyn_cast<StructType>(
-    GEP->getPointerOperandType()->getPointerElementType());
+      GEP->getPointerOperandType()->getPointerElementType());
   int index = 1;
   for (auto it = gep_type_begin(GEP), E = gep_type_end(GEP); it != E;
        ++it, ++index) {
@@ -283,9 +306,8 @@ static unsigned FindFirstStructMemberIdxInGEP(GEPOperator *GEP) {
 /// What is meant by directly here:
 ///   Possibly accessed through GEP array index or address space cast, but
 ///   not under another struct member (always allow SROA of outer struct).
-typedef SmallMapVector<CallInst*, unsigned, 4> FunctionUseMap;
-static unsigned IsPtrUsedByLoweredFn(
-    Value *V, FunctionUseMap &CollectedUses) {
+typedef SmallMapVector<CallInst *, unsigned, 4> FunctionUseMap;
+static unsigned IsPtrUsedByLoweredFn(Value *V, FunctionUseMap &CollectedUses) {
   bool bFound = false;
   for (Use &U : V->uses()) {
     User *user = U.getUser();
@@ -294,57 +316,56 @@ static unsigned IsPtrUsedByLoweredFn(
       unsigned foundIdx = (unsigned)-1;
       Function *F = CI->getCalledFunction();
       Type *Ty = V->getType();
-      if (F->isDeclaration() && !F->isIntrinsic() &&
-          Ty->isPointerTy()) {
+      if (F->isDeclaration() && !F->isIntrinsic() && Ty->isPointerTy()) {
         HLOpcodeGroup group = hlsl::GetHLOpcodeGroupByName(F);
         if (group == HLOpcodeGroup::HLIntrinsic) {
           unsigned opIdx = U.getOperandNo();
           switch ((IntrinsicOp)hlsl::GetHLOpcode(CI)) {
-            // TODO: Lower these as well, along with function parameter types
-            //case IntrinsicOp::IOP_TraceRay:
-            //  if (opIdx != HLOperandIndex::kTraceRayPayLoadOpIdx)
-            //    continue;
-            //  break;
-            //case IntrinsicOp::IOP_ReportHit:
-            //  if (opIdx != HLOperandIndex::kReportIntersectionAttributeOpIdx)
-            //    continue;
-            //  break;
-            //case IntrinsicOp::IOP_CallShader:
-            //  if (opIdx != HLOperandIndex::kCallShaderPayloadOpIdx)
-            //    continue;
-            //  break;
-            case IntrinsicOp::IOP_DispatchMesh:
-              if (opIdx != HLOperandIndex::kDispatchMeshOpPayload)
-                continue;
-              break;
-            default:
+          // TODO: Lower these as well, along with function parameter types
+          // case IntrinsicOp::IOP_TraceRay:
+          //  if (opIdx != HLOperandIndex::kTraceRayPayLoadOpIdx)
+          //    continue;
+          //  break;
+          // case IntrinsicOp::IOP_ReportHit:
+          //  if (opIdx != HLOperandIndex::kReportIntersectionAttributeOpIdx)
+          //    continue;
+          //  break;
+          // case IntrinsicOp::IOP_CallShader:
+          //  if (opIdx != HLOperandIndex::kCallShaderPayloadOpIdx)
+          //    continue;
+          //  break;
+          case IntrinsicOp::IOP_DispatchMesh:
+            if (opIdx != HLOperandIndex::kDispatchMeshOpPayload)
               continue;
+            break;
+          default:
+            continue;
           }
           foundIdx = opIdx;
 
-        // TODO: Lower these as well, along with function parameter types
-        //} else if (group == HLOpcodeGroup::NotHL) {
-        //  foundIdx = U.getOperandNo();
+          // TODO: Lower these as well, along with function parameter types
+          //} else if (group == HLOpcodeGroup::NotHL) {
+          //  foundIdx = U.getOperandNo();
         }
       }
       if (foundIdx != (unsigned)-1) {
         bFound = true;
         auto insRes = CollectedUses.insert(std::make_pair(CI, foundIdx));
         DXASSERT_LOCALVAR(insRes, insRes.second,
-            "otherwise, multiple uses in single call");
+                          "otherwise, multiple uses in single call");
       }
 
     } else if (GEPOperator *GEP = dyn_cast<GEPOperator>(user)) {
       // Not what we are looking for if GEP result is not [array of] struct.
       // If use is under struct member, we can still SROA the outer struct.
       if (!dxilutil::StripArrayTypes(GEP->getType()->getPointerElementType())
-            ->isStructTy() ||
+               ->isStructTy() ||
           FindFirstStructMemberIdxInGEP(GEP))
         continue;
       if (IsPtrUsedByLoweredFn(user, CollectedUses))
         bFound = true;
 
-    } else if (AddrSpaceCastInst *AC = dyn_cast<AddrSpaceCastInst>(user)) {
+    } else if (isa<AddrSpaceCastInst>(user)) {
       if (IsPtrUsedByLoweredFn(user, CollectedUses))
         bFound = true;
 
@@ -359,7 +380,8 @@ static unsigned IsPtrUsedByLoweredFn(
 }
 
 /// Rewrite call to natively use an argument with addrspace cast/bitcast
-static CallInst *RewriteIntrinsicCallForCastedArg(CallInst *CI, unsigned argIdx) {
+static CallInst *RewriteIntrinsicCallForCastedArg(CallInst *CI,
+                                                  unsigned argIdx) {
   Function *F = CI->getCalledFunction();
   HLOpcodeGroup group = GetHLOpcodeGroupByName(F);
   DXASSERT_NOMSG(group == HLOpcodeGroup::HLIntrinsic);
@@ -372,9 +394,11 @@ static CallInst *RewriteIntrinsicCallForCastedArg(CallInst *CI, unsigned argIdx)
   newArgTypes[argIdx] = newArg->getType();
   newArgs[argIdx] = newArg;
 
-  FunctionType *newFuncTy = FunctionType::get(CI->getType(), newArgTypes, false);
-  Function *newF = GetOrCreateHLFunction(*F->getParent(), newFuncTy, group, opcode,
-                                         F->getAttributes().getFnAttributes());
+  FunctionType *newFuncTy =
+      FunctionType::get(CI->getType(), newArgTypes, false);
+  Function *newF =
+      GetOrCreateHLFunction(*F->getParent(), newFuncTy, group, opcode,
+                            F->getAttributes().getFnAttributes());
 
   IRBuilder<> Builder(CI);
   return Builder.CreateCall(newF, newArgs);
@@ -383,8 +407,8 @@ static CallInst *RewriteIntrinsicCallForCastedArg(CallInst *CI, unsigned argIdx)
 /// Translate pointer for cases where intrinsics use UDT pointers directly
 /// Return existing or new ptr if needs preserving,
 /// otherwise nullptr to proceed with existing checks and SROA.
-static Value *TranslatePtrIfUsedByLoweredFn(
-    Value *Ptr, DxilTypeSystem &TypeSys) {
+static Value *TranslatePtrIfUsedByLoweredFn(Value *Ptr,
+                                            DxilTypeSystem &TypeSys) {
   if (!Ptr->getType()->isPointerTy())
     return nullptr;
   Type *Ty = Ptr->getType()->getPointerElementType();
@@ -413,19 +437,17 @@ static Value *TranslatePtrIfUsedByLoweredFn(
     if (GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
       Module &M = *GV->getParent();
       // Rewrite init expression for arrays instead of vectors
-      Constant *Init = GV->hasInitializer() ?
-        GV->getInitializer() : UndefValue::get(Ptr->getType());
-      Constant *NewInit = TranslateInitForLoweredUDT(
-        Init, NewTy, &TypeSys);
+      Constant *Init = GV->hasInitializer() ? GV->getInitializer()
+                                            : UndefValue::get(Ptr->getType());
+      Constant *NewInit = TranslateInitForLoweredUDT(Init, NewTy, &TypeSys);
       // Replace with new GV, and rewrite vector load/store users
       GlobalVariable *NewGV = new GlobalVariable(
-          M, NewTy, GV->isConstant(), GV->getLinkage(),
-          NewInit, GV->getName(), /*InsertBefore*/ GV,
-          GV->getThreadLocalMode(), AddrSpace);
+          M, NewTy, GV->isConstant(), GV->getLinkage(), NewInit, GV->getName(),
+          /*InsertBefore*/ GV, GV->getThreadLocalMode(), AddrSpace);
       NewPtr = NewGV;
     } else if (AllocaInst *AI = dyn_cast<AllocaInst>(Ptr)) {
       IRBuilder<> Builder(AI);
-      AllocaInst * NewAI = Builder.CreateAlloca(NewTy, nullptr, AI->getName());
+      AllocaInst *NewAI = Builder.CreateAlloca(NewTy, nullptr, AI->getName());
       NewPtr = NewAI;
     } else {
       DXASSERT(false, "Ptr must be global or alloca");
@@ -487,14 +509,13 @@ static bool isCompatibleAggregate(Type *T1, Type *T2) {
   return false;
 }
 
-
 /// LoadVectorArray - Load vector array like [2 x <4 x float>] from
 ///  arrays like 4 [2 x float] or struct array like
 ///  [2 x { <4 x float>, < 4 x uint> }]
 /// from arrays like [ 2 x <4 x float> ], [ 2 x <4 x uint> ].
 static Value *LoadVectorOrStructArray(ArrayType *AT, ArrayRef<Value *> NewElts,
-                              SmallVector<Value *, 8> &idxList,
-                              IRBuilder<> &Builder) {
+                                      SmallVector<Value *, 8> &idxList,
+                                      IRBuilder<> &Builder) {
   Type *EltTy = AT->getElementType();
   Value *retVal = llvm::UndefValue::get(AT);
   Type *i32Ty = Type::getInt32Ty(EltTy->getContext());
@@ -508,8 +529,8 @@ static Value *LoadVectorOrStructArray(ArrayType *AT, ArrayRef<Value *> NewElts,
       Value *EltVal = LoadVectorOrStructArray(EltAT, NewElts, idxList, Builder);
       retVal = Builder.CreateInsertValue(retVal, EltVal, i);
     } else {
-      assert((EltTy->isVectorTy() ||
-              EltTy->isStructTy()) && "must be a vector or struct type");
+      assert((EltTy->isVectorTy() || EltTy->isStructTy()) &&
+             "must be a vector or struct type");
       bool isVectorTy = EltTy->isVectorTy();
       Value *retVec = llvm::UndefValue::get(EltTy);
 
@@ -539,9 +560,9 @@ static Value *LoadVectorOrStructArray(ArrayType *AT, ArrayRef<Value *> NewElts,
 ///  [2 x { <4 x float>, < 4 x uint> }]
 /// from arrays like [ 2 x <4 x float> ], [ 2 x <4 x uint> ].
 static void StoreVectorOrStructArray(ArrayType *AT, Value *val,
-                             ArrayRef<Value *> NewElts,
-                             SmallVector<Value *, 8> &idxList,
-                             IRBuilder<> &Builder) {
+                                     ArrayRef<Value *> NewElts,
+                                     SmallVector<Value *, 8> &idxList,
+                                     IRBuilder<> &Builder) {
   Type *EltTy = AT->getElementType();
   Type *i32Ty = Type::getInt32Ty(EltTy->getContext());
 
@@ -555,8 +576,8 @@ static void StoreVectorOrStructArray(ArrayType *AT, Value *val,
     if (ArrayType *EltAT = dyn_cast<ArrayType>(EltTy)) {
       StoreVectorOrStructArray(EltAT, elt, NewElts, idxList, Builder);
     } else {
-      assert((EltTy->isVectorTy() ||
-              EltTy->isStructTy()) && "must be a vector or struct type");
+      assert((EltTy->isVectorTy() || EltTy->isStructTy()) &&
+             "must be a vector or struct type");
       bool isVectorTy = EltTy->isVectorTy();
       if (isVectorTy) {
         for (uint32_t c = 0; c < EltTy->getVectorNumElements(); c++) {
@@ -983,9 +1004,11 @@ void DeleteMemcpy(MemCpyInst *MI) {
     if (op0->user_empty())
       op0->eraseFromParent();
   }
-  if (Instruction *op1 = dyn_cast<Instruction>(Op1)) {
-    if (op1->user_empty())
-      op1->eraseFromParent();
+  if (Op0 != Op1) {
+    if (Instruction *op1 = dyn_cast<Instruction>(Op1)) {
+      if (op1->user_empty())
+        op1->eraseFromParent();
+    }
   }
 }
 
@@ -1008,7 +1031,8 @@ DxilFieldAnnotation *FindAnnotationFromMatUser(Value *Mat,
 }
 
 namespace {
-bool isCBVec4ArrayToScalarArray(Type *TyV, Value *Src, Type *TySrc, const DataLayout &DL) {
+bool isCBVec4ArrayToScalarArray(Type *TyV, Value *Src, Type *TySrc,
+                                const DataLayout &DL) {
   Value *SrcPtr = Src;
   while (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(SrcPtr)) {
     SrcPtr = GEP->getPointerOperand();
@@ -1078,7 +1102,7 @@ bool trySplitCBVec4ArrayToScalarArray(Value *Dest, Type *TyV, Value *Src,
   return true;
 }
 
-}
+} // namespace
 
 void MemcpySplitter::SplitMemCpy(MemCpyInst *MI, const DataLayout &DL,
                                  DxilFieldAnnotation *fieldAnnotation,
@@ -1453,6 +1477,62 @@ void isSafePHISelectUseForScalarRepl(Instruction *I, uint64_t Offset,
   }
 }
 
+// Returns whether the `OpIdx` argument of HL intrinsic call `CI` is expected to
+// be a user-defined-type.
+static bool isUDTIntrinsicArg(CallInst *CI, unsigned OpIdx) {
+  if (HLOpcodeGroup::HLIntrinsic != GetHLOpcodeGroup(CI->getCalledFunction()))
+    return false;
+  const unsigned NumOps = CI->getNumArgOperands();
+  switch (static_cast<IntrinsicOp>(GetHLOpcode(CI))) {
+  case IntrinsicOp::IOP_TraceRay:
+    if (NumOps == HLOperandIndex::kTraceRay_PreNumOp &&
+        OpIdx == HLOperandIndex::kTraceRayPayloadPreOpIdx)
+      return true;
+    else if (NumOps == HLOperandIndex::kTraceRay_NumOp &&
+             OpIdx == HLOperandIndex::kTraceRayPayloadOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::IOP_ReportHit:
+    if (OpIdx == HLOperandIndex::kReportIntersectionAttributeOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::IOP_CallShader:
+    if (OpIdx == HLOperandIndex::kCallShaderPayloadOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::IOP_TriangleObjectPositions:
+    // Not UDT exactly, but sret parameter that needs the same treatment.
+    if (OpIdx == HLOperandIndex::kIOP_SRetOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::MOP_DxHitObject_FromRayQuery:
+    if (NumOps == HLOperandIndex::kHitObjectFromRayQuery_WithAttrs_NumOp &&
+        OpIdx ==
+            HLOperandIndex::kHitObjectFromRayQuery_WithAttrs_AttributeOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::MOP_DxHitObject_TraceRay:
+    if (NumOps == HLOperandIndex::kHitObjectTraceRay_PreNumOp &&
+        OpIdx == HLOperandIndex::kHitObjectTraceRay_PayloadPreOpIdx)
+      return true;
+    else if (NumOps == HLOperandIndex::kHitObjectTraceRay_NumOp &&
+             OpIdx == HLOperandIndex::kHitObjectTraceRay_PayloadOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::MOP_DxHitObject_Invoke:
+    if (OpIdx == HLOperandIndex::kHitObjectInvoke_PayloadOpIdx)
+      return true;
+    break;
+  case IntrinsicOp::MOP_DxHitObject_GetAttributes:
+    if (OpIdx == HLOperandIndex::kHitObjectGetAttributes_AttributeOpIdx)
+      return true;
+    break;
+  default:
+    break;
+  }
+  return false;
+}
+
 /// isSafeForScalarRepl - Check if instruction I is a safe use with regard to
 /// performing scalar replacement of alloca AI.  The results are flagged in
 /// the Info parameter.  Offset indicates the position within AI that is
@@ -1510,16 +1590,9 @@ void isSafeForScalarRepl(Instruction *I, uint64_t Offset, AllocaInfo &Info) {
       // Most HL functions are safe for scalar repl.
       if (HLOpcodeGroup::NotHL == group)
         return MarkUnsafe(Info, User);
-      else if (HLOpcodeGroup::HLIntrinsic == group) {
-        // TODO: should we check HL parameter type for UDT overload instead of
-        // basing on IOP?
-        IntrinsicOp opcode = static_cast<IntrinsicOp>(GetHLOpcode(CI));
-        if (IntrinsicOp::IOP_TraceRay == opcode ||
-            IntrinsicOp::IOP_ReportHit == opcode ||
-            IntrinsicOp::IOP_CallShader == opcode) {
-          return MarkUnsafe(Info, User);
-        }
-      }
+      else if (HLOpcodeGroup::HLIntrinsic == group &&
+               isUDTIntrinsicArg(CI, U.getOperandNo()))
+        return MarkUnsafe(Info, User);
     } else {
       return MarkUnsafe(Info, User);
     }
@@ -1622,6 +1695,10 @@ bool hasDynamicVectorIndexing(Value *V) {
         }
       }
     }
+    // Also recursively check the uses of this User to find a possible
+    // dynamically indexed GEP of this GEP.
+    if (hasDynamicVectorIndexing(U))
+      return true;
   }
   return false;
 }
@@ -1668,9 +1745,6 @@ void RemoveUnusedInternalGlobalVariable(Module &M) {
         Value *User = *(UserIt++);
         if (Instruction *I = dyn_cast<Instruction>(User)) {
           I->eraseFromParent();
-        } else {
-          ConstantExpr *CE = cast<ConstantExpr>(User);
-          CE->dropAllReferences();
         }
       }
       GV->eraseFromParent();
@@ -1681,8 +1755,8 @@ void RemoveUnusedInternalGlobalVariable(Module &M) {
 bool isGroupShareOrConstStaticArray(GlobalVariable *GV) {
   // Disable scalarization of groupshared/const_static vector arrays
   if (!(GV->getType()->getAddressSpace() == DXIL::kTGSMAddrSpace ||
-       (GV->isConstant() && GV->hasInitializer() &&
-        GV->getLinkage() == GlobalValue::LinkageTypes::InternalLinkage)))
+        (GV->isConstant() && GV->hasInitializer() &&
+         GV->getLinkage() == GlobalValue::LinkageTypes::InternalLinkage)))
     return false;
   Type *Ty = GV->getType()->getPointerElementType();
   return Ty->isArrayTy();
@@ -1690,6 +1764,7 @@ bool isGroupShareOrConstStaticArray(GlobalVariable *GV) {
 
 bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
   Module &M = *HLM.GetModule();
+  bool SupportsVectors = HLM.GetShaderModel()->IsSM69Plus();
   DxilTypeSystem &typeSys = HLM.GetTypeSystem();
 
   const DataLayout &DL = M.getDataLayout();
@@ -1707,9 +1782,16 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         a1ty->isStructTy() && a1ty->getStructNumElements() == 1;
     auto sz0 = DL.getTypeAllocSize(a0ty);
     auto sz1 = DL.getTypeAllocSize(a1ty);
-    if (sz0 == sz1 && (isUnitSzStruct0 || isUnitSzStruct1))
-      return getNestedLevelInStruct(a0ty) < getNestedLevelInStruct(a1ty);
-    return sz0 < sz1;
+    if (sz0 == sz1 && (isUnitSzStruct0 || isUnitSzStruct1)) {
+      sz0 = getNestedLevelInStruct(a0ty);
+      sz1 = getNestedLevelInStruct(a1ty);
+    }
+    // If sizes are equal, and the new value is a GV,
+    // replace the existing node if it isn't GV or comes later alphabetically
+    // Thus, entries are sorted by size, global variableness, and then name
+    return sz0 < sz1 ||
+           (sz0 == sz1 && isa<GlobalVariable>(a1) &&
+            (!isa<GlobalVariable>(a0) || a0->getName() > a1->getName()));
   };
 
   std::priority_queue<Value *, std::vector<Value *>,
@@ -1721,6 +1803,8 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
 
   DenseMap<GlobalVariable *, GVDbgOffset> GVDbgOffsetMap;
   for (GlobalVariable &GV : M.globals()) {
+    if (GV.user_empty())
+      continue;
     if (dxilutil::IsStaticGlobal(&GV) || dxilutil::IsSharedMemoryGlobal(&GV)) {
       staticGVs.insert(&GV);
       GVDbgOffset &dbgOffset = GVDbgOffsetMap[&GV];
@@ -1728,7 +1812,7 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
       dbgOffset.debugOffset = 0;
     } else {
       // merge GEP use for global.
-      HLModule::MergeGepUse(&GV);
+      dxilutil::MergeGepUse(&GV);
     }
   }
   // Add static GVs to work list.
@@ -1749,7 +1833,7 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         if (!A->user_empty()) {
           WorkList.push(A);
           // merge GEP use for the allocs
-          HLModule::MergeGepUse(A);
+          dxilutil::MergeGepUse(A);
         }
       }
   }
@@ -1786,6 +1870,8 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
       DominatorTree &DT = domTreeMap[F];
       if (SROA_Helper::LowerMemcpy(AI, /*annotation*/ nullptr, typeSys, DL, &DT,
                                    bAllowReplace)) {
+        if (AI->use_empty())
+          AI->eraseFromParent();
         Changed = true;
         continue;
       }
@@ -1816,8 +1902,13 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         if (NewV != AI) {
           DXASSERT(AI->getNumUses() == 0, "must have zero users.");
           // Update debug declare.
-          if (DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(AI)) {
-            DDI->setArgOperand(0, MetadataAsValue::get(NewV->getContext(), ValueAsMetadata::get(NewV)));
+
+          SmallVector<DbgDeclareInst *, 4> dbgDecls;
+          llvm::FindAllocaDbgDeclare(AI, dbgDecls);
+          for (DbgDeclareInst *DDI : dbgDecls) {
+            DDI->setArgOperand(
+                0, MetadataAsValue::get(NewV->getContext(),
+                                        ValueAsMetadata::get(NewV)));
           }
           AI->eraseFromParent();
           Changed = true;
@@ -1838,7 +1929,8 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         uint64_t NumInstances = 1;
         bool SROAed = SROA_Helper::DoScalarReplacement(
             AI, Elts, BrokenUpTy, NumInstances, Builder,
-            /*bFlatVector*/ true, hasPrecise, typeSys, DL, DeadInsts, &DT);
+            /*bFlatVector*/ true, SupportsVectors, hasPrecise, typeSys, DL,
+            DeadInsts, &DT);
 
         if (SROAed) {
           Type *Ty = AI->getAllocatedType();
@@ -1879,13 +1971,22 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
       }
     } else {
       GlobalVariable *GV = cast<GlobalVariable>(V);
+      // Handle dead GVs trivially. These can be formed by RAUWing one GV
+      // with another, leaving the original in the worklist
+      if (GV->use_empty()) {
+        staticGVs.remove(GV);
+        GV->eraseFromParent();
+        Changed = true;
+        continue;
+      }
+
       if (staticGVs.count(GV)) {
         Type *Ty = GV->getType()->getPointerElementType();
         // Skip basic types.
         if (!Ty->isAggregateType() && !Ty->isVectorTy())
           continue;
         // merge GEP use for global.
-        HLModule::MergeGepUse(GV);
+        dxilutil::MergeGepUse(GV);
       }
 
       const bool bAllowReplace = true;
@@ -1896,7 +1997,7 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         continue;
       }
 
-      // Flat Global vector if no dynamic vector indexing.
+      // Flatten global vector if it has no dynamic vector indexing.
       bool bFlatVector = !hasDynamicVectorIndexing(GV);
 
       if (bFlatVector) {
@@ -1924,6 +2025,7 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
             // Remove GV when it is replaced by NewEltGV and is not a base GV.
             GV->removeDeadConstantUsers();
             GV->eraseFromParent();
+            staticGVs.remove(GV);
           }
           GV = NewEltGV;
         }
@@ -1931,7 +2033,7 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
         // SROA_Parameter_HLSL has no access to a domtree, if one is needed,
         // it'll be generated
         SROAed = SROA_Helper::DoScalarReplacement(
-            GV, Elts, Builder, bFlatVector,
+            GV, Elts, Builder, bFlatVector, SupportsVectors,
             // TODO: set precise.
             /*hasPrecise*/ false, typeSys, DL, DeadInsts, /*DT*/ nullptr);
       }
@@ -1947,8 +2049,10 @@ bool SROAGlobalAndAllocas(HLModule &HLM, bool bHasDbgInfo) {
             StringRef OriginEltName = EltGV->getName();
             StringRef OriginName = dbgOffset.base->getName();
             StringRef EltName = OriginEltName.substr(OriginName.size());
-            StringRef EltParentName = OriginEltName.substr(0, OriginName.size());
-            DXASSERT_LOCALVAR(EltParentName, EltParentName == OriginName, "parent name mismatch");
+            StringRef EltParentName =
+                OriginEltName.substr(0, OriginName.size());
+            DXASSERT_LOCALVAR(EltParentName, EltParentName == OriginName,
+                              "parent name mismatch");
             EltNameMap[EltGV] = EltName;
           }
           GVDbgOffset &EltDbgOffset = GVDbgOffsetMap[EltGV];
@@ -2046,7 +2150,7 @@ void SROA_Helper::RewriteForGEP(GEPOperator *GEP, IRBuilder<> &Builder) {
     }
 
     assert(NewGEP->getType() == GEP->getType() && "type mismatch");
-    
+
     GEP->replaceAllUsesWith(NewGEP);
   } else {
     // End at array of basic type.
@@ -2064,7 +2168,8 @@ void SROA_Helper::RewriteForGEP(GEPOperator *GEP, IRBuilder<> &Builder) {
         NewGEPs.emplace_back(NewGEP);
       }
       const bool bAllowReplace = isa<AllocaInst>(OldVal);
-      if (!SROA_Helper::LowerMemcpy(GEP, /*annotation*/ nullptr, typeSys, DL, DT, bAllowReplace)) {
+      if (!SROA_Helper::LowerMemcpy(GEP, /*annotation*/ nullptr, typeSys, DL,
+                                    DT, bAllowReplace)) {
         SROA_Helper helper(GEP, NewGEPs, DeadInsts, typeSys, DL, DT);
         helper.RewriteForScalarRepl(GEP, Builder);
         for (Value *NewGEP : NewGEPs) {
@@ -2099,12 +2204,13 @@ void SROA_Helper::RewriteForGEP(GEPOperator *GEP, IRBuilder<> &Builder) {
   }
 
   // Remove the use so that the caller can keep iterating over its other users
-  DXASSERT(GEP->user_empty(), "All uses of the GEP should have been eliminated");
+  DXASSERT(GEP->user_empty(),
+           "All uses of the GEP should have been eliminated");
   if (isa<Instruction>(GEP)) {
-    GEP->setOperand(GEP->getPointerOperandIndex(), UndefValue::get(GEP->getPointerOperand()->getType()));
+    GEP->setOperand(GEP->getPointerOperandIndex(),
+                    UndefValue::get(GEP->getPointerOperand()->getType()));
     DeadInsts.push_back(GEP);
-  }
-  else {
+  } else {
     cast<Constant>(GEP)->destroyConstant();
   }
 }
@@ -2141,8 +2247,7 @@ static void SimplifyStructValUsage(Value *StructVal, std::vector<Value *> Elts,
         IRBuilder<> Builder(Insert);
         Value *TmpStructVal = UndefValue::get(StructVal->getType());
         for (unsigned i = 0; i < Elts.size(); i++) {
-          TmpStructVal =
-              Builder.CreateInsertValue(TmpStructVal, Elts[i], {i});
+          TmpStructVal = Builder.CreateInsertValue(TmpStructVal, Elts[i], {i});
         }
         Insert->replaceUsesOfWith(StructVal, TmpStructVal);
       }
@@ -2183,8 +2288,8 @@ void SROA_Helper::RewriteForLoad(LoadInst *LI) {
       Value *zero = ConstantInt::get(i32Ty, 0);
       SmallVector<Value *, 8> idxList;
       idxList.emplace_back(zero);
-      Value *newLd =
-          LoadVectorOrStructArray(cast<ArrayType>(LIType), NewElts, idxList, Builder);
+      Value *newLd = LoadVectorOrStructArray(cast<ArrayType>(LIType), NewElts,
+                                             idxList, Builder);
       LI->replaceAllUsesWith(newLd);
     } else {
       // Replace:
@@ -2225,7 +2330,8 @@ void SROA_Helper::RewriteForLoad(LoadInst *LI) {
   }
 
   // Remove the use so that the caller can keep iterating over its other users
-  LI->setOperand(LI->getPointerOperandIndex(), UndefValue::get(LI->getPointerOperand()->getType()));
+  LI->setOperand(LI->getPointerOperandIndex(),
+                 UndefValue::get(LI->getPointerOperand()->getType()));
   DeadInsts.push_back(LI);
 }
 
@@ -2305,7 +2411,8 @@ void SROA_Helper::RewriteForStore(StoreInst *SI) {
   }
 
   // Remove the use so that the caller can keep iterating over its other users
-  SI->setOperand(SI->getPointerOperandIndex(), UndefValue::get(SI->getPointerOperand()->getType()));
+  SI->setOperand(SI->getPointerOperandIndex(),
+                 UndefValue::get(SI->getPointerOperand()->getType()));
   DeadInsts.push_back(SI);
 }
 /// RewriteMemIntrin - MI is a memcpy/memset/memmove from or to AI.
@@ -2350,7 +2457,8 @@ void SROA_Helper::RewriteMemIntrin(MemIntrinsic *MI, Value *OldV) {
         if (*I == MI)
           return;
 
-      // Remove the uses so that the caller can keep iterating over its other users
+      // Remove the uses so that the caller can keep iterating over its other
+      // users
       MI->setOperand(0, UndefValue::get(MI->getOperand(0)->getType()));
       MI->setOperand(1, UndefValue::get(MI->getOperand(1)->getType()));
       DeadInsts.push_back(MI);
@@ -2514,8 +2622,9 @@ void SROA_Helper::RewriteBitCast(BitCastInst *BCI) {
   SrcTy = SrcTy->getPointerElementType();
 
   if (!DstTy->isStructTy()) {
-    // This is an llvm.lifetime.* intrinsic. Replace bitcast by a bitcast for each element.
-    SmallVector<IntrinsicInst*, 16> ToReplace;
+    // This is an llvm.lifetime.* intrinsic. Replace bitcast by a bitcast for
+    // each element.
+    SmallVector<IntrinsicInst *, 16> ToReplace;
 
     DXASSERT(onlyUsedByLifetimeMarkers(BCI),
              "expected struct bitcast to only be used by lifetime intrinsics");
@@ -2531,12 +2640,12 @@ void SROA_Helper::RewriteBitCast(BitCastInst *BCI) {
 
       for (Value *Elt : NewElts) {
         assert(Elt->getType()->isPointerTy());
-        Type     *ElPtrTy = Elt->getType();
-        Type     *ElTy    = ElPtrTy->getPointerElementType();
-        Value    *SizeV   = Builder.getInt64( DL.getTypeAllocSize(ElTy) );
-        Value    *Ptr     = Builder.CreateBitCast(Elt, Builder.getInt8PtrTy());
-        Value    *Args[]  = {SizeV, Ptr};
-        CallInst *C       = Builder.CreateCall(Intrin->getCalledFunction(), Args);
+        Type *ElPtrTy = Elt->getType();
+        Type *ElTy = ElPtrTy->getPointerElementType();
+        Value *SizeV = Builder.getInt64(DL.getTypeAllocSize(ElTy));
+        Value *Ptr = Builder.CreateBitCast(Elt, Builder.getInt8PtrTy());
+        Value *Args[] = {SizeV, Ptr};
+        CallInst *C = Builder.CreateCall(Intrin->getCalledFunction(), Args);
         C->setDoesNotThrow();
       }
 
@@ -2582,13 +2691,15 @@ void SROA_Helper::RewriteBitCast(BitCastInst *BCI) {
     return;
   }
 
-  std::vector<Value*> idxList(level+1);
-  ConstantInt *zeroIdx = ConstantInt::get(Type::getInt32Ty(Val->getContext()), 0);
-  for (unsigned i=0;i<(level+1);i++)
+  std::vector<Value *> idxList(level + 1);
+  ConstantInt *zeroIdx =
+      ConstantInt::get(Type::getInt32Ty(Val->getContext()), 0);
+  for (unsigned i = 0; i < (level + 1); i++)
     idxList[i] = zeroIdx;
 
   IRBuilder<> Builder(BCI);
-  Builder.AllowFolding = false; // We need an Instruction, so make sure we don't get a constant
+  Builder.AllowFolding =
+      false; // We need an Instruction, so make sure we don't get a constant
   Instruction *GEP = cast<Instruction>(Builder.CreateInBoundsGEP(Val, idxList));
   BCI->replaceAllUsesWith(GEP);
   BCI->eraseFromParent();
@@ -2597,12 +2708,11 @@ void SROA_Helper::RewriteBitCast(BitCastInst *BCI) {
   RewriteForGEP(cast<GEPOperator>(GEP), GEPBuilder);
 }
 
-/// RewriteCallArg - For Functions which don't flat,
-///                  replace OldVal with alloca and
-///                  copy in copy out data between alloca and flattened NewElts
-///                  in CallInst.
-void SROA_Helper::RewriteCallArg(CallInst *CI, unsigned ArgIdx, bool bIn,
-                                 bool bOut) {
+/// memcpyAggCallArg - For an aggregate call argument, this replaces the
+/// argument with an alloca and inserts a memcpy for input (if CopyIn) and
+/// output (if CopyOut).
+static void memcpyAggCallArg(CallInst *CI, unsigned ArgIdx, bool CopyIn,
+                             bool CopyOut) {
   Function *F = CI->getParent()->getParent();
   IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(F));
   const DataLayout &DL = F->getParent()->getDataLayout();
@@ -2612,24 +2722,87 @@ void SROA_Helper::RewriteCallArg(CallInst *CI, unsigned ArgIdx, bool bIn,
   Type *userTyElt = userTy->getElementType();
   Value *Alloca = AllocaBuilder.CreateAlloca(userTyElt);
   IRBuilder<> Builder(CI);
-  if (bIn) {
-    MemCpyInst *cpy = cast<MemCpyInst>(Builder.CreateMemCpy(
-        Alloca, userTyV, DL.getTypeAllocSize(userTyElt), false));
-    RewriteMemIntrin(cpy, cpy->getRawSource());
-  }
+  if (CopyIn)
+    Builder.CreateMemCpy(Alloca, userTyV, DL.getTypeAllocSize(userTyElt),
+                         false);
   CI->setArgOperand(ArgIdx, Alloca);
-  if (bOut) {
+  if (CopyOut) {
     Builder.SetInsertPoint(CI->getNextNode());
-    MemCpyInst *cpy = cast<MemCpyInst>(Builder.CreateMemCpy(
-        userTyV, Alloca, DL.getTypeAllocSize(userTyElt), false));
-    RewriteMemIntrin(cpy, cpy->getRawSource());
+    Builder.CreateMemCpy(userTyV, Alloca, DL.getTypeAllocSize(userTyElt),
+                         false);
+  }
+}
+
+static void copyIntrinsicAggArgs(HLModule &HLM) {
+  // Iterate HLIntrinsic function users
+  // For specific intrinsics, use memcpyAggCallArg on aggregate args
+  // This ensures that the call does not directly use the pointer supplied,
+  // allowing certain arguments to be flattened, and UDT args to be correctly
+  // lowered.
+  for (Function &F : HLM.GetModule()->functions()) {
+    if (F.isIntrinsic() || !F.isDeclaration())
+      continue;
+    if (GetHLOpcodeGroup(&F) != HLOpcodeGroup::HLIntrinsic)
+      continue;
+    // Iterate users
+    for (User *U : F.users()) {
+      if (CallInst *CI = dyn_cast<CallInst>(U)) {
+        switch (static_cast<IntrinsicOp>(GetHLOpcode(CI))) {
+        case IntrinsicOp::IOP_TraceRay:
+          memcpyAggCallArg(CI, HLOperandIndex::kTraceRayRayDescOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ false);
+          memcpyAggCallArg(CI, HLOperandIndex::kTraceRayPayloadPreOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ true);
+          break;
+        case IntrinsicOp::IOP_ReportHit:
+          memcpyAggCallArg(CI,
+                           HLOperandIndex::kReportIntersectionAttributeOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ false);
+          break;
+        case IntrinsicOp::IOP_CallShader:
+          memcpyAggCallArg(CI, HLOperandIndex::kCallShaderPayloadOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ true);
+          break;
+        case IntrinsicOp::MOP_TraceRayInline:
+          memcpyAggCallArg(CI, HLOperandIndex::kTraceRayInlineRayDescOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ false);
+          break;
+        case IntrinsicOp::MOP_DxHitObject_FromRayQuery:
+          if (CI->getNumArgOperands() ==
+              HLOperandIndex::kHitObjectFromRayQuery_WithAttrs_NumOp)
+            memcpyAggCallArg(
+                CI,
+                HLOperandIndex::kHitObjectFromRayQuery_WithAttrs_AttributeOpIdx,
+                /*CopyIn*/ true, /*CopyOut*/ false);
+          break;
+        case IntrinsicOp::MOP_DxHitObject_MakeMiss:
+          memcpyAggCallArg(CI, HLOperandIndex::kHitObjectMakeMiss_RayDescOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ false);
+          break;
+        case IntrinsicOp::MOP_DxHitObject_TraceRay:
+          memcpyAggCallArg(CI, HLOperandIndex::kHitObjectTraceRay_RayDescOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ false);
+          memcpyAggCallArg(CI,
+                           HLOperandIndex::kHitObjectTraceRay_PayloadPreOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ true);
+          break;
+        case IntrinsicOp::MOP_DxHitObject_Invoke:
+          memcpyAggCallArg(CI, HLOperandIndex::kHitObjectInvoke_PayloadOpIdx,
+                           /*CopyIn*/ true, /*CopyOut*/ true);
+          break;
+        default:
+          break;
+        }
+      }
+    }
   }
 }
 
 // Flatten matching OldVal arg to NewElts, optionally loading values (loadElts).
 // Does not replace or clean up old CallInst.
-static CallInst *CreateFlattenedHLIntrinsicCall(
-    CallInst *CI, Value* OldVal, ArrayRef<Value*> NewElts, bool loadElts) {
+static CallInst *CreateFlattenedHLIntrinsicCall(CallInst *CI, Value *OldVal,
+                                                ArrayRef<Value *> NewElts,
+                                                bool loadElts) {
   HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
   Function *F = CI->getCalledFunction();
   DXASSERT_NOMSG(group == HLOpcodeGroup::HLIntrinsic);
@@ -2654,85 +2827,95 @@ static CallInst *CreateFlattenedHLIntrinsicCall(
   FunctionType *flatFuncTy =
       FunctionType::get(CI->getType(), flatParamTys, false);
   Function *flatF =
-    GetOrCreateHLFunction(*F->getParent(), flatFuncTy, group, opcode,
-                          F->getAttributes().getFnAttributes());
+      GetOrCreateHLFunction(*F->getParent(), flatFuncTy, group, opcode,
+                            F->getAttributes().getFnAttributes());
 
   return Builder.CreateCall(flatF, flatArgs);
 }
 
-static CallInst *RewriteWithFlattenedHLIntrinsicCall(
-    CallInst *CI, Value* OldVal, ArrayRef<Value*> NewElts, bool loadElts) {
-  CallInst *flatCI = CreateFlattenedHLIntrinsicCall(
-    CI, OldVal, NewElts, /*loadElts*/loadElts);
+static CallInst *RewriteWithFlattenedHLIntrinsicCall(CallInst *CI,
+                                                     Value *OldVal,
+                                                     ArrayRef<Value *> NewElts,
+                                                     bool loadElts) {
+  CallInst *flatCI = CreateFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                                    /*loadElts*/ loadElts);
   CI->replaceAllUsesWith(flatCI);
   // Clear CI operands so we don't try to translate old call again
-  for (auto& opit : CI->operands())
+  for (auto &opit : CI->operands())
     opit.set(UndefValue::get(opit->getType()));
   return flatCI;
 }
 
 /// RewriteCall - Replace OldVal with flattened NewElts in CallInst.
 void SROA_Helper::RewriteCall(CallInst *CI) {
-  HLOpcodeGroup group = GetHLOpcodeGroupByName(CI->getCalledFunction());
-  if (group != HLOpcodeGroup::NotHL) {
+  HLOpcodeGroup Group = GetHLOpcodeGroupByName(CI->getCalledFunction());
+  if (Group != HLOpcodeGroup::NotHL) {
     unsigned opcode = GetHLOpcode(CI);
-    if (group == HLOpcodeGroup::HLIntrinsic) {
+    if (Group == HLOpcodeGroup::HLIntrinsic) {
+      // RayQuery this pointer replacement.
+      if (OldVal->getType()->isPointerTy() &&
+          dxilutil::IsHLSLRayQueryType(
+              OldVal->getType()->getPointerElementType())) {
+        // For RayQuery methods, we want to replace the RayQuery this pointer
+        // with a load and use of the underlying handle value.
+        // This will allow elimination of RayQuery types earlier.
+        RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                            /*loadElts*/ true);
+        DeadInsts.push_back(CI);
+        return;
+      }
+
       IntrinsicOp IOP = static_cast<IntrinsicOp>(opcode);
       switch (IOP) {
-      case IntrinsicOp::MOP_Append: {
+      case IntrinsicOp::MOP_Append:
         // Buffer Append already expand in code gen.
         // Must be OutputStream Append here.
         // Every Elt has a pointer type.
         // For Append, this is desired, so don't load.
-        RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts, /*loadElts*/false);
+        RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                            /*loadElts*/ false);
         DeadInsts.push_back(CI);
-      } break;
-      case IntrinsicOp::IOP_TraceRay: {
+        return;
+      case IntrinsicOp::IOP_TraceRay:
         if (OldVal ==
             CI->getArgOperand(HLOperandIndex::kTraceRayRayDescOpIdx)) {
-          RewriteCallArg(CI, HLOperandIndex::kTraceRayRayDescOpIdx,
-                         /*bIn*/ true, /*bOut*/ false);
-        } else {
-          DXASSERT(OldVal ==
-                       CI->getArgOperand(HLOperandIndex::kTraceRayPayLoadOpIdx),
-                   "else invalid TraceRay");
-          RewriteCallArg(CI, HLOperandIndex::kTraceRayPayLoadOpIdx,
-                         /*bIn*/ true, /*bOut*/ true);
+          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                              /*loadElts*/ true);
+          DeadInsts.push_back(CI);
+          return;
         }
-      } break;
-      case IntrinsicOp::IOP_ReportHit: {
-        RewriteCallArg(CI, HLOperandIndex::kReportIntersectionAttributeOpIdx,
-                       /*bIn*/ true, /*bOut*/ false);
-      } break;
-      case IntrinsicOp::IOP_CallShader: {
-        RewriteCallArg(CI, HLOperandIndex::kCallShaderPayloadOpIdx,
-                       /*bIn*/ true, /*bOut*/ true);
-      } break;
-      case IntrinsicOp::MOP_TraceRayInline: {
+        break;
+      case IntrinsicOp::MOP_DxHitObject_TraceRay:
+        if (OldVal == CI->getArgOperand(
+                          HLOperandIndex::kHitObjectTraceRay_RayDescOpIdx)) {
+          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                              /*loadElts*/ true);
+          DeadInsts.push_back(CI);
+          return;
+        }
+        break;
+      case IntrinsicOp::MOP_DxHitObject_MakeMiss:
+        if (OldVal == CI->getArgOperand(
+                          HLOperandIndex::kHitObjectMakeMiss_RayDescOpIdx)) {
+          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                              /*loadElts*/ true);
+          DeadInsts.push_back(CI);
+          return;
+        }
+        break;
+      case IntrinsicOp::MOP_TraceRayInline:
         if (OldVal ==
             CI->getArgOperand(HLOperandIndex::kTraceRayInlineRayDescOpIdx)) {
-          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts, /*loadElts*/true);
+          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts,
+                                              /*loadElts*/ true);
           DeadInsts.push_back(CI);
-          break;
+          return;
         }
-      }
-      __fallthrough;
+        break;
       default:
-        // RayQuery this pointer replacement.
-        if (OldVal->getType()->isPointerTy() &&
-            CI->getNumArgOperands() >= HLOperandIndex::kHandleOpIdx &&
-            OldVal == CI->getArgOperand(HLOperandIndex::kHandleOpIdx) &&
-            dxilutil::IsHLSLRayQueryType(
-              OldVal->getType()->getPointerElementType())) {
-          // For RayQuery methods, we want to replace the RayQuery this pointer
-          // with a load and use of the underlying handle value.
-          // This will allow elimination of RayQuery types earlier.
-          RewriteWithFlattenedHLIntrinsicCall(CI, OldVal, NewElts, /*loadElts*/true);
-          DeadInsts.push_back(CI);
-          break;
-        }
-        DXASSERT(0, "cannot flatten hlsl intrinsic.");
+        break;
       }
+      DXASSERT(0, "cannot flatten hlsl intrinsic.");
     }
     // TODO: check other high level dx operations if need to.
   } else {
@@ -2740,9 +2923,9 @@ void SROA_Helper::RewriteCall(CallInst *CI) {
   }
 }
 
-/// RewriteForAddrSpaceCast - Rewrite the AddrSpaceCast, either ConstExpr or Inst.
-void SROA_Helper::RewriteForAddrSpaceCast(Value *CE,
-                                          IRBuilder<> &Builder) {
+/// RewriteForAddrSpaceCast - Rewrite the AddrSpaceCast, either ConstExpr or
+/// Inst.
+void SROA_Helper::RewriteForAddrSpaceCast(Value *CE, IRBuilder<> &Builder) {
   SmallVector<Value *, 8> NewCasts;
   // create new AddrSpaceCast.
   for (unsigned i = 0, e = NewElts.size(); i != e; ++i) {
@@ -2756,7 +2939,8 @@ void SROA_Helper::RewriteForAddrSpaceCast(Value *CE,
   helper.RewriteForScalarRepl(CE, Builder);
 
   // Remove the use so that the caller can keep iterating over its other users
-  DXASSERT(CE->user_empty(), "All uses of the addrspacecast should have been eliminated");
+  DXASSERT(CE->user_empty(),
+           "All uses of the addrspacecast should have been eliminated");
   if (Instruction *I = dyn_cast<Instruction>(CE))
     I->eraseFromParent();
   else
@@ -2787,35 +2971,36 @@ void SROA_Helper::RewriteForConstExpr(ConstantExpr *CE, IRBuilder<> &Builder) {
       Instruction *tmpInst = CE->getAsInstruction();
       tmpBuilder.Insert(tmpInst);
       TheUse.set(tmpInst);
-    }
-    else {
+    } else {
       RewriteForConstExpr(cast<ConstantExpr>(TheUse.getUser()), Builder);
     }
   }
 
   // Remove the use so that the caller can keep iterating over its other users
-  DXASSERT(CE->user_empty(), "All uses of the constantexpr should have been eliminated");
+  DXASSERT(CE->user_empty(),
+           "All uses of the constantexpr should have been eliminated");
   CE->destroyConstant();
 }
 /// RewriteForScalarRepl - OldVal is being split into NewElts, so rewrite
 /// users of V, which references it, to use the separate elements.
 void SROA_Helper::RewriteForScalarRepl(Value *V, IRBuilder<> &Builder) {
   // Don't iterate upon the uses explicitly because we'll be removing them,
-  // and potentially adding new ones (if expanding memcpys) during the iteration.
-  Use* PrevUse = nullptr;
+  // and potentially adding new ones (if expanding memcpys) during the
+  // iteration.
+  Use *PrevUse = nullptr;
   while (!V->use_empty()) {
     Use &TheUse = *V->use_begin();
 
-    DXASSERT_LOCALVAR(PrevUse, &TheUse != PrevUse,
-      "Infinite loop while SROA'ing value, use isn't getting eliminated.");
+    DXASSERT_LOCALVAR(
+        PrevUse, &TheUse != PrevUse,
+        "Infinite loop while SROA'ing value, use isn't getting eliminated.");
     PrevUse = &TheUse;
 
     // Each of these must either call ->eraseFromParent()
     // or null out the use of V so that we make progress.
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(TheUse.getUser())) {
       RewriteForConstExpr(CE, Builder);
-    }
-    else {
+    } else {
       Instruction *User = cast<Instruction>(TheUse.getUser());
       if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(User)) {
         IRBuilder<> Builder(GEP);
@@ -2826,7 +3011,7 @@ void SROA_Helper::RewriteForScalarRepl(Value *V, IRBuilder<> &Builder) {
         RewriteForStore(stInst);
       else if (MemIntrinsic *MI = dyn_cast<MemIntrinsic>(User))
         RewriteMemIntrin(MI, V);
-      else if (CallInst *CI = dyn_cast<CallInst>(User)) 
+      else if (CallInst *CI = dyn_cast<CallInst>(User))
         RewriteCall(CI);
       else if (BitCastInst *BCI = dyn_cast<BitCastInst>(User))
         RewriteBitCast(BCI);
@@ -2842,18 +3027,19 @@ void SROA_Helper::RewriteForScalarRepl(Value *V, IRBuilder<> &Builder) {
 static ArrayType *CreateNestArrayTy(Type *FinalEltTy,
                                     ArrayRef<ArrayType *> nestArrayTys) {
   Type *newAT = FinalEltTy;
-  for (auto ArrayTy = nestArrayTys.rbegin(), E=nestArrayTys.rend(); ArrayTy != E;
-       ++ArrayTy)
+  for (auto ArrayTy = nestArrayTys.rbegin(), E = nestArrayTys.rend();
+       ArrayTy != E; ++ArrayTy)
     newAT = ArrayType::get(newAT, (*ArrayTy)->getNumElements());
   return cast<ArrayType>(newAT);
 }
 
-/// DoScalarReplacement - Split V into AllocaInsts with Builder and save the new AllocaInsts into Elts.
-/// Then do SROA on V.
+/// DoScalarReplacement - Split V into AllocaInsts with Builder and save the new
+/// AllocaInsts into Elts. Then do SROA on V.
 bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
                                       Type *&BrokenUpTy, uint64_t &NumInstances,
                                       IRBuilder<> &Builder, bool bFlatVector,
-                                      bool hasPrecise, DxilTypeSystem &typeSys,
+                                      bool SupportsVectors, bool hasPrecise,
+                                      DxilTypeSystem &typeSys,
                                       const DataLayout &DL,
                                       SmallVector<Value *, 32> &DeadInsts,
                                       DominatorTree *DT) {
@@ -2871,7 +3057,8 @@ bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
   if (HLMatrixType::isa(Ty))
     return false;
 
-  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
+  IRBuilder<> AllocaBuilder(
+      dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
 
   if (StructType *ST = dyn_cast<StructType>(Ty)) {
     // Skip HLSL object types and RayQuery.
@@ -2889,7 +3076,8 @@ bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
     if (SA && SA->IsEmptyStruct())
       return true;
     for (int i = 0, e = numTypes; i != e; ++i) {
-      AllocaInst *NA = AllocaBuilder.CreateAlloca(ST->getContainedType(i), nullptr, V->getName() + "." + Twine(i));
+      AllocaInst *NA = AllocaBuilder.CreateAlloca(
+          ST->getContainedType(i), nullptr, V->getName() + "." + Twine(i));
       bool markPrecise = hasPrecise;
       if (SA) {
         DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
@@ -2954,8 +3142,8 @@ bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
         BrokenUpTy = AT;
         NumInstances = 1;
         for (int i = 0, e = AT->getNumElements(); i != e; ++i) {
-          AllocaInst *NA = AllocaBuilder.CreateAlloca(ElTy, nullptr,
-                                                V->getName() + "." + Twine(i));
+          AllocaInst *NA = AllocaBuilder.CreateAlloca(
+              ElTy, nullptr, V->getName() + "." + Twine(i));
           Elts.push_back(NA);
         }
       }
@@ -2964,17 +3152,22 @@ bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
       if (!bFlatVector)
         return false;
 
+      // Skip vector where supported if it has more than 1 element.
+      if (SupportsVectors && ElTy->getVectorNumElements() > 1)
+        return false;
+
       // for array of vector
       // split into arrays of scalar
       VectorType *ElVT = cast<VectorType>(ElTy);
       BrokenUpTy = ElVT;
       Elts.reserve(ElVT->getNumElements());
 
-      ArrayType *scalarArrayTy = CreateNestArrayTy(ElVT->getElementType(), nestArrayTys);
+      ArrayType *scalarArrayTy =
+          CreateNestArrayTy(ElVT->getElementType(), nestArrayTys);
 
       for (int i = 0, e = ElVT->getNumElements(); i != e; ++i) {
-        AllocaInst *NA = AllocaBuilder.CreateAlloca(scalarArrayTy, nullptr,
-                           V->getName() + "." + Twine(i));
+        AllocaInst *NA = AllocaBuilder.CreateAlloca(
+            scalarArrayTy, nullptr, V->getName() + "." + Twine(i));
         if (hasPrecise)
           HLModule::MarkPreciseAttributeWithMetadata(NA);
         Elts.push_back(NA);
@@ -2983,7 +3176,7 @@ bool SROA_Helper::DoScalarReplacement(Value *V, std::vector<Value *> &Elts,
       // Skip array of basic types.
       return false;
   }
-  
+
   // Now that we have created the new alloca instructions, rewrite all the
   // uses of the old alloca.
   SROA_Helper helper(V, Elts, DeadInsts, typeSys, DL, DT);
@@ -3042,15 +3235,13 @@ unsigned SROA_Helper::GetEltAlign(unsigned ValueAlign, const DataLayout &DL,
   return MinAlign(Alignment, Offset);
 }
 
-/// DoScalarReplacement - Split V into AllocaInsts with Builder and save the new AllocaInsts into Elts.
-/// Then do SROA on V.
-bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
-                                      std::vector<Value *> &Elts,
-                                      IRBuilder<> &Builder, bool bFlatVector,
-                                      bool hasPrecise, DxilTypeSystem &typeSys,
-                                      const DataLayout &DL,
-                                      SmallVector<Value *, 32> &DeadInsts,
-                                      DominatorTree *DT) {
+/// DoScalarReplacement - Split V into AllocaInsts with Builder and save the new
+/// AllocaInsts into Elts. Then do SROA on V.
+bool SROA_Helper::DoScalarReplacement(
+    GlobalVariable *GV, std::vector<Value *> &Elts, IRBuilder<> &Builder,
+    bool bFlatVector, bool SupportsVectors, bool hasPrecise,
+    DxilTypeSystem &typeSys, const DataLayout &DL,
+    SmallVector<Value *, 32> &DeadInsts, DominatorTree *DT) {
   DEBUG(dbgs() << "Found inst to SROA: " << *GV << '\n');
   Type *Ty = GV->getType();
   // Skip none pointer types.
@@ -3064,12 +3255,16 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
   // Skip basic types.
   if (Ty->isSingleValueType() && !Ty->isVectorTy())
     return false;
+  // Skip vector where supported if it has more than 1 element.
+  if (Ty->isVectorTy() && SupportsVectors && Ty->getVectorNumElements() > 1)
+    return false;
   // Skip matrix types.
   if (HLMatrixType::isa(Ty))
     return false;
 
   Module *M = GV->getParent();
-  Constant *Init = GV->hasInitializer() ? GV->getInitializer() : UndefValue::get(Ty);
+  Constant *Init =
+      GV->hasInitializer() ? GV->getInitializer() : UndefValue::get(Ty);
   bool isConst = GV->isConstant();
 
   GlobalVariable::ThreadLocalMode TLMode = GV->getThreadLocalMode();
@@ -3083,7 +3278,7 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
     unsigned numTypes = ST->getNumContainedTypes();
     Elts.reserve(numTypes);
     unsigned Offset = 0;
-    //DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ST);
+    // DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ST);
     for (int i = 0, e = numTypes; i != e; ++i) {
       Type *EltTy = ST->getElementType(i);
       Constant *EltInit = GetEltInit(Ty, Init, i, EltTy);
@@ -3093,10 +3288,10 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
           /*InsertBefore*/ nullptr, TLMode, AddressSpace);
       EltGV->setAlignment(GetEltAlign(Alignment, DL, EltTy, Offset));
       Offset += DL.getTypeAllocSize(EltTy);
-      //DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
-      // TODO: set precise.
-      // if (hasPrecise || FA.IsPrecise())
-      //  HLModule::MarkPreciseAttributeWithMetadata(NA);
+      // DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
+      //  TODO: set precise.
+      //  if (hasPrecise || FA.IsPrecise())
+      //   HLModule::MarkPreciseAttributeWithMetadata(NA);
       Elts.push_back(EltGV);
     }
   } else if (VectorType *VT = dyn_cast<VectorType>(Ty)) {
@@ -3105,7 +3300,7 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
     Elts.reserve(numElts);
     Type *EltTy = VT->getElementType();
     unsigned Offset = 0;
-    //DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ST);
+    // DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ST);
     for (int i = 0, e = numElts; i != e; ++i) {
       Constant *EltInit = GetEltInit(Ty, Init, i, EltTy);
       GlobalVariable *EltGV = new llvm::GlobalVariable(
@@ -3114,10 +3309,10 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
           /*InsertBefore*/ nullptr, TLMode, AddressSpace);
       EltGV->setAlignment(GetEltAlign(Alignment, DL, EltTy, Offset));
       Offset += DL.getTypeAllocSize(EltTy);
-      //DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
-      // TODO: set precise.
-      // if (hasPrecise || FA.IsPrecise())
-      //  HLModule::MarkPreciseAttributeWithMetadata(NA);
+      // DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
+      //  TODO: set precise.
+      //  if (hasPrecise || FA.IsPrecise())
+      //   HLModule::MarkPreciseAttributeWithMetadata(NA);
       Elts.push_back(EltGV);
     }
   } else {
@@ -3139,15 +3334,14 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
 
     if (ElTy->isStructTy() &&
         // Skip Matrix and Resource type.
-        !HLMatrixType::isa(ElTy) &&
-        !dxilutil::IsHLSLResourceType(ElTy)) {
+        !HLMatrixType::isa(ElTy) && !dxilutil::IsHLSLResourceType(ElTy)) {
       // for array of struct
       // split into arrays of struct elements
       StructType *ElST = cast<StructType>(ElTy);
       unsigned numTypes = ElST->getNumContainedTypes();
       Elts.reserve(numTypes);
       unsigned Offset = 0;
-      //DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ElST);
+      // DxilStructAnnotation *SA = typeSys.GetStructAnnotation(ElST);
       for (int i = 0, e = numTypes; i != e; ++i) {
         Type *EltTy =
             CreateNestArrayTy(ElST->getContainedType(i), nestArrayTys);
@@ -3159,15 +3353,19 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
 
         EltGV->setAlignment(GetEltAlign(Alignment, DL, EltTy, Offset));
         Offset += DL.getTypeAllocSize(EltTy);
-        //DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
-        // TODO: set precise.
-        // if (hasPrecise || FA.IsPrecise())
-        //  HLModule::MarkPreciseAttributeWithMetadata(NA);
+        // DxilFieldAnnotation &FA = SA->GetFieldAnnotation(i);
+        //  TODO: set precise.
+        //  if (hasPrecise || FA.IsPrecise())
+        //   HLModule::MarkPreciseAttributeWithMetadata(NA);
         Elts.push_back(EltGV);
       }
     } else if (ElTy->isVectorTy()) {
       // Skip vector if required.
       if (!bFlatVector)
+        return false;
+
+      // Skip vector where supported if it has more than 1 element.
+      if (SupportsVectors && ElTy->getVectorNumElements() > 1)
         return false;
 
       // for array of vector
@@ -3205,11 +3403,34 @@ bool SROA_Helper::DoScalarReplacement(GlobalVariable *GV,
   return true;
 }
 
-static void ReplaceConstantWithInst(Constant *C, Value *V, IRBuilder<> &Builder) {
-  for (auto it = C->user_begin(); it != C->user_end(); ) {
+// Replaces uses of constant C in the current function
+// with V, when those uses are dominated by V.
+// Returns true if it was completely replaced.
+static bool ReplaceConstantWithInst(Constant *C, Value *V,
+                                    IRBuilder<> &Builder) {
+  bool bReplacedAll = true;
+  Function *F = Builder.GetInsertBlock()->getParent();
+  Instruction *VInst = dyn_cast<Instruction>(V);
+  // Lazily calculate dominance
+  DominatorTree DT;
+  bool Calculated = false;
+  auto Dominates = [&](llvm::Instruction *Def, llvm::Instruction *User) {
+    if (!Calculated) {
+      DT.recalculate(*F);
+      Calculated = true;
+    }
+    return DT.dominates(Def, User);
+  };
+
+  for (auto it = C->user_begin(); it != C->user_end();) {
     User *U = *(it++);
     if (Instruction *I = dyn_cast<Instruction>(U)) {
-      I->replaceUsesOfWith(C, V);
+      if (I->getParent()->getParent() != F)
+        continue;
+      if (VInst && Dominates(VInst, I))
+        I->replaceUsesOfWith(C, V);
+      else
+        bReplacedAll = false;
     } else {
       // Skip unused ConstantExpr.
       if (U->user_empty())
@@ -3218,14 +3439,16 @@ static void ReplaceConstantWithInst(Constant *C, Value *V, IRBuilder<> &Builder)
       Instruction *Inst = CE->getAsInstruction();
       Builder.Insert(Inst);
       Inst->replaceUsesOfWith(C, V);
-      ReplaceConstantWithInst(CE, Inst, Builder);
+      if (!ReplaceConstantWithInst(CE, Inst, Builder))
+        bReplacedAll = false;
     }
   }
   C->removeDeadConstantUsers();
+  return bReplacedAll;
 }
 
 static void ReplaceUnboundedArrayUses(Value *V, Value *Src) {
-  for (auto it = V->user_begin(); it != V->user_end(); ) {
+  for (auto it = V->user_begin(); it != V->user_end();) {
     User *U = *(it++);
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
       SmallVector<Value *, 4> idxList(GEP->idx_begin(), GEP->idx_end());
@@ -3237,14 +3460,16 @@ static void ReplaceUnboundedArrayUses(Value *V, Value *Src) {
     } else if (BitCastInst *BC = dyn_cast<BitCastInst>(U)) {
       BC->setOperand(0, Src);
     } else {
-      DXASSERT(false, "otherwise unbounded array used in unexpected instruction");
+      DXASSERT(false,
+               "otherwise unbounded array used in unexpected instruction");
     }
   }
 }
 
 static bool IsUnboundedArrayMemcpy(Type *destTy, Type *srcTy) {
   return (destTy->isArrayTy() && srcTy->isArrayTy()) &&
-    (destTy->getArrayNumElements() == 0 || srcTy->getArrayNumElements() == 0);
+         (destTy->getArrayNumElements() == 0 ||
+          srcTy->getArrayNumElements() == 0);
 }
 
 static bool ArePointersToStructsOfIdenticalLayouts(Type *DstTy, Type *SrcTy) {
@@ -3259,8 +3484,8 @@ static bool ArePointersToStructsOfIdenticalLayouts(Type *DstTy, Type *SrcTy) {
   return SrcST->isLayoutIdentical(DstST);
 }
 
-static std::vector<Value *> GetConstValueIdxList(IRBuilder<> &builder,
-  std::vector<unsigned> idxlist) {
+static std::vector<Value *>
+GetConstValueIdxList(IRBuilder<> &builder, std::vector<unsigned> idxlist) {
   std::vector<Value *> idxConstList;
   for (unsigned idx : idxlist) {
     idxConstList.push_back(ConstantInt::get(builder.getInt32Ty(), idx));
@@ -3268,49 +3493,47 @@ static std::vector<Value *> GetConstValueIdxList(IRBuilder<> &builder,
   return idxConstList;
 }
 
-static void CopyElementsOfStructsWithIdenticalLayout(
-  IRBuilder<> &builder, Value *destPtr, Value *srcPtr, Type *ty,
-  std::vector<unsigned>& idxlist) {
+static void
+CopyElementsOfStructsWithIdenticalLayout(IRBuilder<> &builder, Value *destPtr,
+                                         Value *srcPtr, Type *ty,
+                                         std::vector<unsigned> &idxlist) {
   if (ty->isStructTy()) {
     for (unsigned i = 0; i < ty->getStructNumElements(); i++) {
       idxlist.push_back(i);
       CopyElementsOfStructsWithIdenticalLayout(
-        builder, destPtr, srcPtr, ty->getStructElementType(i), idxlist);
+          builder, destPtr, srcPtr, ty->getStructElementType(i), idxlist);
       idxlist.pop_back();
     }
-  }
-  else if (ty->isArrayTy()) {
+  } else if (ty->isArrayTy()) {
     for (unsigned i = 0; i < ty->getArrayNumElements(); i++) {
       idxlist.push_back(i);
       CopyElementsOfStructsWithIdenticalLayout(
-        builder, destPtr, srcPtr, ty->getArrayElementType(), idxlist);
+          builder, destPtr, srcPtr, ty->getArrayElementType(), idxlist);
       idxlist.pop_back();
     }
-  }
-  else if (ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy() ||
-    ty->isHalfTy() || ty->isVectorTy()) {
-    Value *srcGEP =
-      builder.CreateInBoundsGEP(srcPtr, GetConstValueIdxList(builder, idxlist));
-    Value *destGEP =
-      builder.CreateInBoundsGEP(destPtr, GetConstValueIdxList(builder, idxlist));
+  } else if (ty->isIntegerTy() || ty->isFloatTy() || ty->isDoubleTy() ||
+             ty->isHalfTy() || ty->isVectorTy()) {
+    Value *srcGEP = builder.CreateInBoundsGEP(
+        srcPtr, GetConstValueIdxList(builder, idxlist));
+    Value *destGEP = builder.CreateInBoundsGEP(
+        destPtr, GetConstValueIdxList(builder, idxlist));
     LoadInst *LI = builder.CreateLoad(srcGEP);
     builder.CreateStore(LI, destGEP);
-  }
-  else {
-    DXASSERT(0, "encountered unsupported type when copying elements of identical structs.");
+  } else {
+    DXASSERT(0, "encountered unsupported type when copying elements of "
+                "identical structs.");
   }
 }
 
 static void removeLifetimeUsers(Value *V) {
-  std::set<Value*> users(V->users().begin(), V->users().end());
+  std::set<Value *> users(V->users().begin(), V->users().end());
   for (Value *U : users) {
     if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(U)) {
       if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
           II->getIntrinsicID() == Intrinsic::lifetime_end) {
         II->eraseFromParent();
       }
-    } else if (isa<BitCastInst>(U) ||
-               isa<AddrSpaceCastInst>(U) ||
+    } else if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U) ||
                isa<GetElementPtrInst>(U)) {
       // Recurse into bitcast, addrspacecast, GEP.
       removeLifetimeUsers(U);
@@ -3324,16 +3547,15 @@ static void removeLifetimeUsers(Value *V) {
 // Otherwise, wrong lifetimes could be inherited either way.
 // TODO: We should be merging the lifetimes. For convenience, just remove them
 //       for now to be safe.
-static void updateLifetimeForReplacement(Value *From, Value *To)
-{
-    removeLifetimeUsers(From);
-    removeLifetimeUsers(To);
+static void updateLifetimeForReplacement(Value *From, Value *To) {
+  removeLifetimeUsers(From);
+  removeLifetimeUsers(To);
 }
 
 static bool DominateAllUsers(Instruction *I, Value *V, DominatorTree *DT);
 
 namespace {
-void replaceScalarArrayGEPWithVectorArrayGEP(User *GEP, Value *VectorArray,
+bool replaceScalarArrayGEPWithVectorArrayGEP(User *GEP, Value *VectorArray,
                                              IRBuilder<> &Builder,
                                              unsigned sizeInDwords) {
   gep_type_iterator GEPIt = gep_type_begin(GEP), E = gep_type_end(GEP);
@@ -3367,11 +3589,30 @@ void replaceScalarArrayGEPWithVectorArrayGEP(User *GEP, Value *VectorArray,
   Value *CompIdx = Builder.CreateAnd(ArrayIdx, mask);
   Value *NewGEP = Builder.CreateGEP(
       VecPtr, {ConstantInt::get(CompIdx->getType(), 0), CompIdx});
-  GEP->replaceAllUsesWith(NewGEP);
+
+  if (isa<ConstantExpr>(GEP) && isa<Instruction>(NewGEP)) {
+    if (!ReplaceConstantWithInst(cast<Constant>(GEP), NewGEP, Builder)) {
+      // If new instructions unable to be used, clean them up.
+      if (NewGEP->user_empty())
+        cast<Instruction>(NewGEP)->eraseFromParent();
+      if (isa<Instruction>(VecPtr) && VecPtr->user_empty())
+        cast<Instruction>(VecPtr)->eraseFromParent();
+      if (isa<Instruction>(CompIdx) && CompIdx->user_empty())
+        cast<Instruction>(CompIdx)->eraseFromParent();
+      if (isa<Instruction>(VecIdx) && VecIdx->user_empty())
+        cast<Instruction>(VecIdx)->eraseFromParent();
+      return false;
+    }
+    return true;
+  } else {
+    GEP->replaceAllUsesWith(NewGEP);
+  }
+  return true;
 }
 
-void replaceScalarArrayWithVectorArray(Value *ScalarArray, Value *VectorArray,
+bool replaceScalarArrayWithVectorArray(Value *ScalarArray, Value *VectorArray,
                                        MemCpyInst *MC, unsigned sizeInDwords) {
+  bool bReplacedAll = true;
   LLVMContext &Context = ScalarArray->getContext();
   // All users should be element type.
   // Replace users of AI or GV.
@@ -3380,24 +3621,35 @@ void replaceScalarArrayWithVectorArray(Value *ScalarArray, Value *VectorArray,
     if (U->user_empty())
       continue;
     if (BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
-      BCI->setOperand(0, VectorArray);
+      // Avoid replacing the dest of the memcpy to support partial replacement.
+      if (MC->getArgOperand(0) != BCI)
+        BCI->setOperand(0, VectorArray);
       continue;
     }
 
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(U)) {
       IRBuilder<> Builder(Context);
+      // If we need to replace the constant with an instruction, start at the
+      // memcpy, so we replace only users dominated by it.
+      if (isa<Instruction>(VectorArray))
+        Builder.SetInsertPoint(MC);
+
       if (GEPOperator *GEP = dyn_cast<GEPOperator>(U)) {
-        // NewGEP must be GEPOperator too.
-        // No instruction will be build.
-        replaceScalarArrayGEPWithVectorArrayGEP(U, VectorArray, Builder,
-                                                sizeInDwords);
+        if (!replaceScalarArrayGEPWithVectorArrayGEP(U, VectorArray, Builder,
+                                                     sizeInDwords))
+          bReplacedAll = false;
       } else if (CE->getOpcode() == Instruction::AddrSpaceCast) {
         Value *NewAddrSpaceCast = Builder.CreateAddrSpaceCast(
             VectorArray,
             PointerType::get(VectorArray->getType()->getPointerElementType(),
                              CE->getType()->getPointerAddressSpace()));
-        replaceScalarArrayWithVectorArray(CE, NewAddrSpaceCast, MC,
-                                          sizeInDwords);
+        if (!replaceScalarArrayWithVectorArray(CE, NewAddrSpaceCast, MC,
+                                               sizeInDwords)) {
+          bReplacedAll = false;
+          if (Instruction *NewInst = dyn_cast<Instruction>(NewAddrSpaceCast))
+            if (NewInst->user_empty())
+              NewInst->eraseFromParent();
+        }
       } else if (CE->hasOneUse() && CE->user_back() == MC) {
         continue;
       } else {
@@ -3405,13 +3657,16 @@ void replaceScalarArrayWithVectorArray(Value *ScalarArray, Value *VectorArray,
       }
     } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
       IRBuilder<> Builder(GEP);
-      replaceScalarArrayGEPWithVectorArrayGEP(U, VectorArray, Builder,
-                                              sizeInDwords);
-      GEP->eraseFromParent();
+      if (!replaceScalarArrayGEPWithVectorArrayGEP(U, VectorArray, Builder,
+                                                   sizeInDwords))
+        bReplacedAll = false;
+      else
+        GEP->eraseFromParent();
     } else {
       DXASSERT(0, "not implemented");
     }
   }
+  return bReplacedAll;
 }
 
 // For pattern like
@@ -3427,23 +3682,42 @@ bool tryToReplaceCBVec4ArrayToScalarArray(Value *V, Type *TyV, Value *Src,
   Type *EltTy = AT->getElementType();
   unsigned sizeInBits = DL.getTypeSizeInBits(EltTy);
   // Convert array of float4 to array of float.
-  replaceScalarArrayWithVectorArray(V, Src, MC, sizeInBits >> 5);
-  return true;
+  if (replaceScalarArrayWithVectorArray(V, Src, MC, sizeInBits >> 5)) {
+    Value *DstBC = MC->getArgOperand(0);
+    MC->setArgOperand(0, UndefValue::get(MC->getArgOperand(0)->getType()));
+    if (DstBC->user_empty()) {
+      // Replacement won't include the memcpy dest.  Now remove that use.
+      if (BitCastInst *BCI = dyn_cast<BitCastInst>(DstBC)) {
+        Value *Dst = BCI->getOperand(0);
+        Type *DstTy = Dst->getType();
+        if (Dst == V)
+          BCI->setOperand(0, UndefValue::get(DstTy));
+        else
+          llvm_unreachable("Unexpected dest of memcpy.");
+      }
+    } else {
+      llvm_unreachable("Unexpected users of memcpy bitcast.");
+    }
+    return true;
+  }
+  return false;
 }
 
 } // namespace
 
 static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
-                          DxilFieldAnnotation *annotation, DxilTypeSystem &typeSys,
-                          const DataLayout &DL, DominatorTree *DT) {
+                          DxilFieldAnnotation *annotation,
+                          DxilTypeSystem &typeSys, const DataLayout &DL,
+                          DominatorTree *DT) {
   // If the only user of the src and dst is the memcpy,
   // this memcpy was probably produced by splitting another.
   // Regardless, the goal here is to replace, not remove the memcpy
-  // we won't have enough information to determine if we can do that before mem2reg
+  // we won't have enough information to determine if we can do that before
+  // mem2reg
   if (V != Src && V->hasOneUse() && Src->hasOneUse())
     return false;
 
-  // If the memcpy doesn't dominate all its users,
+  // If the source of the memcpy (Src) doesn't dominate all users of dest (V),
   // full replacement isn't possible without complicated PHI insertion
   // This will likely replace with ld/st which will be replaced in mem2reg
   if (Instruction *SrcI = dyn_cast<Instruction>(Src))
@@ -3460,7 +3734,8 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
       } else {
         // Replace Constant with a non-Constant.
         IRBuilder<> Builder(MC);
-        ReplaceConstantWithInst(C, Src, Builder);
+        if (!ReplaceConstantWithInst(C, Src, Builder))
+          return false;
       }
     } else {
       // Try convert special pattern for cbuffer which copy array of float4 to
@@ -3468,7 +3743,8 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
       if (!tryToReplaceCBVec4ArrayToScalarArray(V, TyV, Src, TySrc, MC, DL)) {
         IRBuilder<> Builder(MC);
         Src = Builder.CreateBitCast(Src, V->getType());
-        ReplaceConstantWithInst(C, Src, Builder);
+        if (!ReplaceConstantWithInst(C, Src, Builder))
+          return false;
       }
     }
   } else {
@@ -3478,8 +3754,8 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
         V->replaceAllUsesWith(Src);
       }
     } else if (!IsUnboundedArrayMemcpy(TyV, TySrc)) {
-      Value* DestVal = MC->getRawDest();
-      Value* SrcVal = MC->getRawSource();
+      Value *DestVal = MC->getRawDest();
+      Value *SrcVal = MC->getRawSource();
       if (!isa<BitCastInst>(SrcVal) || !isa<BitCastInst>(DestVal)) {
         DXASSERT(0, "Encountered unexpected instruction sequence");
         return false;
@@ -3488,13 +3764,14 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
       BitCastInst *DestBCI = cast<BitCastInst>(DestVal);
       BitCastInst *SrcBCI = cast<BitCastInst>(SrcVal);
 
-      Type* DstTy = DestBCI->getSrcTy();
+      Type *DstTy = DestBCI->getSrcTy();
       Type *SrcTy = SrcBCI->getSrcTy();
       if (ArePointersToStructsOfIdenticalLayouts(DstTy, SrcTy)) {
         const DataLayout &DL = SrcBCI->getModule()->getDataLayout();
         unsigned SrcSize = DL.getTypeAllocSize(
             SrcBCI->getOperand(0)->getType()->getPointerElementType());
-        unsigned MemcpySize = cast<ConstantInt>(MC->getLength())->getZExtValue();
+        unsigned MemcpySize =
+            cast<ConstantInt>(MC->getLength())->getZExtValue();
         if (SrcSize != MemcpySize) {
           DXASSERT(0, "Cannot handle partial memcpy");
           return false;
@@ -3527,7 +3804,8 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
       }
     } else {
       updateLifetimeForReplacement(V, Src);
-      DXASSERT(IsUnboundedArrayMemcpy(TyV, TySrc), "otherwise mismatched types in memcpy are not unbounded array");
+      DXASSERT(IsUnboundedArrayMemcpy(TyV, TySrc),
+               "otherwise mismatched types in memcpy are not unbounded array");
       ReplaceUnboundedArrayUses(V, Src);
     }
   }
@@ -3559,7 +3837,7 @@ static bool ReplaceMemcpy(Value *V, Value *Src, MemCpyInst *MC,
 static bool ReplaceUseOfZeroInitEntry(Instruction *I, Value *V) {
   BasicBlock *BB = I->getParent();
   Function *F = I->getParent()->getParent();
-  for (auto U = V->user_begin(); U != V->user_end(); ) {
+  for (auto U = V->user_begin(); U != V->user_end();) {
     Instruction *UI = dyn_cast<Instruction>(*(U++));
     if (!UI)
       continue;
@@ -3578,7 +3856,9 @@ static bool ReplaceUseOfZeroInitEntry(Instruction *I, Value *V) {
     // I is the last inst in the block after split.
     // Any inst in current block is before I.
     if (LoadInst *LI = dyn_cast<LoadInst>(UI)) {
-      LI->replaceAllUsesWith(ConstantAggregateZero::get(LI->getType()));
+      // Replace uses of the load with a constant zero.
+      Constant *replacement = Constant::getNullValue(LI->getType());
+      LI->replaceAllUsesWith(replacement);
       LI->eraseFromParent();
       continue;
     }
@@ -3587,33 +3867,42 @@ static bool ReplaceUseOfZeroInitEntry(Instruction *I, Value *V) {
   return true;
 }
 
-static bool ReplaceUseOfZeroInitPostDom(Instruction *I, Value *V,
-                                    PostDominatorTree &PDT) {
+// If a V user is dominated by memcpy (I),
+//    skip it - memcpy dest can simply alias to src for this user.
+// If the V user may follow the memcpy (I),
+//    return false - memcpy dest not safe to replace with src.
+// Otherwise,
+//    replace use with zeroinitializer.
+static bool ReplaceUseOfZeroInit(Instruction *I, Value *V, DominatorTree &DT,
+                                 SmallPtrSet<BasicBlock *, 8> &Reachable) {
   BasicBlock *BB = I->getParent();
   Function *F = I->getParent()->getParent();
-  for (auto U = V->user_begin(); U != V->user_end(); ) {
+  for (auto U = V->user_begin(); U != V->user_end();) {
     Instruction *UI = dyn_cast<Instruction>(*(U++));
-    if (!UI)
+    if (!UI || UI == I)
       continue;
     if (UI->getParent()->getParent() != F)
       continue;
 
-    if (!PDT.dominates(BB, UI->getParent()))
+    // Skip properly dominated users
+    if (DT.properlyDominates(BB, UI->getParent()))
+      continue;
+
+    // If user is found in memcpy successor list
+    // then the user is not safe to replace with zeroinitializer.
+    if (Reachable.count(UI->getParent()))
       return false;
 
+    // Remaining cases are where I:
+    // - is at the end of the same block
+    // - does not precede UI on any path
     if (isa<GetElementPtrInst>(UI) || isa<BitCastInst>(UI)) {
-      if (!ReplaceUseOfZeroInitPostDom(I, UI, PDT))
-        return false;
-      else
+      if (ReplaceUseOfZeroInit(I, UI, DT, Reachable))
         continue;
-    }
-
-    if (BB != UI->getParent() || UI == I)
-      continue;
-    // I is the last inst in the block after split.
-    // Any inst in current block is before I.
-    if (LoadInst *LI = dyn_cast<LoadInst>(UI)) {
-      LI->replaceAllUsesWith(ConstantAggregateZero::get(LI->getType()));
+    } else if (LoadInst *LI = dyn_cast<LoadInst>(UI)) {
+      // Replace uses of the load with a constant zero.
+      Constant *replacement = Constant::getNullValue(LI->getType());
+      LI->replaceAllUsesWith(replacement);
       LI->eraseFromParent();
       continue;
     }
@@ -3621,32 +3910,53 @@ static bool ReplaceUseOfZeroInitPostDom(Instruction *I, Value *V,
   }
   return true;
 }
+
+// Recursively collect all successors of BB and BB's successors.
+// BB will not be in set unless it's reachable through its successors.
+static void CollectReachableBBs(BasicBlock *BB,
+                                SmallPtrSet<BasicBlock *, 8> &Reachable) {
+  for (auto S : successors(BB)) {
+    if (Reachable.insert(S).second)
+      CollectReachableBBs(S, Reachable);
+  }
+}
+
 // When zero initialized GV has only one define, all uses before the def should
 // use zero.
 static bool ReplaceUseOfZeroInitBeforeDef(Instruction *I, GlobalVariable *GV) {
   BasicBlock *BB = I->getParent();
   Function *F = I->getParent()->getParent();
   // Make sure I is the last inst for BB.
+  BasicBlock *NewBB = nullptr;
   if (I != BB->getTerminator())
-    BB->splitBasicBlock(I->getNextNode());
+    NewBB = BB->splitBasicBlock(I->getNextNode());
 
+  bool bSuccess = false;
   if (&F->getEntryBlock() == I->getParent()) {
-    return ReplaceUseOfZeroInitEntry(I, GV);
+    bSuccess = ReplaceUseOfZeroInitEntry(I, GV);
   } else {
-    // Post dominator tree.
-    PostDominatorTree PDT;
-    PDT.runOnFunction(*F);
-    return ReplaceUseOfZeroInitPostDom(I, GV, PDT);
+    DominatorTree DT;
+    DT.recalculate(*F);
+    SmallPtrSet<BasicBlock *, 8> Reachable;
+    CollectReachableBBs(BB, Reachable);
+    bSuccess = ReplaceUseOfZeroInit(I, GV, DT, Reachable);
   }
+
+  // Re-merge basic block to keep things simpler
+  if (NewBB)
+    llvm::MergeBlockIntoPredecessor(NewBB);
+
+  return bSuccess;
 }
 
 // Use `DT` to trace all users and make sure `I`'s BB dominates them all
 static bool DominateAllUsersDom(Instruction *I, Value *V, DominatorTree *DT) {
   BasicBlock *BB = I->getParent();
   Function *F = I->getParent()->getParent();
-  for (auto U = V->user_begin(); U != V->user_end(); ) {
+  for (auto U = V->user_begin(); U != V->user_end();) {
     Instruction *UI = dyn_cast<Instruction>(*(U++));
-    // If not an instruction or from a differnt function, nothing to check, move along.
+    // If not an instruction or from a differnt function, nothing to check, move
+    // along.
     if (!UI || UI->getParent()->getParent() != F)
       continue;
 
@@ -3678,30 +3988,125 @@ static bool DominateAllUsers(Instruction *I, Value *V, DominatorTree *DT) {
   }
 }
 
-static bool isReadOnlyPtr(CallInst *PtrCI) {
-  HLSubscriptOpcode opcode =
-      static_cast<HLSubscriptOpcode>(hlsl::GetHLOpcode(PtrCI));
-  if (opcode == HLSubscriptOpcode::CBufferSubscript) {
-    // Ptr from CBuffer is readonly.
-    return true;
-  } else if (opcode == HLSubscriptOpcode::DefaultSubscript) {
-    Value *ptr = PtrCI->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx);
-    // Resource ptr.
-    if (CallInst *handleCI = dyn_cast<CallInst>(ptr)) {
-      hlsl::HLOpcodeGroup group =
-          hlsl::GetHLOpcodeGroup(handleCI->getCalledFunction());
-      if (group == HLOpcodeGroup::HLAnnotateHandle) {
-        Constant *Props = cast<Constant>(handleCI->getArgOperand(
-                             HLOperandIndex::kAnnotateHandleResourcePropertiesOpIdx));
-        DxilResourceProperties RP = resource_helper::loadPropsFromConstant(*Props);
-        if (RP.getResourceClass() == DXIL::ResourceClass::SRV) {
-          // Ptr from SRV is readonly.
-          return true;
-        }
-      }
+// Return resource properties if handle value is HLAnnotateHandle
+static DxilResourceProperties GetResPropsFromHLAnnotateHandle(Value *handle) {
+  if (CallInst *handleCI = dyn_cast<CallInst>(handle)) {
+    hlsl::HLOpcodeGroup group =
+        hlsl::GetHLOpcodeGroup(handleCI->getCalledFunction());
+    if (group == HLOpcodeGroup::HLAnnotateHandle) {
+      Constant *Props = cast<Constant>(handleCI->getArgOperand(
+          HLOperandIndex::kAnnotateHandleResourcePropertiesOpIdx));
+      return resource_helper::loadPropsFromConstant(*Props);
+    }
+  }
+  return {};
+}
+
+static bool isReadOnlyResSubscriptOrLoad(CallInst *PtrCI) {
+  hlsl::HLOpcodeGroup group =
+      hlsl::GetHLOpcodeGroup(PtrCI->getCalledFunction());
+  if (group == HLOpcodeGroup::HLSubscript) {
+    HLSubscriptOpcode opcode =
+        static_cast<HLSubscriptOpcode>(hlsl::GetHLOpcode(PtrCI));
+    if (opcode == HLSubscriptOpcode::CBufferSubscript) {
+      // Ptr from CBuffer is readonly.
+      return true;
+    } else if (opcode == HLSubscriptOpcode::DefaultSubscript) {
+      DxilResourceProperties RP = GetResPropsFromHLAnnotateHandle(
+          PtrCI->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx));
+      if (RP.getResourceClass() == DXIL::ResourceClass::SRV)
+        return true;
+    }
+  } else if (group == HLOpcodeGroup::HLIntrinsic) {
+    IntrinsicOp hlOpcode = (IntrinsicOp)GetHLOpcode(PtrCI);
+    if (hlOpcode == IntrinsicOp::MOP_Load) {
+      // This is templated BAB.Load<UDT>() case.
+      DxilResourceProperties RP = GetResPropsFromHLAnnotateHandle(
+          PtrCI->getArgOperand(HLOperandIndex::kHandleOpIdx));
+      if (RP.getResourceClass() == DXIL::ResourceClass::SRV)
+        return true;
     }
   }
   return false;
+}
+
+static void collectAllStores(const Value *V,
+                             SmallVector<const Instruction *, 4> &Stores) {
+  for (const User *U : V->users()) {
+    if (const BitCastOperator *BC = dyn_cast<BitCastOperator>(U)) {
+      collectAllStores(BC, Stores);
+    } else if (const MemCpyInst *MC = dyn_cast<MemCpyInst>(U)) {
+      if (MC->getRawDest() == V)
+        Stores.emplace_back(MC);
+    } else if (const GEPOperator *GEP = dyn_cast<GEPOperator>(U)) {
+      collectAllStores(GEP, Stores);
+    } else if (const StoreInst *SI = dyn_cast<StoreInst>(U)) {
+      Stores.emplace_back(SI);
+    } else if (const CallInst *CI = dyn_cast<CallInst>(U)) {
+      Function *F = CI->getCalledFunction();
+      if (F->isIntrinsic()) {
+        if (F->getIntrinsicID() == Intrinsic::lifetime_start ||
+            F->getIntrinsicID() == Intrinsic::lifetime_end)
+          continue;
+      }
+
+      HLOpcodeGroup group = hlsl::GetHLOpcodeGroupByName(F);
+      switch (group) {
+      case HLOpcodeGroup::HLMatLoadStore: {
+        HLMatLoadStoreOpcode opcode =
+            static_cast<HLMatLoadStoreOpcode>(hlsl::GetHLOpcode(CI));
+        switch (opcode) {
+        case HLMatLoadStoreOpcode::ColMatLoad:
+        case HLMatLoadStoreOpcode::RowMatLoad:
+          break;
+        case HLMatLoadStoreOpcode::ColMatStore:
+        case HLMatLoadStoreOpcode::RowMatStore:
+          Stores.emplace_back(CI);
+          break;
+        default:
+          DXASSERT(0, "invalid opcode");
+          Stores.emplace_back(CI);
+          break;
+        }
+      } break;
+      case HLOpcodeGroup::HLSubscript: {
+        HLSubscriptOpcode opcode =
+            static_cast<HLSubscriptOpcode>(hlsl::GetHLOpcode(CI));
+        switch (opcode) {
+        case HLSubscriptOpcode::VectorSubscript:
+        case HLSubscriptOpcode::ColMatElement:
+        case HLSubscriptOpcode::ColMatSubscript:
+        case HLSubscriptOpcode::RowMatElement:
+        case HLSubscriptOpcode::RowMatSubscript:
+          collectAllStores(CI, Stores);
+          break;
+        default:
+          // Rest are resource ptr like buf[i].
+          // Only read of resource handle.
+          break;
+        }
+      } break;
+      default: {
+        // If not sure its out param or not. Take as out param.
+        Stores.emplace_back(CI);
+      }
+      }
+    }
+  }
+}
+
+// Make sure all store on V dominate I.
+static bool allStoresDominateInst(Value *V, Instruction *I, DominatorTree *DT) {
+  if (!DT)
+    return false;
+  SmallVector<const Instruction *, 4> Stores;
+  collectAllStores(V, Stores);
+
+  for (const Instruction *S : Stores) {
+    if (!DT->dominates(S, I))
+      return false;
+  }
+  return true;
 }
 
 bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
@@ -3734,7 +4139,7 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
         // void set(A aa) { aa = a; }
         // call set inside entry function then use a2.
         if (isa<ConstantAggregateZero>(GV->getInitializer())) {
-          Instruction * Memcpy = PS.StoringMemcpy;
+          Instruction *Memcpy = PS.StoringMemcpy;
           if (!ReplaceUseOfZeroInitBeforeDef(Memcpy, GV)) {
             PS.storedType = hlutil::PointerStatus::StoredType::Stored;
           }
@@ -3747,7 +4152,8 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
 
   if (bAllowReplace && !PS.HasMultipleAccessingFunctions) {
     if (PS.storedType == hlutil::PointerStatus::StoredType::MemcopyDestOnce &&
-        // Skip argument for input argument has input value, it is not dest once anymore.
+        // Skip argument for input argument has input value, it is not dest once
+        // anymore.
         !isa<Argument>(V)) {
       // Replace with src of memcpy.
       MemCpyInst *MC = PS.StoringMemcpy;
@@ -3765,16 +4171,13 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
             Ptr = NestedGEP->getPointerOperand();
 
           if (CallInst *PtrCI = dyn_cast<CallInst>(Ptr)) {
-            hlsl::HLOpcodeGroup group =
-                hlsl::GetHLOpcodeGroup(PtrCI->getCalledFunction());
-            if (group == HLOpcodeGroup::HLSubscript) {
-              if (isReadOnlyPtr(PtrCI)) {
-                // Ptr from CBuffer/SRV is safe.
-                if (ReplaceMemcpy(V, Src, MC, annotation, typeSys, DL, DT)) {
-                  if (V->user_empty())
-                    return true;
-                  return LowerMemcpy(V, annotation, typeSys, DL, DT, bAllowReplace);
-                }
+            if (isReadOnlyResSubscriptOrLoad(PtrCI)) {
+              // Ptr from CBuffer/SRV is safe.
+              if (ReplaceMemcpy(V, Src, MC, annotation, typeSys, DL, DT)) {
+                if (V->user_empty())
+                  return true;
+                return LowerMemcpy(V, annotation, typeSys, DL, DT,
+                                   bAllowReplace);
               }
             }
           }
@@ -3782,9 +4185,14 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
           // Resource ptr should not be replaced.
           // Need to make sure src not updated after current memcpy.
           // Check Src only have 1 store now.
+          // If Src has more than 1 store but only used once by memcpy, check if
+          // the stores dominate the memcpy.
           hlutil::PointerStatus SrcPS(Src, size, /*bLdStOnly*/ false);
           SrcPS.analyze(typeSys, bStructElt);
-          if (SrcPS.storedType != hlutil::PointerStatus::StoredType::Stored) {
+          if (SrcPS.storedType != hlutil::PointerStatus::StoredType::Stored ||
+              (SrcPS.loadedType ==
+                   hlutil::PointerStatus::LoadedType::MemcopySrcOnce &&
+               allStoresDominateInst(Src, MC, DT))) {
             if (ReplaceMemcpy(V, Src, MC, annotation, typeSys, DL, DT)) {
               if (V->user_empty())
                 return true;
@@ -3805,8 +4213,9 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
         // For GEP, the ptr could have other GEP read/write.
         // Only scan one GEP is not enough.
         // And resource ptr should not be replaced.
+        // Nor should (output) argument ptr be replaced.
         if (!isa<GEPOperator>(Dest) && !isa<CallInst>(Dest) &&
-            !isa<BitCastOperator>(Dest)) {
+            !isa<BitCastOperator>(Dest) && !isa<Argument>(Dest)) {
           // Need to make sure Dest not updated after current memcpy.
           // Check Dest only have 1 store now.
           hlutil::PointerStatus DestPS(Dest, size, /*bLdStOnly*/ false);
@@ -3830,7 +4239,8 @@ bool SROA_Helper::LowerMemcpy(Value *V, DxilFieldAnnotation *annotation,
 }
 
 /// MarkEmptyStructUsers - Add instruction related to Empty struct to DeadInsts.
-void SROA_Helper::MarkEmptyStructUsers(Value *V, SmallVector<Value *, 32> &DeadInsts) {
+void SROA_Helper::MarkEmptyStructUsers(Value *V,
+                                       SmallVector<Value *, 32> &DeadInsts) {
   UndefValue *undef = UndefValue::get(V->getType());
   for (auto itU = V->user_begin(), E = V->user_end(); itU != E;) {
     Value *U = *(itU++);
@@ -3875,6 +4285,98 @@ bool SROA_Helper::IsEmptyStructType(Type *Ty, DxilTypeSystem &typeSys) {
   return false;
 }
 
+// Recursively search all loads and stores of Ptr, and record all the scopes
+// they are in.
+static void
+FindAllScopesOfLoadsAndStores(Value *Ptr,
+                              std::unordered_set<MDNode *> *OutScopes) {
+  for (User *U : Ptr->users()) {
+    if (isa<GEPOperator>(U) || isa<BitCastOperator>(U)) {
+      FindAllScopesOfLoadsAndStores(U, OutScopes);
+      continue;
+    }
+    Instruction *I = dyn_cast<Instruction>(U);
+    if (!I)
+      continue;
+    DebugLoc DL = I->getDebugLoc();
+    if (!DL)
+      continue;
+
+    if (isa<LoadInst>(I) || isa<StoreInst>(I) || isa<MemCpyInst>(I) ||
+        isa<CallInst>(I)) // Could be some arbitrary HL op
+    {
+      DILocation *loc = DL.get();
+      while (loc) {
+        DILocalScope *scope = dyn_cast<DILocalScope>(loc->getScope());
+        while (scope) {
+          OutScopes->insert(scope);
+          if (auto lexicalScope = dyn_cast<DILexicalBlockBase>(scope))
+            scope = lexicalScope->getScope();
+          else if (isa<DISubprogram>(scope))
+            break;
+        }
+        loc = loc->getInlinedAt();
+      }
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Delete all dbg.declare instructions for allocas that are never touched in
+// scopes. This could greatly improve compilation speed and binary size at the
+// cost of in-scope but unused (part of) variables being invisible in certain
+// functions. For example:
+//
+//     struct Context {
+//        float a, b, c;
+//     };
+//     void bar(inout Context ctx) {
+//       ctx.b = ctx.a * 2;
+//     }
+//     void foo(inout Context ctx) {
+//       ctx.a = 10;
+//       bar(ctx);
+//     }
+//
+//     float main() : SV_Target {
+//       Context ctx = (Context)0;
+//       foo(ctx);
+//       return ctx.a + ctx.b + ctx.c;
+//     }
+//
+// Before running this, shader would generate dbg.declare for members 'a', 'b',
+// and 'c' for variable 'ctx' in every scope ('main', 'foo', and 'bar'). In
+// the call stack with 'foo' and 'bar', member 'c' is never used in any way, so
+// it's a waste to generate dbg.declare for member 'c' for the 'ctx' in scope
+// 'foo' and scope 'bar', so they can be removed.
+//===----------------------------------------------------------------------===//
+static void DeleteOutOfScopeDebugInfo(Function &F) {
+  if (!llvm::hasDebugInfo(*F.getParent()))
+    return;
+
+  std::unordered_set<MDNode *> Scopes;
+  for (Instruction &I : F.getEntryBlock()) {
+    auto AI = dyn_cast<AllocaInst>(&I);
+    if (!AI)
+      continue;
+
+    Scopes.clear();
+    FindAllScopesOfLoadsAndStores(AI, &Scopes);
+    for (auto it = hlsl::dxilutil::mdv_users_begin(AI),
+              end = hlsl::dxilutil::mdv_users_end(AI);
+         it != end;) {
+      User *U = *(it++);
+      if (DbgDeclareInst *DDI = dyn_cast<DbgDeclareInst>(U)) {
+        DILocalVariable *var = DDI->getVariable();
+        DILocalScope *scope = var->getScope();
+        if (!Scopes.count(scope)) {
+          DDI->eraseFromParent();
+        }
+      }
+    }
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // SROA on function parameters.
 //===----------------------------------------------------------------------===//
@@ -3892,9 +4394,11 @@ class SROA_Parameter_HLSL : public ModulePass {
 public:
   static char ID; // Pass identification, replacement for typeid
   explicit SROA_Parameter_HLSL() : ModulePass(ID) {}
-  const char *getPassName() const override { return "SROA Parameter HLSL"; }
+  StringRef getPassName() const override { return "SROA Parameter HLSL"; }
   static void RewriteBitcastWithIdenticalStructs(Function *F);
   static void RewriteBitcastWithIdenticalStructs(BitCastInst *BCI);
+  static bool DeleteSimpleStoreOnlyAlloca(AllocaInst *AI);
+  static bool IsSimpleStoreOnlyAlloca(AllocaInst *AI);
 
   bool runOnModule(Module &M) override {
     // Patch memcpy to cover case bitcast (gep ptr, 0,0) is transformed into
@@ -3979,7 +4483,8 @@ public:
         Function *oldPatchConstantFunc =
             funcProps.ShaderProps.HS.patchConstantFunc;
         if (funcMap.count(oldPatchConstantFunc))
-          m_pHLModule->SetPatchConstantFunctionForHS(&F, funcMap[oldPatchConstantFunc]);
+          m_pHLModule->SetPatchConstantFunctionForHS(
+              &F, funcMap[oldPatchConstantFunc]);
       }
     }
 
@@ -3991,16 +4496,29 @@ public:
       F->eraseFromParent();
     }
 
+    // Expand flattened copy-in/copy-out for intrinsic UDT args:
+    copyIntrinsicAggArgs(*m_pHLModule);
+
     // SROA globals and allocas.
     SROAGlobalAndAllocas(*m_pHLModule, m_HasDbgInfo);
 
     // Move up allocas that might have been pushed down by instruction inserts
+    SmallVector<AllocaInst *, 16> simpleStoreOnlyAllocas;
     for (Function &F : M) {
       if (F.isDeclaration())
         continue;
       Instruction *insertPt = nullptr;
-      // SROA only potentially "incorrectly" inserts non-allocas into the entry block.
+      simpleStoreOnlyAllocas.clear();
+      // SROA only potentially "incorrectly" inserts non-allocas into the entry
+      // block.
       for (llvm::Instruction &I : F.getEntryBlock()) {
+        // In really pathologically huge shaders, there could be thousands of
+        // unused allocas (and hundreds of thousands of dbg.declares). Record
+        // and remove them now so they don't horrifically slow down the
+        // compilation.
+        if (isa<AllocaInst>(I) && IsSimpleStoreOnlyAlloca(cast<AllocaInst>(&I)))
+          simpleStoreOnlyAllocas.push_back(cast<AllocaInst>(&I));
+
         if (!insertPt) {
           // Find the first non-alloca to move the allocas above
           if (!isa<AllocaInst>(I) && !isa<DbgInfoIntrinsic>(I))
@@ -4010,6 +4528,11 @@ public:
           I.moveBefore(insertPt);
         }
       }
+      for (AllocaInst *AI : simpleStoreOnlyAllocas) {
+        DeleteSimpleStoreOnlyAlloca(AI);
+      }
+
+      DeleteOutOfScopeDebugInfo(F);
     }
     return true;
   }
@@ -4025,34 +4548,36 @@ private:
                   DxilParameterAnnotation &paramAnnotation,
                   std::vector<Value *> &FlatParamList,
                   std::vector<DxilParameterAnnotation> &FlatRetAnnotationList,
-                  BasicBlock *EntryBlock, DbgDeclareInst *DDI);
+                  BasicBlock *EntryBlock, ArrayRef<DbgDeclareInst *> DDIs);
   Value *castResourceArgIfRequired(Value *V, Type *Ty, bool bOut,
                                    DxilParamInputQual inputQual,
                                    IRBuilder<> &Builder);
   Value *castArgumentIfRequired(Value *V, Type *Ty, bool bOut,
                                 DxilParamInputQual inputQual,
                                 DxilFieldAnnotation &annotation,
-                                IRBuilder<> &Builder,
-                                DxilTypeSystem &TypeSys);
+                                IRBuilder<> &Builder, DxilTypeSystem &TypeSys);
   // Replace use of parameter which changed type when flatten.
   // Also add information to Arg if required.
   void replaceCastParameter(Value *NewParam, Value *OldParam, Function &F,
                             Argument *Arg, const DxilParamInputQual inputQual,
                             IRBuilder<> &Builder);
   void allocateSemanticIndex(
-    std::vector<DxilParameterAnnotation> &FlatAnnotationList,
-    unsigned startArgIndex, llvm::StringMap<Type *> &semanticTypeMap);
+      std::vector<DxilParameterAnnotation> &FlatAnnotationList,
+      unsigned startArgIndex, llvm::StringMap<Type *> &semanticTypeMap);
 
-  //static std::vector<Value*> GetConstValueIdxList(IRBuilder<>& builder, std::vector<unsigned> idxlist);
+  // static std::vector<Value*> GetConstValueIdxList(IRBuilder<>& builder,
+  // std::vector<unsigned> idxlist);
   /// DeadInsts - Keep track of instructions we have made dead, so that
   /// we can remove them after we are done working.
   SmallVector<Value *, 32> DeadInsts;
   // Map from orginal function to the flatten version.
-  MapVector<Function *, Function *> funcMap; // Need deterministic order of iteration
+  MapVector<Function *, Function *>
+      funcMap; // Need deterministic order of iteration
   // Map from original arg/param to flatten cast version.
-  std::unordered_map<Value *, std::pair<Value*, DxilParamInputQual>> castParamMap;
+  std::unordered_map<Value *, std::pair<Value *, DxilParamInputQual>>
+      castParamMap;
   // Map form first element of a vector the list of all elements of the vector.
-  std::unordered_map<Value *, SmallVector<Value*, 4> > vectorEltsMap;
+  std::unordered_map<Value *, SmallVector<Value *, 4>> vectorEltsMap;
   // Set for row major matrix parameter.
   std::unordered_set<Value *> castRowMajorParamMap;
   bool m_HasDbgInfo;
@@ -4063,7 +4588,7 @@ private:
 // and the subsequent ones will temporarily use this value.
 // We then run a pass to fix the semantics and properly renumber them
 // once the aggregate has been fully expanded.
-// 
+//
 // For example:
 // struct Foo { float a; float b; };
 // void main(Foo foo : TEXCOORD0, float bar : TEXCOORD0)
@@ -4076,24 +4601,24 @@ private:
 //
 // (which will later on fail validation due to duplicate semantics).
 constexpr const char *ContinuedPseudoSemantic = "*";
-}
+} // namespace
 
 char SROA_Parameter_HLSL::ID = 0;
 
 INITIALIZE_PASS(SROA_Parameter_HLSL, "scalarrepl-param-hlsl",
-  "Scalar Replacement of Aggregates HLSL (parameters)", false,
-  false)
+                "Scalar Replacement of Aggregates HLSL (parameters)", false,
+                false)
 
 void SROA_Parameter_HLSL::RewriteBitcastWithIdenticalStructs(Function *F) {
   if (F->isDeclaration())
     return;
   // Gather list of bitcast involving src and dest structs with identical layout
-  std::vector<BitCastInst*> worklist;
+  std::vector<BitCastInst *> worklist;
   for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
     if (BitCastInst *BCI = dyn_cast<BitCastInst>(&*I)) {
       Type *DstTy = BCI->getDestTy();
       Type *SrcTy = BCI->getSrcTy();
-      if(ArePointersToStructsOfIdenticalLayouts(DstTy, SrcTy))
+      if (ArePointersToStructsOfIdenticalLayouts(DstTy, SrcTy))
         worklist.push_back(BCI);
     }
   }
@@ -4106,15 +4631,49 @@ void SROA_Parameter_HLSL::RewriteBitcastWithIdenticalStructs(Function *F) {
   }
 }
 
+bool SROA_Parameter_HLSL::IsSimpleStoreOnlyAlloca(AllocaInst *AI) {
+  if (!AI->getAllocatedType()->isSingleValueType())
+    return false;
+  for (User *U : AI->users()) {
+    if (!isa<StoreInst>(U))
+      return false;
+  }
+  return true;
+}
+
+bool SROA_Parameter_HLSL::DeleteSimpleStoreOnlyAlloca(AllocaInst *AI) {
+  assert(IsSimpleStoreOnlyAlloca(AI));
+  for (auto it = AI->user_begin(), end = AI->user_end(); it != end;) {
+    StoreInst *Store = cast<StoreInst>(*(it++));
+    Store->eraseFromParent();
+  }
+
+  // Delete dbg.declare's too
+  for (auto it = hlsl::dxilutil::mdv_users_begin(AI),
+            end = hlsl::dxilutil::mdv_users_end(AI);
+       it != end;) {
+    User *U = *(it++);
+    if (DbgDeclareInst *DDI = dyn_cast<DbgDeclareInst>(U))
+      DDI->eraseFromParent();
+  }
+
+  AI->eraseFromParent();
+  return true;
+}
+
 void SROA_Parameter_HLSL::RewriteBitcastWithIdenticalStructs(BitCastInst *BCI) {
-  StructType *srcStTy = cast<StructType>(BCI->getSrcTy()->getPointerElementType());
-  StructType *destStTy = cast<StructType>(BCI->getDestTy()->getPointerElementType());
-  Value* srcPtr = BCI->getOperand(0);
-  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(BCI->getParent()->getParent()));
+  StructType *srcStTy =
+      cast<StructType>(BCI->getSrcTy()->getPointerElementType());
+  StructType *destStTy =
+      cast<StructType>(BCI->getDestTy()->getPointerElementType());
+  Value *srcPtr = BCI->getOperand(0);
+  IRBuilder<> AllocaBuilder(
+      dxilutil::FindAllocaInsertionPt(BCI->getParent()->getParent()));
   AllocaInst *destPtr = AllocaBuilder.CreateAlloca(destStTy);
   IRBuilder<> InstBuilder(BCI);
-  std::vector<unsigned> idxlist = { 0 };
-  CopyElementsOfStructsWithIdenticalLayout(InstBuilder, destPtr, srcPtr, srcStTy, idxlist);
+  std::vector<unsigned> idxlist = {0};
+  CopyElementsOfStructsWithIdenticalLayout(InstBuilder, destPtr, srcPtr,
+                                           srcStTy, idxlist);
   BCI->replaceAllUsesWith(destPtr);
   BCI->eraseFromParent();
 }
@@ -4139,7 +4698,9 @@ void SROA_Parameter_HLSL::DeleteDeadInstructions() {
   }
 }
 
-static DxilFieldAnnotation &GetEltAnnotation(Type *Ty, unsigned idx, DxilFieldAnnotation &annotation, DxilTypeSystem &dxilTypeSys) {
+static DxilFieldAnnotation &GetEltAnnotation(Type *Ty, unsigned idx,
+                                             DxilFieldAnnotation &annotation,
+                                             DxilTypeSystem &dxilTypeSys) {
   while (Ty->isArrayTy())
     Ty = Ty->getArrayElementType();
   if (StructType *ST = dyn_cast<StructType>(Ty)) {
@@ -4151,7 +4712,7 @@ static DxilFieldAnnotation &GetEltAnnotation(Type *Ty, unsigned idx, DxilFieldAn
       return FA;
     }
   }
-  return annotation;  
+  return annotation;
 }
 
 // Note: Semantic index allocation.
@@ -4186,10 +4747,9 @@ static DxilFieldAnnotation &GetEltAnnotation(Type *Ty, unsigned idx, DxilFieldAn
 //  float4 s_m[2], float4 s_m2[2].
 //  float4 s2_m[2], float4 s2_m2[2].
 
-// To do the allocation, need to map from each element to its flattened argument.
-// Say arg index of float4 s_m[2] is 0, float4 s_m2[2] is 1.
-// Need to get 0 from s[0].m and s[1].m, get 1 from s[0].m2 and s[1].m2.
-
+// To do the allocation, need to map from each element to its flattened
+// argument. Say arg index of float4 s_m[2] is 0, float4 s_m2[2] is 1. Need to
+// get 0 from s[0].m and s[1].m, get 1 from s[0].m2 and s[1].m2.
 
 // Allocate the argments with same semantic string from type where the
 // semantic starts( S2 for s2.m[2] and s2.m2[2]).
@@ -4217,6 +4777,10 @@ static unsigned AllocateSemanticIndex(
       Type *EltTy = Ty->getStructElementType(i);
       argIdx = AllocateSemanticIndex(EltTy, semIndex, argIdx, endArgIdx,
                                      FlatAnnotationList);
+      // Unwrap array types when checking whether this is a leaf node,
+      // otherwise, array of struct will be misinterpreted as a leaf node.
+      while (EltTy->isArrayTy())
+        EltTy = EltTy->getArrayElementType();
       if (!(EltTy->isStructTy() && !HLMatrixType::isa(EltTy))) {
         // Update argIdx only when it is a leaf node.
         argIdx++;
@@ -4271,7 +4835,8 @@ void SROA_Parameter_HLSL::allocateSemanticIndex(
 
     unsigned semGroupEnd = i + 1;
     while (semGroupEnd < endArgIndex &&
-           FlatAnnotationList[semGroupEnd].GetSemanticString() == ContinuedPseudoSemantic) {
+           FlatAnnotationList[semGroupEnd].GetSemanticString() ==
+               ContinuedPseudoSemantic) {
       FlatAnnotationList[semGroupEnd].SetSemanticString(baseSemName);
       ++semGroupEnd;
     }
@@ -4397,9 +4962,8 @@ static Value *LoadArrayPtrToMat(Value *ArrayPtr, unsigned arrayBaseIdx,
   Value *zero = Builder.getInt32(0);
   for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
     for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
-      unsigned matIdx = bRowMajor
-        ? MatTy.getRowMajorIndex(r, c)
-        : MatTy.getColumnMajorIndex(r, c);
+      unsigned matIdx = bRowMajor ? MatTy.getRowMajorIndex(r, c)
+                                  : MatTy.getColumnMajorIndex(r, c);
       Value *Ptr = Builder.CreateInBoundsGEP(
           ArrayPtr, {zero, Builder.getInt32(arrayBaseIdx + matIdx)});
       Value *Elt = Builder.CreateLoad(Ptr);
@@ -4600,7 +5164,9 @@ void SROA_Parameter_HLSL::replaceCastParameter(
     Builder.SetInsertPoint(I->getNextNode());
   }
 
-  if (DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(OldParam)) {
+  SmallVector<DbgDeclareInst *, 4> dbgDecls;
+  llvm::FindAllocaDbgDeclare(OldParam, dbgDecls);
+  for (DbgDeclareInst *DDI : dbgDecls) {
     // Add debug info to new param.
     DIBuilder DIB(*F.getParent(), /*AllowUnresolved*/ false);
     DIExpression *DDIExp = DDI->getExpression();
@@ -4612,7 +5178,8 @@ void SROA_Parameter_HLSL::replaceCastParameter(
     // OldParam will be removed with Old function.
     // Create alloca to replace it.
     IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(&F));
-    Value *AllocParam = AllocaBuilder.CreateAlloca(OldTy->getPointerElementType());
+    Value *AllocParam =
+        AllocaBuilder.CreateAlloca(OldTy->getPointerElementType());
     OldParam->replaceAllUsesWith(AllocParam);
     OldParam = AllocParam;
   }
@@ -4688,13 +5255,14 @@ void SROA_Parameter_HLSL::replaceCastParameter(
   }
 }
 
-Value *SROA_Parameter_HLSL::castResourceArgIfRequired(
-    Value *V, Type *Ty, bool bOut,
-    DxilParamInputQual inputQual,
-    IRBuilder<> &Builder) {
+Value *
+SROA_Parameter_HLSL::castResourceArgIfRequired(Value *V, Type *Ty, bool bOut,
+                                               DxilParamInputQual inputQual,
+                                               IRBuilder<> &Builder) {
   Type *HandleTy = m_pHLModule->GetOP()->GetHandleType();
   Module &M = *m_pHLModule->GetModule();
-  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
+  IRBuilder<> AllocaBuilder(
+      dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
 
   // Lower resource type to handle ty.
   if (dxilutil::IsHLSLResourceType(Ty)) {
@@ -4702,15 +5270,13 @@ Value *SROA_Parameter_HLSL::castResourceArgIfRequired(
     if (!bOut) {
       Value *LdRes = Builder.CreateLoad(Res);
       V = m_pHLModule->EmitHLOperationCall(Builder,
-        HLOpcodeGroup::HLCreateHandle,
-        /*opcode*/ 0, HandleTy, { LdRes }, M);
-    }
-    else {
+                                           HLOpcodeGroup::HLCreateHandle,
+                                           /*opcode*/ 0, HandleTy, {LdRes}, M);
+    } else {
       V = AllocaBuilder.CreateAlloca(HandleTy);
     }
     castParamMap[V] = std::make_pair(Res, inputQual);
-  }
-  else if (Ty->isArrayTy()) {
+  } else if (Ty->isArrayTy()) {
     unsigned arraySize = 1;
     Type *AT = Ty;
     while (AT->isArrayTy()) {
@@ -4728,12 +5294,12 @@ Value *SROA_Parameter_HLSL::castResourceArgIfRequired(
 }
 
 Value *SROA_Parameter_HLSL::castArgumentIfRequired(
-    Value *V, Type *Ty, bool bOut,
-    DxilParamInputQual inputQual, DxilFieldAnnotation &annotation,
-    IRBuilder<> &Builder,
+    Value *V, Type *Ty, bool bOut, DxilParamInputQual inputQual,
+    DxilFieldAnnotation &annotation, IRBuilder<> &Builder,
     DxilTypeSystem &TypeSys) {
   Module &M = *m_pHLModule->GetModule();
-  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
+  IRBuilder<> AllocaBuilder(
+      dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
 
   if (inputQual == DxilParamInputQual::InPayload) {
     DXASSERT_NOMSG(isa<StructType>(Ty));
@@ -4840,9 +5406,11 @@ void SROA_Parameter_HLSL::flattenArgument(
     DxilParameterAnnotation &paramAnnotation,
     std::vector<Value *> &FlatParamList,
     std::vector<DxilParameterAnnotation> &FlatAnnotationList,
-    BasicBlock *EntryBlock, DbgDeclareInst *DDI) {
+    BasicBlock *EntryBlock, ArrayRef<DbgDeclareInst *> DDIs) {
   std::deque<AnnotatedValue> WorkList;
-  WorkList.push_back({ Arg, paramAnnotation });
+  bool SupportsVectors = m_pHLModule->GetShaderModel()->IsSM69Plus();
+
+  WorkList.push_back({Arg, paramAnnotation});
 
   unsigned startArgIndex = FlatAnnotationList.size();
 
@@ -4865,7 +5433,9 @@ void SROA_Parameter_HLSL::flattenArgument(
     // Unwrap top-level array if primitive
     if (inputQual == DxilParamInputQual::InputPatch ||
         inputQual == DxilParamInputQual::OutputPatch ||
-        inputQual == DxilParamInputQual::InputPrimitive) {
+        inputQual == DxilParamInputQual::InputPrimitive ||
+        inputQual == DxilParamInputQual::OutPrimitives ||
+        inputQual == DxilParamInputQual::OutVertices) {
       Type *Ty = Arg->getType();
       if (Ty->isPointerTy())
         Ty = Ty->getPointerElementType();
@@ -4876,7 +5446,7 @@ void SROA_Parameter_HLSL::flattenArgument(
     }
   }
 
-  std::vector<Instruction*> deadAllocas;
+  std::vector<Instruction *> deadAllocas;
 
   DIBuilder DIB(*F->getParent(), /*AllowUnresolved*/ false);
   unsigned debugOffset = 0;
@@ -4896,10 +5466,12 @@ void SROA_Parameter_HLSL::flattenArgument(
     // will not reveal that, especially if we've done a first SROA pass on V.
     // No DomTree needed for that reason
     const bool bAllowReplace = false;
-    SROA_Helper::LowerMemcpy(V, &annotation, dxilTypeSys, DL, nullptr /*DT */, bAllowReplace);
+    SROA_Helper::LowerMemcpy(V, &annotation, dxilTypeSys, DL, nullptr /*DT */,
+                             bAllowReplace);
 
     // Now is safe to create the IRBuilder.
-    // If we create it before LowerMemcpy, the insertion pointer instruction may get deleted
+    // If we create it before LowerMemcpy, the insertion pointer instruction may
+    // get deleted
     IRBuilder<> Builder(dxilutil::FindAllocaInsertionPt(EntryBlock));
 
     std::vector<Value *> Elts;
@@ -4911,9 +5483,9 @@ void SROA_Parameter_HLSL::flattenArgument(
     if (inputQual != DxilParamInputQual::InPayload) {
       // DomTree isn't used by arguments
       SROAed = SROA_Helper::DoScalarReplacement(
-        V, Elts, BrokenUpTy, NumInstances, Builder, 
-        /*bFlatVector*/ false, annotation.IsPrecise(),
-        dxilTypeSys, DL, DeadInsts, /*DT*/ nullptr);
+          V, Elts, BrokenUpTy, NumInstances, Builder,
+          /*bFlatVector*/ false, SupportsVectors, annotation.IsPrecise(),
+          dxilTypeSys, DL, DeadInsts, /*DT*/ nullptr);
     }
 
     if (SROAed) {
@@ -4929,36 +5501,51 @@ void SROA_Parameter_HLSL::flattenArgument(
       const std::string &semantic = annotation.GetSemanticString();
       hlsl::InterpolationMode interpMode = annotation.GetInterpolationMode();
 
+      // Find index of first non-empty field.
+      unsigned firstNonEmptyIx = Elts.size();
+      for (unsigned ri = 0; ri < Elts.size(); ri++) {
+        if (DL.getTypeSizeInBits(Ty->getContainedType(ri)) > 0) {
+          firstNonEmptyIx = ri;
+          break;
+        }
+      }
+
       // Push Elts into workList from right to left to preserve the order.
-      for (unsigned ri=0;ri<Elts.size();ri++) {
+      for (unsigned ri = 0; ri < Elts.size(); ri++) {
         unsigned i = Elts.size() - ri - 1;
-        DxilFieldAnnotation EltAnnotation = GetEltAnnotation(Ty, i, annotation, dxilTypeSys);
+        DxilFieldAnnotation EltAnnotation =
+            GetEltAnnotation(Ty, i, annotation, dxilTypeSys);
         const std::string &eltSem = EltAnnotation.GetSemanticString();
         if (!semantic.empty()) {
           if (!eltSem.empty()) {
-            // It doesn't look like we can provide source location information from here
+            // It doesn't look like we can provide source location information
+            // from here
             F->getContext().emitWarning(
-              Twine("semantic '") + eltSem + "' on field overridden by function or enclosing type");
+                Twine("semantic '") + eltSem +
+                "' on field overridden by function or enclosing type");
           }
 
-          // Inherit semantic from parent, but only preserve it for the first element.
-          // Subsequent elements are noted with a special value that gets resolved
-          // once the argument is completely flattened.
-          EltAnnotation.SetSemanticString(i == 0 ? semantic : ContinuedPseudoSemantic);
-        } else if (!eltSem.empty() &&
-                 semanticTypeMap.count(eltSem) == 0) {
+          // Inherit semantic from parent, but only preserve it for the first
+          // non-zero-sized element.
+          // Subsequent elements are noted with a special value that gets
+          // resolved once the argument is completely flattened.
+          EltAnnotation.SetSemanticString(
+              i == firstNonEmptyIx ? semantic : ContinuedPseudoSemantic);
+        } else if (!eltSem.empty() && semanticTypeMap.count(eltSem) == 0) {
           Type *EltTy = dxilutil::GetArrayEltTy(Ty);
-          DXASSERT(EltTy->isStructTy(), "must be a struct type to has semantic.");
+          DXASSERT(EltTy->isStructTy(),
+                   "must be a struct type to has semantic.");
           semanticTypeMap[eltSem] = EltTy->getStructElementType(i);
         }
 
         if (precise)
           EltAnnotation.SetPrecise();
 
-        if (EltAnnotation.GetInterpolationMode().GetKind() == DXIL::InterpolationMode::Undefined)
+        if (EltAnnotation.GetInterpolationMode().GetKind() ==
+            DXIL::InterpolationMode::Undefined)
           EltAnnotation.SetInterpolationMode(interpMode);
 
-        WorkList.push_front({ Elts[i], EltAnnotation });
+        WorkList.push_front({Elts[i], EltAnnotation});
       }
 
       ++NumReplaced;
@@ -4971,11 +5558,10 @@ void SROA_Parameter_HLSL::flattenArgument(
 
       // Flatten array of SV_Target.
       StringRef semanticStr = annotation.GetSemanticString();
-      if (semanticStr.upper().find("SV_TARGET") == 0 &&
-          Ty->isArrayTy()) {
+      if (semanticStr.upper().find("SV_TARGET") == 0 && Ty->isArrayTy()) {
         Type *Ty = cast<ArrayType>(V->getType()->getPointerElementType());
         StringRef targetStr;
-        unsigned  targetIndex;
+        unsigned targetIndex;
         Semantic::DecomposeNameAndIndex(semanticStr, &targetStr, &targetIndex);
         // Replace target parameter with local target.
         AllocaInst *localTarget = Builder.CreateAlloca(Ty);
@@ -4994,19 +5580,20 @@ void SROA_Parameter_HLSL::flattenArgument(
 
         // Create flattened target.
         DxilFieldAnnotation EltAnnotation = annotation;
-        for (unsigned i=0;i<arraySize;i++) {
+        for (unsigned i = 0; i < arraySize; i++) {
           Value *Elt = Builder.CreateAlloca(Ty);
-          EltAnnotation.SetSemanticString(targetStr.str()+std::to_string(targetIndex+i));
+          EltAnnotation.SetSemanticString(targetStr.str() +
+                                          std::to_string(targetIndex + i));
 
           // Add semantic type.
           semanticTypeMap[EltAnnotation.GetSemanticString()] = Ty;
 
-          WorkList.push_front({ Elt, EltAnnotation });
+          WorkList.push_front({Elt, EltAnnotation});
           // Copy local target to flattened target.
-          std::vector<Value*> idxList(arrayLevel+1);
+          std::vector<Value *> idxList(arrayLevel + 1);
           idxList[0] = Builder.getInt32(0);
-          for (unsigned idx=0;idx<arrayLevel; idx++) {
-            idxList[idx+1] = Builder.getInt32(arrayIdxList[idx]);
+          for (unsigned idx = 0; idx < arrayLevel; idx++) {
+            idxList[idx + 1] = Builder.getInt32(arrayIdxList[idx]);
           }
 
           if (bForParam) {
@@ -5028,19 +5615,19 @@ void SROA_Parameter_HLSL::flattenArgument(
           }
 
           // Update arrayIdxList.
-          for (unsigned idx=arrayLevel;idx>0;idx--) {
-            arrayIdxList[idx-1]++;
-            if (arrayIdxList[idx-1] < arraySizeList[idx-1])
+          for (unsigned idx = arrayLevel; idx > 0; idx--) {
+            arrayIdxList[idx - 1]++;
+            if (arrayIdxList[idx - 1] < arraySizeList[idx - 1])
               break;
-            arrayIdxList[idx-1] = 0;
+            arrayIdxList[idx - 1] = 0;
           }
         }
         continue;
       }
 
       // Cast vector/matrix/resource parameter.
-      V = castArgumentIfRequired(V, Ty, bOut, inputQual,
-                                  annotation, Builder, dxilTypeSys);
+      V = castArgumentIfRequired(V, Ty, bOut, inputQual, annotation, Builder,
+                                 dxilTypeSys);
 
       // Cannot SROA, save it to final parameter list.
       FlatParamList.emplace_back(V);
@@ -5048,17 +5635,20 @@ void SROA_Parameter_HLSL::flattenArgument(
       FlatAnnotationList.emplace_back(DxilParameterAnnotation());
       DxilParameterAnnotation &flatParamAnnotation = FlatAnnotationList.back();
 
-      flatParamAnnotation.SetParamInputQual(paramAnnotation.GetParamInputQual());
-            
-      flatParamAnnotation.SetInterpolationMode(annotation.GetInterpolationMode());
+      flatParamAnnotation.SetParamInputQual(
+          paramAnnotation.GetParamInputQual());
+
+      flatParamAnnotation.SetInterpolationMode(
+          annotation.GetInterpolationMode());
       flatParamAnnotation.SetSemanticString(annotation.GetSemanticString());
       flatParamAnnotation.SetCompType(annotation.GetCompType().GetKind());
       flatParamAnnotation.SetMatrixAnnotation(annotation.GetMatrixAnnotation());
       flatParamAnnotation.SetPrecise(annotation.IsPrecise());
-      flatParamAnnotation.SetResourceAttribute(annotation.GetResourceAttribute());
+      flatParamAnnotation.SetResourceProperties(
+          annotation.GetResourceProperties());
 
       // Add debug info.
-      if (DDI && V != Arg) {
+      if (DDIs.size() && V != Arg) {
         Value *TmpV = V;
         // If V is casted, add debug into to original V.
         if (castParamMap.count(V)) {
@@ -5082,21 +5672,23 @@ void SROA_Parameter_HLSL::flattenArgument(
         DIExpression *DDIExp = nullptr;
         if (debugOffset == 0 && DL.getTypeAllocSize(argTy) == size) {
           DDIExp = DIB.createExpression();
-        }
-        else {
+        } else {
           DDIExp = DIB.createBitPieceExpression(debugOffset * 8, size * 8);
         }
 #endif // HLSL Change
         debugOffset += size;
-        DIB.insertDeclare(TmpV, DDI->getVariable(), DDIExp, DDI->getDebugLoc(),
-                          Builder.GetInsertPoint());
+        for (DbgDeclareInst *DDI : DDIs) {
+          DIB.insertDeclare(TmpV, DDI->getVariable(), DDIExp,
+                            DDI->getDebugLoc(), Builder.GetInsertPoint());
+        }
       }
 
       // Flatten stream out.
       if (HLModule::IsStreamOutputPtrType(V->getType())) {
         // For stream output objects.
         // Create a value as output value.
-        Type *outputType = V->getType()->getPointerElementType()->getStructElementType(0);
+        Type *outputType =
+            V->getType()->getPointerElementType()->getStructElementType(0);
         Value *outputVal = Builder.CreateAlloca(outputType);
 
         // For each stream.Append(data)
@@ -5108,46 +5700,59 @@ void SROA_Parameter_HLSL::flattenArgument(
           if (CallInst *CI = dyn_cast<CallInst>(user)) {
             unsigned opcode = GetHLOpcode(CI);
             if (opcode == static_cast<unsigned>(IntrinsicOp::MOP_Append)) {
-              // At this point, the stream append data argument might or not have been SROA'd
-              Value *firstDataPtr = CI->getArgOperand(HLOperandIndex::kStreamAppendDataOpIndex);
-              DXASSERT(firstDataPtr->getType()->isPointerTy(), "Append value must be a pointer.");
-              if (firstDataPtr->getType()->getPointerElementType() == outputType) {
+              // At this point, the stream append data argument might or not
+              // have been SROA'd
+              Value *firstDataPtr =
+                  CI->getArgOperand(HLOperandIndex::kStreamAppendDataOpIndex);
+              DXASSERT(firstDataPtr->getType()->isPointerTy(),
+                       "Append value must be a pointer.");
+              if (firstDataPtr->getType()->getPointerElementType() ==
+                  outputType) {
                 // The data has not been SROA'd
-                DXASSERT(CI->getNumArgOperands() == (HLOperandIndex::kStreamAppendDataOpIndex + 1),
-                  "Unexpected number of arguments for non-SROA'd StreamOutput.Append");
+                DXASSERT(CI->getNumArgOperands() ==
+                             (HLOperandIndex::kStreamAppendDataOpIndex + 1),
+                         "Unexpected number of arguments for non-SROA'd "
+                         "StreamOutput.Append");
                 IRBuilder<> Builder(CI);
 
                 llvm::SmallVector<llvm::Value *, 16> idxList;
-                SplitCpy(firstDataPtr->getType(), outputVal, firstDataPtr, idxList, Builder, DL,
-                          dxilTypeSys, &flatParamAnnotation);
+                SplitCpy(firstDataPtr->getType(), outputVal, firstDataPtr,
+                         idxList, Builder, DL, dxilTypeSys,
+                         &flatParamAnnotation);
 
-                CI->setArgOperand(HLOperandIndex::kStreamAppendDataOpIndex, outputVal);
-              }
-              else {
-                // Append has been SROA'd, we might be operating on multiple values
-                // with types differing from the stream output type.
+                CI->setArgOperand(HLOperandIndex::kStreamAppendDataOpIndex,
+                                  outputVal);
+              } else {
+                // Append has been SROA'd, we might be operating on multiple
+                // values with types differing from the stream output type.
                 // Flatten store outputVal.
                 // Must be struct to be flatten.
                 IRBuilder<> Builder(CI);
 
                 llvm::SmallVector<llvm::Value *, 16> IdxList;
                 llvm::SmallVector<llvm::Value *, 16> EltPtrList;
-                llvm::SmallVector<const DxilFieldAnnotation*, 16> EltAnnotationList;
+                llvm::SmallVector<const DxilFieldAnnotation *, 16>
+                    EltAnnotationList;
                 // split
-                SplitPtr(outputVal, IdxList, outputVal->getType(), flatParamAnnotation,
-                  EltPtrList, EltAnnotationList, dxilTypeSys, Builder);
+                SplitPtr(outputVal, IdxList, outputVal->getType(),
+                         flatParamAnnotation, EltPtrList, EltAnnotationList,
+                         dxilTypeSys, Builder);
 
-                unsigned eltCount = CI->getNumArgOperands()-2;
-                DXASSERT_LOCALVAR(eltCount, eltCount == EltPtrList.size(), "invalid element count");
+                unsigned eltCount = CI->getNumArgOperands() - 2;
+                DXASSERT_LOCALVAR(eltCount, eltCount == EltPtrList.size(),
+                                  "invalid element count");
 
-                for (unsigned i = HLOperandIndex::kStreamAppendDataOpIndex; i < CI->getNumArgOperands(); i++) {
+                for (unsigned i = HLOperandIndex::kStreamAppendDataOpIndex;
+                     i < CI->getNumArgOperands(); i++) {
                   Value *DataPtr = CI->getArgOperand(i);
-                  Value *EltPtr = EltPtrList[i - HLOperandIndex::kStreamAppendDataOpIndex];
-                  const DxilFieldAnnotation *EltAnnotation = EltAnnotationList[i - HLOperandIndex::kStreamAppendDataOpIndex];
+                  Value *EltPtr =
+                      EltPtrList[i - HLOperandIndex::kStreamAppendDataOpIndex];
+                  const DxilFieldAnnotation *EltAnnotation = EltAnnotationList
+                      [i - HLOperandIndex::kStreamAppendDataOpIndex];
 
                   llvm::SmallVector<llvm::Value *, 16> IdxList;
                   SplitCpy(DataPtr->getType(), EltPtr, DataPtr, IdxList,
-                            Builder, DL, dxilTypeSys, EltAnnotation);
+                           Builder, DL, dxilTypeSys, EltAnnotation);
                   CI->setArgOperand(i, EltPtr);
                 }
               }
@@ -5156,7 +5761,7 @@ void SROA_Parameter_HLSL::flattenArgument(
         }
 
         // Then split output value to generate ParamQual.
-        WorkList.push_front({ outputVal, annotation });
+        WorkList.push_front({outputVal, annotation});
       }
     }
   }
@@ -5181,10 +5786,8 @@ void SROA_Parameter_HLSL::flattenArgument(
         FlatAnnotationList[startArgIndex];
     const std::string &semantic = flatParamAnnotation.GetSemanticString();
     if (!semantic.empty())
-      allocateSemanticIndex(FlatAnnotationList, startArgIndex,
-                            semanticTypeMap);
+      allocateSemanticIndex(FlatAnnotationList, startArgIndex, semanticTypeMap);
   }
-
 }
 
 static bool IsUsedAsCallArg(Value *V) {
@@ -5225,7 +5828,7 @@ void SROA_Parameter_HLSL::preprocessArgUsedInCall(Function *F) {
 
   IRBuilder<> Builder(dxilutil::FindAllocaInsertionPt(F));
 
-  SmallVector<ReturnInst*, 2> retList;
+  SmallVector<ReturnInst *, 2> retList;
   for (BasicBlock &bb : F->getBasicBlockList()) {
     if (ReturnInst *RI = dyn_cast<ReturnInst>(bb.getTerminator())) {
       retList.emplace_back(RI);
@@ -5239,8 +5842,7 @@ void SROA_Parameter_HLSL::preprocessArgUsedInCall(Function *F) {
       continue;
     Ty = Ty->getPointerElementType();
     // Skip scalar types.
-    if (!Ty->isAggregateType() &&
-        Ty->getScalarType() == Ty)
+    if (!Ty->isAggregateType() && Ty->getScalarType() == Ty)
       continue;
 
     bool bUsedInCall = IsUsedAsCallArg(&arg);
@@ -5251,7 +5853,8 @@ void SROA_Parameter_HLSL::preprocessArgUsedInCall(Function *F) {
       // Replace arg with tmp.
       arg.replaceAllUsesWith(TmpArg);
 
-      DxilParameterAnnotation &paramAnnot = pFuncAnnot->GetParameterAnnotation(arg.getArgNo());
+      DxilParameterAnnotation &paramAnnot =
+          pFuncAnnot->GetParameterAnnotation(arg.getArgNo());
       DxilParamInputQual inputQual = paramAnnot.GetParamInputQual();
       unsigned size = DL.getTypeAllocSize(Ty);
       // Copy between arg and tmp.
@@ -5268,15 +5871,13 @@ void SROA_Parameter_HLSL::preprocessArgUsedInCall(Function *F) {
         for (ReturnInst *RI : retList) {
           IRBuilder<> RetBuilder(RI);
           // copy tmp to arg.
-          CallInst *tmpToArg =
-              RetBuilder.CreateMemCpy(&arg, TmpArg, size, 0);
+          CallInst *tmpToArg = RetBuilder.CreateMemCpy(&arg, TmpArg, size, 0);
           // Split the memcpy.
           MemcpySplitter::SplitMemCpy(cast<MemCpyInst>(tmpToArg), DL, nullptr,
                                       typeSys);
         }
       }
       // TODO: support other DxilParamInputQual.
-
     }
   }
 }
@@ -5400,11 +6001,14 @@ static void LegalizeDxilInputOutputs(Function *F,
   BasicBlock &EntryBlk = F->getEntryBlock();
   Module *M = F->getParent();
   // Map from output to the temp created for it.
-  MapVector<Argument *, Value*> outputTempMap; // Need deterministic order of iteration
+  MapVector<Argument *, Value *>
+      outputTempMap; // Need deterministic order of iteration
   for (Argument &arg : F->args()) {
+    dxilutil::MergeGepUse(&arg);
     Type *Ty = arg.getType();
 
-    DxilParameterAnnotation &paramAnnotation = EntryAnnotation->GetParameterAnnotation(arg.getArgNo());
+    DxilParameterAnnotation &paramAnnotation =
+        EntryAnnotation->GetParameterAnnotation(arg.getArgNo());
     DxilParamInputQual qual = paramAnnotation.GetParamInputQual();
 
     bool isColMajor = false;
@@ -5451,7 +6055,8 @@ static void LegalizeDxilInputOutputs(Function *F,
       case DxilParamInputQual::InPayload:
       case DxilParamInputQual::InputPrimitive:
       case DxilParamInputQual::InputPatch:
-      case DxilParamInputQual::OutputPatch: {
+      case DxilParamInputQual::OutputPatch:
+      case DxilParamInputQual::NodeIO: {
         bStoreInputToTemp = true;
       } break;
       case DxilParamInputQual::Inout:
@@ -5528,9 +6133,9 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
   DxilTypeSystem &typeSys = m_pHLModule->GetTypeSystem();
 
   DXASSERT(F == m_pHLModule->GetEntryFunction() ||
-           m_pHLModule->IsEntryThatUsesSignatures(F),
-    "otherwise, createFlattenedFunction called on library function "
-    "that should not be flattened.");
+               m_pHLModule->IsEntryThatUsesSignatures(F),
+           "otherwise, createFlattenedFunction called on library function "
+           "that should not be flattened.");
 
   const DataLayout &DL = m_pHLModule->GetModule()->getDataLayout();
 
@@ -5542,7 +6147,8 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
   castParamMap.clear();
   vectorEltsMap.clear();
 
-  DxilFunctionAnnotation *funcAnnotation = m_pHLModule->GetFunctionAnnotation(F);
+  DxilFunctionAnnotation *funcAnnotation =
+      m_pHLModule->GetFunctionAnnotation(F);
   DXASSERT(funcAnnotation, "must find annotation for function");
 
   std::deque<Value *> WorkList;
@@ -5571,15 +6177,16 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
   // Add all argument to worklist.
   for (Argument &Arg : F->args()) {
     // merge GEP use for arg.
-    HLModule::MergeGepUse(&Arg);
+    dxilutil::MergeGepUse(&Arg);
 
     unsigned prevFlatParamCount = FlatParamList.size();
 
     DxilParameterAnnotation &paramAnnotation =
         funcAnnotation->GetParameterAnnotation(Arg.getArgNo());
-    DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(&Arg);
+    SmallVector<DbgDeclareInst *, 4> DDIs;
+    llvm::FindAllocaDbgDeclare(&Arg, DDIs);
     flattenArgument(F, &Arg, bForParamTrue, paramAnnotation, FlatParamList,
-                    FlatParamAnnotationList, EntryBlock, DDI);
+                    FlatParamAnnotationList, EntryBlock, DDIs);
 
     unsigned newFlatParamCount = FlatParamList.size() - prevFlatParamCount;
     for (unsigned i = 0; i < newFlatParamCount; i++) {
@@ -5634,7 +6241,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
           }
           unsigned opcode = static_cast<unsigned>(
               isRowMajor ? HLMatLoadStoreOpcode::RowMatStore
-                          : HLMatLoadStoreOpcode::ColMatStore);
+                         : HLMatLoadStoreOpcode::ColMatStore);
           HLModule::EmitHLOperationCall(RetBuilder,
                                         HLOpcodeGroup::HLMatLoadStore, opcode,
                                         voidTy, {retValAddr, RetVal}, M);
@@ -5646,10 +6253,11 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
       Builder.CreateStore(UndefValue::get(retType), retValAddr);
     }
 
-    DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(retValAddr);
+    SmallVector<DbgDeclareInst *, 4> DDIs;
+    llvm::FindAllocaDbgDeclare(retValAddr, DDIs);
     flattenArgument(F, retValAddr, bForParamTrue,
                     funcAnnotation->GetRetTypeAnnotation(), FlatRetList,
-                    FlatRetAnnotationList, EntryBlock, DDI);
+                    FlatRetAnnotationList, EntryBlock, DDIs);
 
     const int kRetArgNo = -1;
     for (unsigned i = 0; i < FlatRetList.size(); i++) {
@@ -5667,15 +6275,15 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
     retType = Type::getVoidTy(retType->getContext());
     // Merge return data info param data.
 
-    FlatParamList.insert(FlatParamList.begin(), FlatRetList.begin(), FlatRetList.end());
+    FlatParamList.insert(FlatParamList.begin(), FlatRetList.begin(),
+                         FlatRetList.end());
     FlatParamAnnotationList.insert(FlatParamAnnotationList.begin(),
-                                    FlatRetAnnotationList.begin(),
-                                    FlatRetAnnotationList.end());
+                                   FlatRetAnnotationList.begin(),
+                                   FlatRetAnnotationList.end());
   }
 
-
   std::vector<Type *> FinalTypeList;
-  for (Value * arg : FlatParamList) {
+  for (Value *arg : FlatParamList) {
     FinalTypeList.emplace_back(arg->getType());
   }
 
@@ -5686,7 +6294,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
       auto &VS = funcProps.ShaderProps.VS;
       Type *outFloatTy = Type::getFloatPtrTy(F->getContext());
       // Add out float parameter for each clip plane.
-      unsigned i=0;
+      unsigned i = 0;
       for (; i < DXIL::kNumClipPlanes; i++) {
         if (!VS.clipPlanes[i])
           break;
@@ -5703,10 +6311,14 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
     if (!FlatParamAnnotationList.empty()) {
       if (!FlatParamAnnotationList[0].GetSemanticString().empty()) {
         for (unsigned i = 0; i < FlatParamAnnotationList.size(); i++) {
-          DxilParameterAnnotation &paramAnnotation = funcAnnotation->GetParameterAnnotation(i);
-          DxilParameterAnnotation &flatParamAnnotation = FlatParamAnnotationList[i];
-          paramAnnotation.SetSemanticIndexVec(flatParamAnnotation.GetSemanticIndexVec());
-          paramAnnotation.SetSemanticString(flatParamAnnotation.GetSemanticString());
+          DxilParameterAnnotation &paramAnnotation =
+              funcAnnotation->GetParameterAnnotation(i);
+          DxilParameterAnnotation &flatParamAnnotation =
+              FlatParamAnnotationList[i];
+          paramAnnotation.SetSemanticIndexVec(
+              flatParamAnnotation.GetSemanticIndexVec());
+          paramAnnotation.SetSemanticString(
+              flatParamAnnotation.GetSemanticString());
         }
       }
     }
@@ -5729,13 +6341,15 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
     funcDI->replaceFunction(flatF);
 
   // Create FunctionAnnotation for flatF.
-  DxilFunctionAnnotation *flatFuncAnnotation = m_pHLModule->AddFunctionAnnotation(flatF);
-  
+  DxilFunctionAnnotation *flatFuncAnnotation =
+      m_pHLModule->AddFunctionAnnotation(flatF);
+
   // Don't need to set Ret Info, flatF always return void now.
 
   // Param Info
   for (unsigned ArgNo = 0; ArgNo < FlatParamAnnotationList.size(); ++ArgNo) {
-    DxilParameterAnnotation &paramAnnotation = flatFuncAnnotation->GetParameterAnnotation(ArgNo);
+    DxilParameterAnnotation &paramAnnotation =
+        flatFuncAnnotation->GetParameterAnnotation(ArgNo);
     paramAnnotation = FlatParamAnnotationList[ArgNo];
   }
 
@@ -5745,7 +6359,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
     F->removeFnAttr(Attribute::StructRet);
   for (Argument &arg : F->args()) {
     if (arg.hasStructRetAttr()) {
-      Attribute::AttrKind SRet [] = {Attribute::StructRet};
+      Attribute::AttrKind SRet[] = {Attribute::StructRet};
       AttributeSet SRetAS = AttributeSet::get(Ctx, arg.getArgNo() + 1, SRet);
       arg.removeAttr(SRetAS);
     }
@@ -5770,11 +6384,15 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
   }
   flatF->setAttributes(flatAS);
 
-  DXASSERT_LOCALVAR(extraParamSize, flatF->arg_size() == (extraParamSize + FlatParamAnnotationList.size()), "parameter count mismatch");
+  DXASSERT_LOCALVAR(extraParamSize,
+                    flatF->arg_size() ==
+                        (extraParamSize + FlatParamAnnotationList.size()),
+                    "parameter count mismatch");
   // ShaderProps.
   if (m_pHLModule->HasDxilFunctionProps(F)) {
     DxilFunctionProps &funcProps = m_pHLModule->GetDxilFunctionProps(F);
-    std::unique_ptr<DxilFunctionProps> flatFuncProps = llvm::make_unique<DxilFunctionProps>();
+    std::unique_ptr<DxilFunctionProps> flatFuncProps =
+        llvm::make_unique<DxilFunctionProps>();
     *flatFuncProps = funcProps;
     m_pHLModule->AddDxilFunctionProps(flatF, flatFuncProps);
     if (funcProps.shaderKind == ShaderModel::Kind::Vertex) {
@@ -5785,7 +6403,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
         if (!VS.clipPlanes[i])
           break;
         DxilParameterAnnotation &paramAnnotation =
-            flatFuncAnnotation->GetParameterAnnotation(clipArgIndex+i);
+            flatFuncAnnotation->GetParameterAnnotation(clipArgIndex + i);
         paramAnnotation.SetParamInputQual(DxilParamInputQual::Out);
         Twine semName = Twine("SV_ClipDistance") + Twine(i);
         paramAnnotation.SetSemanticString(semName.str());
@@ -5821,8 +6439,10 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
       }
 
       // Update arg debug info.
-      DbgDeclareInst *DDI = llvm::FindAllocaDbgDeclare(flatArg);
-      if (DDI) {
+      SmallVector<DbgDeclareInst *, 4> DDIs;
+      llvm::FindAllocaDbgDeclare(flatArg, DDIs);
+      if (DDIs.size()) {
+        Value *VMD = nullptr;
         if (!flatArg->getType()->isPointerTy()) {
           // Create alloca to hold the debug info.
           Value *allocaArg = nullptr;
@@ -5836,10 +6456,11 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
             flatArg->replaceAllUsesWith(ldArg);
             initArg->setOperand(0, flatArg);
           }
-          Value *VMD = MetadataAsValue::get(Context, ValueAsMetadata::get(allocaArg));
-          DDI->setArgOperand(0, VMD);
+          VMD = MetadataAsValue::get(Context, ValueAsMetadata::get(allocaArg));
         } else {
-          Value *VMD = MetadataAsValue::get(Context, ValueAsMetadata::get(Arg));
+          VMD = MetadataAsValue::get(Context, ValueAsMetadata::get(Arg));
+        }
+        for (DbgDeclareInst *DDI : DDIs) {
           DDI->setArgOperand(0, VMD);
         }
       }
@@ -5848,7 +6469,7 @@ void SROA_Parameter_HLSL::createFlattenedFunction(Function *F) {
       if (isa<Instruction>(flatArg))
         DeadInsts.emplace_back(flatArg);
 
-      HLModule::MergeGepUse(Arg);
+      dxilutil::MergeGepUse(Arg);
       // Flatten store of array parameter.
       if (Arg->getType()->isPointerTy()) {
         Type *Ty = Arg->getType()->getPointerElementType();
@@ -5882,13 +6503,64 @@ ModulePass *llvm::createSROA_Parameter_HLSL() {
 //===----------------------------------------------------------------------===//
 
 namespace {
+
+struct GVDebugInfoPatchCache {
+  DenseMap<DILocation *, DISubprogram *> LocToSubprogram;
+  DenseMap<Function *, DISubprogram *> FuncToSubprogram;
+  DITypeIdentifierMap EmptyMap;
+
+  DISubprogram *GetSubprogramForLoc(DILocation *Loc) {
+    auto It = LocToSubprogram.find(Loc);
+    if (It != LocToSubprogram.end())
+      return It->second;
+    DISubprogram *Result = nullptr;
+    auto *Scope = dyn_cast<DIScope>(Loc->getScope());
+    while (Scope) {
+      if (auto SubP = dyn_cast<DISubprogram>(Scope)) {
+        Result = SubP;
+        break;
+      }
+      Scope = Scope->getScope().resolve(EmptyMap);
+    }
+    LocToSubprogram[Loc] = Result;
+    return Result;
+  }
+
+  // Collect DISubprograms from a DILocation's inlined-at chain.
+  void CollectSubprograms(DILocation *Loc, SetVector<DISubprogram *> &Set) {
+    while (Loc) {
+      if (DISubprogram *SP = GetSubprogramForLoc(Loc))
+        Set.insert(SP);
+      Loc = Loc->getInlinedAt();
+    }
+  }
+
+  DISubprogram *GetFuncSubprogram(Function *F, DebugInfoFinder &DbgFinder) {
+    auto It = FuncToSubprogram.find(F);
+    if (It != FuncToSubprogram.end())
+      return It->second;
+    DISubprogram *Result = nullptr;
+    for (DISubprogram *SP : DbgFinder.subprograms()) {
+      if (SP->getFunction() == F) {
+        Result = SP;
+        break;
+      }
+    }
+    FuncToSubprogram[F] = Result;
+    return Result;
+  }
+};
+
 class LowerStaticGlobalIntoAlloca : public ModulePass {
   DebugInfoFinder m_DbgFinder;
+  GVDebugInfoPatchCache m_GVDebugInfoCache;
 
 public:
   static char ID; // Pass identification, replacement for typeid
   explicit LowerStaticGlobalIntoAlloca() : ModulePass(ID) {}
-  const char *getPassName() const override { return "Lower static global into Alloca"; }
+  StringRef getPassName() const override {
+    return "Lower static global into Alloca";
+  }
 
   bool runOnModule(Module &M) override {
     m_DbgFinder.processModule(M);
@@ -5906,7 +6578,7 @@ public:
         }
       } else {
         for (Function &F : M) {
-          if (!HLM.IsEntry(&F)) {
+          if (F.isDeclaration() || !HLM.IsEntry(&F)) {
             continue;
           }
           entryAndInitFunctionSet.insert(&F);
@@ -5924,7 +6596,7 @@ public:
         }
       } else {
         for (Function &F : M) {
-          if (!DM.IsEntry(&F))
+          if (F.isDeclaration() || !DM.IsEntry(&F))
             continue;
           entryAndInitFunctionSet.insert(&F);
         }
@@ -5973,8 +6645,7 @@ public:
       } else {
         EltTy = dxilutil::GetArrayEltTy(EltTy);
         // Lower static [array of] resources
-        if (dxilutil::IsHLSLObjectType(EltTy) ||
-            EltTy == handleTy) {
+        if (dxilutil::IsHLSLObjectType(EltTy) || EltTy == handleTy) {
           staticGVs.emplace_back(&GV);
         }
       }
@@ -5987,19 +6658,22 @@ public:
     // Collect all users of GV within each entry.
     // Remove unused AI in the end.
     for (GlobalVariable *GV : staticGVs) {
-      bUpdated |= lowerStaticGlobalIntoAlloca(GV, DL, *pTypeSys, entryAndInitFunctionSet);
+      bUpdated |= lowerStaticGlobalIntoAlloca(GV, DL, *pTypeSys,
+                                              entryAndInitFunctionSet);
     }
 
     return bUpdated;
   }
 
 private:
-  bool lowerStaticGlobalIntoAlloca(GlobalVariable *GV, const DataLayout &DL,
-                                   DxilTypeSystem &typeSys,
-                                   SetVector<Function *> &entryAndInitFunctionSet);
-  bool usedOnlyInEntry(Value *V, SetVector<Function *> &entryAndInitFunctionSet);
+  bool
+  lowerStaticGlobalIntoAlloca(GlobalVariable *GV, const DataLayout &DL,
+                              DxilTypeSystem &typeSys,
+                              SetVector<Function *> &entryAndInitFunctionSet);
+  bool usedOnlyInEntry(Value *V,
+                       SetVector<Function *> &entryAndInitFunctionSet);
 };
-}
+} // namespace
 
 // Go through the base type chain of TyA and see if
 // we eventually get to TyB
@@ -6016,8 +6690,7 @@ static bool IsDerivedTypeOf(DIType *TyA, DIType *TyB) {
         return true;
       else
         TyA = Derived->getBaseType().resolve(EmptyMap);
-    }
-    else {
+    } else {
       break;
     }
   }
@@ -6030,7 +6703,10 @@ static bool IsDerivedTypeOf(DIType *TyA, DIType *TyB) {
 //
 // If DGV is not a member, just return nullptr.
 //
-static DIGlobalVariable *FindGlobalVariableFragment(const DebugInfoFinder &DbgFinder, DIGlobalVariable *DGV, unsigned *Out_OffsetInBits, unsigned *Out_SizeInBits) {
+static DIGlobalVariable *
+FindGlobalVariableFragment(const DebugInfoFinder &DbgFinder,
+                           DIGlobalVariable *DGV, unsigned *Out_OffsetInBits,
+                           unsigned *Out_SizeInBits) {
   DITypeIdentifierMap EmptyMap;
 
   StringRef FullName = DGV->getName();
@@ -6048,8 +6724,7 @@ static DIGlobalVariable *FindGlobalVariableFragment(const DebugInfoFinder &DbgFi
 
   for (DIGlobalVariable *DGV_It : DbgFinder.global_variables()) {
     if (DGV_It->getName() == BaseName &&
-      IsDerivedTypeOf(Ty, DGV_It->getType().resolve(EmptyMap)))
-    {
+        IsDerivedTypeOf(Ty, DGV_It->getType().resolve(EmptyMap))) {
       FinalResult = DGV_It;
       break;
     }
@@ -6066,34 +6741,21 @@ static DIGlobalVariable *FindGlobalVariableFragment(const DebugInfoFinder &DbgFi
 // Create a fake local variable for the GlobalVariable GV that has just been
 // lowered to local Alloca.
 //
-static
-void PatchDebugInfo(DebugInfoFinder &DbgFinder, Function *F, GlobalVariable *GV, AllocaInst *AI) {
-  if (!DbgFinder.compile_unit_count())
-    return;
-
-  // Find the subprogram for function
-  DISubprogram *Subprogram = nullptr;
-  for (DISubprogram *SP : DbgFinder.subprograms()) {
-    if (SP->getFunction() == F) {
-      Subprogram = SP;
-      break;
-    }
-  }
-
+static void PatchDebugInfo(GVDebugInfoPatchCache &Cache,
+                           DebugInfoFinder &DbgFinder, Function *F,
+                           GlobalVariable *GV, AllocaInst *AI) {
   DIGlobalVariable *DGV = dxilutil::FindGlobalVariableDebugInfo(GV, DbgFinder);
   if (!DGV)
     return;
 
-  DITypeIdentifierMap EmptyMap;
-  DIBuilder DIB(*GV->getParent());
-  DIScope *Scope = Subprogram;
-  DebugLoc Loc = DebugLoc::get(0, 0, Scope);
+  if (!DbgFinder.compile_unit_count())
+    return;
 
   // If the variable is a member of another variable, find the offset and size
   bool IsFragment = false;
-  unsigned OffsetInBits = 0,
-           SizeInBits = 0;
-  if (DIGlobalVariable *UnsplitDGV = FindGlobalVariableFragment(DbgFinder, DGV, &OffsetInBits, &SizeInBits)) {
+  unsigned OffsetInBits = 0, SizeInBits = 0;
+  if (DIGlobalVariable *UnsplitDGV = FindGlobalVariableFragment(
+          DbgFinder, DGV, &OffsetInBits, &SizeInBits)) {
     DGV = UnsplitDGV;
     IsFragment = true;
   }
@@ -6104,27 +6766,47 @@ void PatchDebugInfo(DebugInfoFinder &DbgFinder, Function *F, GlobalVariable *GV,
   // Subprogram as its scope, so we don't have to make one up for it.
   llvm::dwarf::Tag Tag = llvm::dwarf::Tag::DW_TAG_arg_variable;
 
+  DITypeIdentifierMap EmptyMap;
   DIType *Ty = DGV->getType().resolve(EmptyMap);
-  DXASSERT(Ty->getTag() != dwarf::DW_TAG_member, "Member type is not allowed for variables.");
-  DILocalVariable *ConvertedLocalVar =
-    DIB.createLocalVariable(Tag, Scope,
-      Name, DGV->getFile(), DGV->getLine(), Ty);
+  DXASSERT(Ty->getTag() != dwarf::DW_TAG_member,
+           "Member type is not allowed for variables.");
 
-  DIExpression *Expr = nullptr;
-  if (IsFragment) {
-    Expr = DIB.createBitPieceExpression(OffsetInBits, SizeInBits);
-  }
-  else {
-    Expr = DIB.createExpression(ArrayRef<int64_t>());
+  DIBuilder DIB(*GV->getParent());
+
+  // Only collect subprograms relevant to this GV to avoid creating
+  // O(subprograms × globals) debug instructions.
+  SetVector<DISubprogram *> Subprograms;
+
+  if (DISubprogram *SP = Cache.GetFuncSubprogram(F, DbgFinder))
+    Subprograms.insert(SP);
+
+  for (User *U : AI->users()) {
+    if (Instruction *I = dyn_cast<Instruction>(U))
+      Cache.CollectSubprograms(I->getDebugLoc(), Subprograms);
   }
 
-  DIB.insertDeclare(AI, ConvertedLocalVar, Expr, Loc, AI->getNextNode());
+  for (DISubprogram *Subprogram : Subprograms) {
+    DIScope *Scope = Subprogram;
+    DebugLoc Loc = DebugLoc::get(DGV->getLine(), 0, Scope);
+
+    DILocalVariable *ConvertedLocalVar = DIB.createLocalVariable(
+        Tag, Scope, Name, DGV->getFile(), DGV->getLine(), Ty);
+
+    DIExpression *Expr = nullptr;
+    if (IsFragment)
+      Expr = DIB.createBitPieceExpression(OffsetInBits, SizeInBits);
+    else
+      Expr = DIB.createExpression(ArrayRef<int64_t>());
+
+    DIB.insertDeclare(AI, ConvertedLocalVar, Expr, Loc, AI->getNextNode());
+  }
 }
 
-//Collect instructions using GV and the value used by the instruction.
-//For direct use, the value == GV
-//For constant operator like GEP/Bitcast, the value is the operator used by the instruction.
-//This requires recursion to unwrap nested constant operators using the GV.
+// Collect instructions using GV and the value used by the instruction.
+// For direct use, the value == GV
+// For constant operator like GEP/Bitcast, the value is the operator used by the
+// instruction. This requires recursion to unwrap nested constant operators
+// using the GV.
 static void collectGVInstUsers(Value *V,
                                DenseMap<Instruction *, Value *> &InstUserMap) {
   for (User *U : V->users()) {
@@ -6159,6 +6841,8 @@ bool LowerStaticGlobalIntoAlloca::lowerStaticGlobalIntoAlloca(
     GlobalVariable *GV, const DataLayout &DL, DxilTypeSystem &typeSys,
     SetVector<Function *> &entryAndInitFunctionSet) {
   GV->removeDeadConstantUsers();
+  bool bIsObjectTy = dxilutil::IsHLSLObjectType(
+      dxilutil::StripArrayTypes(GV->getType()->getElementType()));
   // Create alloca for each entry.
   DenseMap<Function *, AllocaInst *> allocaMap;
   for (Function *F : entryAndInitFunctionSet) {
@@ -6166,7 +6850,8 @@ bool LowerStaticGlobalIntoAlloca::lowerStaticGlobalIntoAlloca(
     AllocaInst *AI = Builder.CreateAlloca(GV->getType()->getElementType());
     allocaMap[F] = AI;
     // Store initializer is exist.
-    if (GV->hasInitializer() && !isa<UndefValue>(GV->getInitializer())) {
+    if (GV->hasInitializer() && !isa<UndefValue>(GV->getInitializer()) &&
+        !bIsObjectTy) { // Do not zerio-initialize object allocas
       Builder.CreateStore(GV->getInitializer(), GV);
     }
   }
@@ -6192,7 +6877,7 @@ bool LowerStaticGlobalIntoAlloca::lowerStaticGlobalIntoAlloca(
     if (AI->user_empty())
       AI->eraseFromParent();
     else
-      PatchDebugInfo(m_DbgFinder, F, GV, AI);
+      PatchDebugInfo(m_GVDebugInfoCache, m_DbgFinder, F, GV, AI);
   }
 
   GV->removeDeadConstantUsers();
@@ -6224,8 +6909,7 @@ bool LowerStaticGlobalIntoAlloca::usedOnlyInEntry(
 char LowerStaticGlobalIntoAlloca::ID = 0;
 
 INITIALIZE_PASS(LowerStaticGlobalIntoAlloca, "static-global-to-alloca",
-  "Lower static global into Alloca", false,
-  false)
+                "Lower static global into Alloca", false, false)
 
 // Public interface to the LowerStaticGlobalIntoAlloca pass
 ModulePass *llvm::createLowerStaticGlobalIntoAlloca() {

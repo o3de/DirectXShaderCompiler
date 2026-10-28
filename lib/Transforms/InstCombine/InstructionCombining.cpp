@@ -1841,9 +1841,9 @@ Instruction *InstCombiner::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   return nullptr;
 }
 
-static bool
-isAllocSiteRemovable(Instruction *AI, SmallVectorImpl<WeakVH> &Users,
-                     const TargetLibraryInfo *TLI) {
+static bool isAllocSiteRemovable(Instruction *AI,
+                                 SmallVectorImpl<WeakTrackingVH> &Users,
+                                 const TargetLibraryInfo *TLI) {
   SmallVector<Instruction*, 4> Worklist;
   Worklist.push_back(AI);
 
@@ -1885,7 +1885,7 @@ isAllocSiteRemovable(Instruction *AI, SmallVectorImpl<WeakVH> &Users,
             if (MI->isVolatile() || MI->getRawDest() != PI)
               return false;
           }
-          // fall through
+          LLVM_FALLTHROUGH; // HLSL Change
           case Intrinsic::dbg_declare:
           case Intrinsic::dbg_value:
           case Intrinsic::invariant_start:
@@ -1922,7 +1922,7 @@ Instruction *InstCombiner::visitAllocSite(Instruction &MI) {
   // If we have a malloc call which is only used in any amount of comparisons
   // to null and free calls, delete the calls and replace the comparisons with
   // true or false as appropriate.
-  SmallVector<WeakVH, 64> Users;
+  SmallVector<WeakTrackingVH, 64> Users;
   if (isAllocSiteRemovable(&MI, Users, TLI)) {
     for (unsigned i = 0, e = Users.size(); i != e; ++i) {
       Instruction *I = cast_or_null<Instruction>(&*Users[i]);
@@ -1937,7 +1937,8 @@ Instruction *InstCombiner::visitAllocSite(Instruction &MI) {
       } else if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
         if (II->getIntrinsicID() == Intrinsic::objectsize) {
           ConstantInt *CI = cast<ConstantInt>(II->getArgOperand(1));
-          uint64_t DontKnow = CI->isZero() ? -1ULL : 0;
+          uint64_t DontKnow =
+              CI->isZero() ? std::numeric_limits<uint64_t>::max() : 0;
           ReplaceInstUsesWith(*I, ConstantInt::get(I->getType(), DontKnow));
         }
       }
@@ -2664,6 +2665,10 @@ static bool TryToSinkInstruction(Instruction *I, BasicBlock *DestBlock) {
       isa<TerminatorInst>(I))
     return false;
 
+  if (CallInst *CI = dyn_cast<CallInst>(I))
+    if (CI->hasFnAttr(Attribute::Convergent))
+      return false;
+
   // Do not sink alloca instructions out of the entry block.
   if (isa<AllocaInst>(I) && I->getParent() ==
         &DestBlock->getParent()->getEntryBlock())
@@ -2738,6 +2743,7 @@ bool InstCombiner::run() {
         // only has us as a predecessors (we'd have to split the critical edge
         // otherwise), we can keep going.
         if (UserIsSuccessor && UserParent->getSinglePredecessor()) {
+          if (!m_HLSLNoSinks) // HLSL Change
           // Okay, the CFG is simple enough, try to sink this instruction.
           if (TryToSinkInstruction(I, UserParent)) {
             MadeIRChange = true;
@@ -2979,7 +2985,7 @@ static bool prepareICWorklistFromFunction(Function &F, const DataLayout &DL,
 }
 
 static bool
-combineInstructionsOverFunction(Function &F, InstCombineWorklist &Worklist,
+combineInstructionsOverFunction(Function &F, InstCombineWorklist &Worklist, bool HLSLNoSink/*HLSL Change*/,
                                 AliasAnalysis *AA, AssumptionCache &AC,
                                 TargetLibraryInfo &TLI, DominatorTree &DT,
                                 LoopInfo *LI = nullptr) {
@@ -3009,6 +3015,7 @@ combineInstructionsOverFunction(Function &F, InstCombineWorklist &Worklist,
 
     InstCombiner IC(Worklist, &Builder, MinimizeSize,
                     AA, &AC, &TLI, &DT, DL, LI);
+    IC.m_HLSLNoSinks = HLSLNoSink;
     if (IC.run())
       Changed = true;
 
@@ -3028,7 +3035,7 @@ PreservedAnalyses InstCombinePass::run(Function &F,
   auto *LI = AM->getCachedResult<LoopAnalysis>(F);
 
   // FIXME: The AliasAnalysis is not yet supported in the new pass manager
-  if (!combineInstructionsOverFunction(F, Worklist, nullptr, AC, TLI, DT, LI))
+  if (!combineInstructionsOverFunction(F, Worklist, /*HLSLNoSink*/false, nullptr, AC, TLI, DT, LI))
     // No changes, all analyses are preserved.
     return PreservedAnalyses::all();
 
@@ -3054,8 +3061,25 @@ public:
     initializeInstructionCombiningPassPass(*PassRegistry::getPassRegistry());
   }
 
+  // HLSL Change - begin
+  bool m_HLSLNoSink = false;
+  InstructionCombiningPass(bool HLSLNoSink) : FunctionPass(ID) {
+    initializeInstructionCombiningPassPass(*PassRegistry::getPassRegistry());
+    m_HLSLNoSink = HLSLNoSink;
+  }
+
+  void applyOptions(PassOptions O) override {
+    GetPassOptionBool(O, "NoSink", &m_HLSLNoSink, /*defaultValue*/false);
+  }
+  void dumpConfig(raw_ostream &OS) override {
+    FunctionPass::dumpConfig(OS);
+    OS << ",NoSink=" << m_HLSLNoSink;
+  }
+  // HLSL Change - end
+
   void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnFunction(Function &F) override;
+
 };
 }
 
@@ -3082,7 +3106,7 @@ bool InstructionCombiningPass::runOnFunction(Function &F) {
   auto *LIWP = getAnalysisIfAvailable<LoopInfoWrapperPass>();
   auto *LI = LIWP ? &LIWP->getLoopInfo() : nullptr;
 
-  return combineInstructionsOverFunction(F, Worklist, AA, AC, TLI, DT, LI);
+  return combineInstructionsOverFunction(F, Worklist, m_HLSLNoSink /*HLSL Change*/, AA, AC, TLI, DT, LI);
 }
 
 char InstructionCombiningPass::ID = 0;
@@ -3107,3 +3131,8 @@ void LLVMInitializeInstCombine(LLVMPassRegistryRef R) {
 FunctionPass *llvm::createInstructionCombiningPass() {
   return new InstructionCombiningPass();
 }
+// HLSL Change - begin
+FunctionPass *llvm::createInstructionCombiningPass(bool HLSLNoSink) {
+  return new InstructionCombiningPass(HLSLNoSink);
+}
+// HLSL Change - end

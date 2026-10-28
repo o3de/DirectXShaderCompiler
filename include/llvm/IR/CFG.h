@@ -27,10 +27,18 @@ namespace llvm {
 //===----------------------------------------------------------------------===//
 
 template <class Ptr, class USE_iterator> // Predecessor Iterator
-class PredIterator : public std::iterator<std::forward_iterator_tag,
-                                          Ptr, ptrdiff_t, Ptr*, Ptr*> {
-  typedef std::iterator<std::forward_iterator_tag, Ptr, ptrdiff_t, Ptr*,
-                                                                    Ptr*> super;
+class PredIterator {
+public:
+  // HLSL Change start: The iterator wasn't satisfying the std::forward_iterator
+  // concept, which caused std::vector::insert calls to fail in C++23.
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = Ptr *;
+  using difference_type = std::ptrdiff_t;
+  using pointer = Ptr **;
+  // HLSL Change end
+  using reference = Ptr *;
+
+private:
   typedef PredIterator<Ptr, USE_iterator> Self;
   USE_iterator It;
 
@@ -41,8 +49,6 @@ class PredIterator : public std::iterator<std::forward_iterator_tag,
   }
 
 public:
-  typedef typename super::pointer pointer;
-  typedef typename super::reference reference;
 
   PredIterator() {}
   explicit inline PredIterator(Ptr *bb) : It(bb->user_begin()) {
@@ -112,14 +118,17 @@ inline pred_const_range predecessors(const BasicBlock *BB) {
 ///////////////////////////////////////////////////////////////////////////////
 
 template <class Term_, class BB_>           // Successor Iterator
-class SuccIterator : public std::iterator<std::random_access_iterator_tag, BB_,
-                                          int, BB_ *, BB_ *> {
-  typedef std::iterator<std::random_access_iterator_tag, BB_, int, BB_ *, BB_ *>
-  super;
+class SuccIterator {
 
 public:
-  typedef typename super::pointer pointer;
-  typedef typename super::reference reference;
+  using iterator_category = std::random_access_iterator_tag;
+  // HLSL Change start: The iterator wasn't satisfying the std::forward_iterator
+  // concept, which caused std::vector::insert calls to fail in C++23.
+  using value_type = BB_ *;
+  using difference_type = std::ptrdiff_t;
+  // HLSL Change end
+  using pointer = BB_ *;
+  using reference = BB_ *;
 
 private:
   Term_ Term;
@@ -127,7 +136,9 @@ private:
   typedef SuccIterator<Term_, BB_> Self;
 
   inline bool index_is_valid(int idx) {
-    return idx >= 0 && (unsigned) idx < Term->getNumSuccessors();
+    // HLSL Change Begin
+    return idx >= 0 && (unsigned)idx <= Term->getNumSuccessors();
+    // HLSL Change End
   }
 
   /// \brief Proxy object to allow write access in operator[]

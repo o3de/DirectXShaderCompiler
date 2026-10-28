@@ -277,7 +277,7 @@ namespace hlsl {
   /// In/inout/out/uniform parameter modifier.
   class ParameterModifier {
   public:
-    enum Kind { In, InOut, Out, Uniform, Invalid };
+    enum Kind { In, InOut, Out, Uniform, Ref, Invalid };
 
     ParameterModifier() : m_Kind(Kind::In) { }
     ParameterModifier(enum Kind Kind) : m_Kind(Kind) { }
@@ -295,6 +295,7 @@ namespace hlsl {
 
     unsigned getAsUnsigned() const { return (unsigned)m_Kind; }
 
+    bool isRef() const { return m_Kind == Kind::Ref; }
     bool isIn() const { return m_Kind == Kind::In; }
     bool isOut() const { return m_Kind == Kind::Out; }
     bool isInOut() const { return m_Kind == Kind::InOut; }

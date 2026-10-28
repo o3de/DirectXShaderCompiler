@@ -39,7 +39,7 @@ struct DecorationComparisonInfo {
   static inline SpirvDecoration *getEmptyKey() { return nullptr; }
   static inline SpirvDecoration *getTombstoneKey() { return nullptr; }
   static unsigned getHashValue(const SpirvDecoration *decor) {
-    return llvm::hash_combine(decor->getTarget(),
+    return llvm::hash_combine(decor->getTarget(), decor->getTargetFunc(),
                               static_cast<uint32_t>(decor->getDecoration()));
   }
   static bool isEqual(SpirvDecoration *LHS, SpirvDecoration *RHS) {
@@ -102,14 +102,28 @@ public:
   // Returns false otherwise (e.g. if the capability already existed).
   bool addCapability(SpirvCapability *cap);
 
+  // Returns true if the capability is in the module.
+  bool hasCapability(SpirvCapability &cap);
+
   // Set the memory model of the module.
   void setMemoryModel(SpirvMemoryModel *model);
+
+  // Increases addressing model requirement for the module:
+  // Logical -> Physical32 -> Physical64 -> PhysicalStorageBuffer64.
+  // Requires setMemoryModel() to be called first to set the base memory model.
+  // Returns true if addressing model was changed.
+  bool promoteAddressingModel(spv::AddressingModel addrModel);
 
   // Add an entry point to the module.
   void addEntryPoint(SpirvEntryPoint *);
 
+  // Returns an existing execution mode instruction that is the same as em if it
+  // exists. Return nullptr otherwise.
+  SpirvExecutionModeBase *findExecutionMode(SpirvFunction *entryPoint,
+                                            spv::ExecutionMode em);
+
   // Adds an execution mode to the module.
-  void addExecutionMode(SpirvExecutionMode *);
+  void addExecutionMode(SpirvExecutionModeBase *em);
 
   // Adds an extension to the module. Returns true if the extension was added.
   // Returns false otherwise (e.g. if the extension already existed).
@@ -123,13 +137,20 @@ public:
   SpirvExtInstImport *getExtInstSet(llvm::StringRef name);
 
   // Adds a variable to the module.
-  void addVariable(SpirvVariable *);
+  void addVariable(SpirvVariableLike *);
+
+  // Adds a variable to the module immediately before `pos`.
+  // If `pos` is not found, `var` is added at the end of the variable list.
+  void addVariable(SpirvVariableLike *var, SpirvInstruction *pos);
 
   // Adds a decoration to the module.
   void addDecoration(SpirvDecoration *);
 
   // Adds a constant to the module.
   void addConstant(SpirvConstant *);
+
+  // Adds an Undef to the module.
+  void addUndef(SpirvUndef *);
 
   // Adds given string to the module which will be emitted via OpString.
   void addString(SpirvString *);
@@ -144,14 +165,22 @@ public:
     return debugInstructions;
   }
 
+  // Access the one DebugCompilationUnit per module
+  SpirvDebugCompilationUnit *getDebugCompilationUnit();
+  void setDebugCompilationUnit(SpirvDebugCompilationUnit *unit);
+
   // Adds the given OpModuleProcessed to the module.
   void addModuleProcessed(SpirvModuleProcessed *);
 
-  llvm::ArrayRef<SpirvVariable *> getVariables() const { return variables; }
+  llvm::ArrayRef<SpirvVariableLike *> getVariables() const { return variables; }
 
   llvm::ArrayRef<SpirvEntryPoint *> getEntryPoints() const {
     return entryPoints;
   }
+
+  void setPerVertexInterpMode(bool b) { perVertexInterp = b; }
+
+  bool isPerVertexInterpMode() const { return perVertexInterp; }
 
 private:
   // Use a set for storing capabilities. This will ensure there are no duplicate
@@ -173,7 +202,7 @@ private:
   llvm::SmallVector<SpirvExtInstImport *, 1> extInstSets;
   SpirvMemoryModel *memoryModel;
   llvm::SmallVector<SpirvEntryPoint *, 1> entryPoints;
-  llvm::SmallVector<SpirvExecutionMode *, 4> executionModes;
+  llvm::SmallVector<SpirvExecutionModeBase *, 4> executionModes;
   llvm::SmallVector<SpirvString *, 4> constStrings;
   std::vector<SpirvSource *> sources;
   std::vector<SpirvModuleProcessed *> moduleProcesses;
@@ -187,7 +216,8 @@ private:
       decorations;
 
   std::vector<SpirvConstant *> constants;
-  std::vector<SpirvVariable *> variables;
+  std::vector<SpirvUndef *> undefs;
+  std::vector<SpirvVariableLike *> variables;
   // A vector of functions in the module in the order that they should be
   // emitted. The order starts with the entry-point function followed by a
   // depth-first discovery of functions reachable from the entry-point function.
@@ -196,8 +226,14 @@ private:
   // vector is not in any particular order, and may contain unused functions.
   llvm::SetVector<SpirvFunction *> allFunctions;
 
-  // Keep all OpenCL.DebugInfo.100 instructions.
+  // Keep all rich DebugInfo instructions.
   llvm::SmallVector<SpirvDebugInstruction *, 32> debugInstructions;
+
+  // There is one debugCompilationUnit per module
+  SpirvDebugCompilationUnit *debugCompilationUnit;
+
+  // Whether current module is in pervertex interpolation mode.
+  bool perVertexInterp;
 };
 
 } // end namespace spirv

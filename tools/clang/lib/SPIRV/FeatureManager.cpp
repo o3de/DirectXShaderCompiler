@@ -8,17 +8,96 @@
 
 #include "clang/SPIRV/FeatureManager.h"
 
+#include <array>
 #include <sstream>
 
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
 
 namespace clang {
 namespace spirv {
+namespace {
+
+constexpr std::array<std::pair<const char *, spv_target_env>, 6>
+    kKnownTargetEnv = {{{"vulkan1.0", SPV_ENV_VULKAN_1_0},
+                        {"vulkan1.1", SPV_ENV_VULKAN_1_1},
+                        {"vulkan1.1spirv1.4", SPV_ENV_VULKAN_1_1_SPIRV_1_4},
+                        {"vulkan1.2", SPV_ENV_VULKAN_1_2},
+                        {"vulkan1.3", SPV_ENV_VULKAN_1_3},
+                        {"universal1.5", SPV_ENV_UNIVERSAL_1_5}}};
+
+constexpr std::array<std::pair<spv_target_env, const char *>, 6>
+    kHumanReadableTargetEnv = {
+        {{SPV_ENV_VULKAN_1_0, "Vulkan 1.0"},
+         {SPV_ENV_VULKAN_1_1, "Vulkan 1.1"},
+         {SPV_ENV_VULKAN_1_1_SPIRV_1_4, "Vulkan 1.1 with SPIR-V 1.4"},
+         {SPV_ENV_VULKAN_1_2, "Vulkan 1.2"},
+         {SPV_ENV_VULKAN_1_3, "Vulkan 1.3"},
+         {SPV_ENV_UNIVERSAL_1_5, "SPIR-V 1.5"}}};
+
+constexpr std::array<std::pair<spv_target_env, std::pair<uint32_t, uint32_t>>,
+                     6>
+    kTargetEnvToSpirvVersion = {{{SPV_ENV_VULKAN_1_0, {1, 0}},
+                                 {SPV_ENV_VULKAN_1_1, {1, 3}},
+                                 {SPV_ENV_VULKAN_1_1_SPIRV_1_4, {1, 4}},
+                                 {SPV_ENV_VULKAN_1_2, {1, 5}},
+                                 {SPV_ENV_VULKAN_1_3, {1, 6}},
+                                 {SPV_ENV_UNIVERSAL_1_5, {1, 5}}}};
+
+static_assert(
+    kKnownTargetEnv.size() == kHumanReadableTargetEnv.size(),
+    "kKnownTargetEnv and kHumanReadableTargetEnv should remain in sync.");
+
+} // end namespace
+
+llvm::Optional<spv_target_env>
+FeatureManager::stringToSpvEnvironment(const std::string &target_env) {
+  auto it =
+      std::find_if(kKnownTargetEnv.cbegin(), kKnownTargetEnv.cend(),
+                   [&](const auto &pair) { return pair.first == target_env; });
+
+  return it == kKnownTargetEnv.end()
+             ? llvm::None
+             : llvm::Optional<spv_target_env>(it->second);
+}
+
+clang::VersionTuple FeatureManager::getSpirvVersion(spv_target_env env) {
+  auto it = std::find_if(kTargetEnvToSpirvVersion.cbegin(),
+                         kTargetEnvToSpirvVersion.cend(),
+                         [&](const auto &pair) { return pair.first == env; });
+
+  return it == kTargetEnvToSpirvVersion.end()
+             ? clang::VersionTuple()
+             : clang::VersionTuple(it->second.first, it->second.second);
+}
+
+llvm::Optional<std::string>
+FeatureManager::spvEnvironmentToPrettyName(spv_target_env target_env) {
+  auto it = std::find_if(
+      kHumanReadableTargetEnv.cbegin(), kHumanReadableTargetEnv.cend(),
+      [&](const auto &pair) { return pair.first == target_env; });
+  return it == kHumanReadableTargetEnv.end()
+             ? llvm::None
+             : llvm::Optional<std::string>(it->second);
+}
 
 FeatureManager::FeatureManager(DiagnosticsEngine &de,
                                const SpirvCodeGenOptions &opts)
     : diags(de) {
   allowedExtensions.resize(static_cast<unsigned>(Extension::Unknown) + 1);
+
+  targetEnvStr = opts.targetEnv;
+
+  llvm::Optional<spv_target_env> targetEnvOpt =
+      stringToSpvEnvironment(opts.targetEnv);
+  if (!targetEnvOpt) {
+    emitError("unknown SPIR-V target environment '%0'", {}) << opts.targetEnv;
+    emitNote("allowed options are:\n vulkan1.0\n vulkan1.1\n "
+             "vulkan1.1spirv1.4\n vulkan1.2\n vulkan1.3\n universal1.5",
+             {});
+    return;
+  }
+  targetEnv = *targetEnvOpt;
 
   if (opts.allowedExtensions.empty()) {
     // If no explicit extension control from command line, use the default mode:
@@ -27,23 +106,12 @@ FeatureManager::FeatureManager(DiagnosticsEngine &de,
   } else {
     for (auto ext : opts.allowedExtensions)
       allowExtension(ext);
-  }
 
-  targetEnvStr = opts.targetEnv;
-
-  if (opts.targetEnv == "vulkan1.0")
-    targetEnv = SPV_ENV_VULKAN_1_0;
-  else if (opts.targetEnv == "vulkan1.1")
-    targetEnv = SPV_ENV_VULKAN_1_1;
-  else if (opts.targetEnv == "vulkan1.2")
-    targetEnv = SPV_ENV_VULKAN_1_2;
-  else if(opts.targetEnv == "universal1.5")
-    targetEnv = SPV_ENV_UNIVERSAL_1_5;
-  else {
-    emitError("unknown SPIR-V target environment '%0'", {}) << opts.targetEnv;
-    emitNote("allowed options are:\n vulkan1.0\n vulkan1.1\n vulkan1.2\n "
-             "universal1.5",
-             {});
+    // The option to use the vulkan memory model implies the extension is
+    // available.
+    if (opts.useVulkanMemoryModel) {
+      allowExtension("SPV_KHR_vulkan_memory_model");
+    }
   }
 }
 
@@ -96,9 +164,9 @@ bool FeatureManager::requestTargetEnv(spv_target_env requestedEnv,
                                       llvm::StringRef target,
                                       SourceLocation srcLoc) {
   if (targetEnv < requestedEnv) {
+    auto envName = spvEnvironmentToPrettyName(requestedEnv);
     emitError("%0 is required for %1 but not permitted to use", srcLoc)
-        << (requestedEnv > SPV_ENV_VULKAN_1_1 ? "Vulkan 1.2" : "Vulkan 1.1")
-        << target;
+        << envName.getValueOr("unknown") << target;
     emitNote("please specify your target environment via command line option "
              "-fspv-target-env=",
              {});
@@ -124,14 +192,15 @@ Extension FeatureManager::getExtensionSymbol(llvm::StringRef name) {
             Extension::EXT_fragment_fully_covered)
       .Case("SPV_EXT_fragment_invocation_density",
             Extension::EXT_fragment_invocation_density)
+      .Case("SPV_EXT_fragment_shader_interlock",
+            Extension::EXT_fragment_shader_interlock)
+      .Case("SPV_EXT_mesh_shader", Extension::EXT_mesh_shader)
       .Case("SPV_EXT_shader_stencil_export",
             Extension::EXT_shader_stencil_export)
       .Case("SPV_EXT_shader_viewport_index_layer",
             Extension::EXT_shader_viewport_index_layer)
-      .Case("SPV_AMD_gpu_shader_half_float",
-            Extension::AMD_gpu_shader_half_float)
-      .Case("SPV_AMD_shader_explicit_vertex_parameter",
-            Extension::AMD_shader_explicit_vertex_parameter)
+      .Case("SPV_AMD_shader_early_and_late_fragment_tests",
+            Extension::AMD_shader_early_and_late_fragment_tests)
       .Case("SPV_GOOGLE_hlsl_functionality1",
             Extension::GOOGLE_hlsl_functionality1)
       .Case("SPV_GOOGLE_user_type", Extension::GOOGLE_user_type)
@@ -142,6 +211,25 @@ Extension FeatureManager::getExtensionSymbol(llvm::StringRef name) {
       .Case("SPV_KHR_ray_query", Extension::KHR_ray_query)
       .Case("SPV_KHR_fragment_shading_rate",
             Extension::KHR_fragment_shading_rate)
+      .Case("SPV_EXT_shader_image_int64", Extension::EXT_shader_image_int64)
+      .Case("SPV_KHR_physical_storage_buffer",
+            Extension::KHR_physical_storage_buffer)
+      .Case("SPV_AMDX_shader_enqueue", Extension::AMD_shader_enqueue)
+      .Case("SPV_KHR_vulkan_memory_model", Extension::KHR_vulkan_memory_model)
+      .Case("SPV_KHR_compute_shader_derivatives",
+            Extension::KHR_compute_shader_derivatives)
+      .Case("SPV_NV_compute_shader_derivatives",
+            Extension::NV_compute_shader_derivatives)
+      .Case("SPV_KHR_fragment_shader_barycentric",
+            Extension::KHR_fragment_shader_barycentric)
+      .Case("SPV_KHR_maximal_reconvergence",
+            Extension::KHR_maximal_reconvergence)
+      .Case("SPV_KHR_float_controls", Extension::KHR_float_controls)
+      .Case("SPV_NV_shader_subgroup_partitioned",
+            Extension::NV_shader_subgroup_partitioned)
+      .Case("SPV_KHR_quad_control", Extension::KHR_quad_control)
+      .Case("SPV_EXT_descriptor_heap", Extension::EXT_descriptor_heap)
+      .Case("SPV_KHR_untyped_pointers", Extension::KHR_untyped_pointers)
       .Default(Extension::Unknown);
 }
 
@@ -173,14 +261,16 @@ const char *FeatureManager::getExtensionName(Extension symbol) {
     return "SPV_EXT_fragment_fully_covered";
   case Extension::EXT_fragment_invocation_density:
     return "SPV_EXT_fragment_invocation_density";
+  case Extension::EXT_fragment_shader_interlock:
+    return "SPV_EXT_fragment_shader_interlock";
+  case Extension::EXT_mesh_shader:
+    return "SPV_EXT_mesh_shader";
   case Extension::EXT_shader_stencil_export:
     return "SPV_EXT_shader_stencil_export";
   case Extension::EXT_shader_viewport_index_layer:
     return "SPV_EXT_shader_viewport_index_layer";
-  case Extension::AMD_gpu_shader_half_float:
-    return "SPV_AMD_gpu_shader_half_float";
-  case Extension::AMD_shader_explicit_vertex_parameter:
-    return "SPV_AMD_shader_explicit_vertex_parameter";
+  case Extension::AMD_shader_early_and_late_fragment_tests:
+    return "SPV_AMD_shader_early_and_late_fragment_tests";
   case Extension::GOOGLE_hlsl_functionality1:
     return "SPV_GOOGLE_hlsl_functionality1";
   case Extension::GOOGLE_user_type:
@@ -193,13 +283,39 @@ const char *FeatureManager::getExtensionName(Extension symbol) {
     return "SPV_KHR_ray_query";
   case Extension::KHR_fragment_shading_rate:
     return "SPV_KHR_fragment_shading_rate";
+  case Extension::EXT_shader_image_int64:
+    return "SPV_EXT_shader_image_int64";
+  case Extension::KHR_physical_storage_buffer:
+    return "SPV_KHR_physical_storage_buffer";
+  case Extension::AMD_shader_enqueue:
+    return "SPV_AMDX_shader_enqueue";
+  case Extension::KHR_vulkan_memory_model:
+    return "SPV_KHR_vulkan_memory_model";
+  case Extension::KHR_compute_shader_derivatives:
+    return "SPV_KHR_compute_shader_derivatives";
+  case Extension::NV_compute_shader_derivatives:
+    return "SPV_NV_compute_shader_derivatives";
+  case Extension::KHR_fragment_shader_barycentric:
+    return "SPV_KHR_fragment_shader_barycentric";
+  case Extension::KHR_maximal_reconvergence:
+    return "SPV_KHR_maximal_reconvergence";
+  case Extension::KHR_float_controls:
+    return "SPV_KHR_float_controls";
+  case Extension::NV_shader_subgroup_partitioned:
+    return "SPV_NV_shader_subgroup_partitioned";
+  case Extension::KHR_quad_control:
+    return "SPV_KHR_quad_control";
+  case Extension::EXT_descriptor_heap:
+    return "SPV_EXT_descriptor_heap";
+  case Extension::KHR_untyped_pointers:
+    return "SPV_KHR_untyped_pointers";
   default:
     break;
   }
   return "<unknown extension>";
 }
 
-bool FeatureManager::isKHRExtension(llvm::StringRef name) {
+bool FeatureManager::isKHRExtension(llvm::StringRef name) const {
   return name.startswith_lower("spv_khr_");
 }
 
@@ -222,9 +338,20 @@ std::string FeatureManager::getKnownExtensions(const char *delimiter,
   return oss.str();
 }
 
-bool FeatureManager::isExtensionRequiredForTargetEnv(Extension ext) {
+bool FeatureManager::isExtensionRequiredForTargetEnv(Extension ext) const {
   bool required = true;
-  if (targetEnv >= SPV_ENV_VULKAN_1_1) {
+  if (targetEnv >= SPV_ENV_VULKAN_1_3) {
+    // The following extensions are incorporated into Vulkan 1.3 or above, and
+    // are therefore not required to be emitted for that target environment.
+    switch (ext) {
+    case Extension::KHR_non_semantic_info:
+      required = false;
+      break;
+    default:
+      break;
+    }
+  }
+  if (required && targetEnv >= SPV_ENV_VULKAN_1_1) {
     // The following extensions are incorporated into Vulkan 1.1 or above, and
     // are therefore not required to be emitted for that target environment.
     // TODO: Also add the following extensions  if we start to support them.
@@ -239,14 +366,14 @@ bool FeatureManager::isExtensionRequiredForTargetEnv(Extension ext) {
       break;
     default:
       // Only 1.1 or above extensions can be suppressed.
-      required = true;
+      break;
     }
   }
 
   return required;
 }
 
-bool FeatureManager::isExtensionEnabled(Extension ext) {
+bool FeatureManager::isExtensionEnabled(Extension ext) const {
   bool allowed = false;
   if (ext != Extension::Unknown &&
       allowedExtensions.test(static_cast<unsigned>(ext)))
@@ -260,26 +387,60 @@ bool FeatureManager::enabledByDefault(Extension ext) {
     // KHR extension by default
   case Extension::NV_ray_tracing:
     return false;
+    // KHR_compute_shader_derivatives and NV_compute_shader_derivatives are
+    // mutually exclusive so enable only KHR extension by default
+  case Extension::NV_compute_shader_derivatives:
+    return false;
     // Enabling EXT_demote_to_helper_invocation changes the code generation
     // behavior for the 'discard' statement. Therefore we will only enable it if
     // the user explicitly asks for it.
   case Extension::EXT_demote_to_helper_invocation:
     return false;
+  case Extension::EXT_mesh_shader:
+    // Enabling EXT_mesh_shader only when the target environment is SPIR-V 1.4
+    // or above
+    return isTargetEnvSpirv1p4OrAbove();
   default:
     return true;
   }
 }
 
-bool FeatureManager::isTargetEnvVulkan1p1OrAbove() {
-  std::string vulkanStr = "vulkan";
-  return targetEnvStr.substr(0, vulkanStr.size()) == vulkanStr &&
-         targetEnvStr.compare("vulkan1.1") >= 0;
+bool FeatureManager::isTargetEnvVulkan1p1OrAbove() const {
+  return targetEnv >= SPV_ENV_VULKAN_1_1;
 }
 
-bool FeatureManager::isTargetEnvVulkan1p2OrAbove() {
-  std::string vulkanStr = "vulkan";
-  return targetEnvStr.substr(0, vulkanStr.size()) == vulkanStr &&
-         targetEnvStr.compare("vulkan1.2") >= 0;
+bool FeatureManager::isTargetEnvSpirv1p4OrAbove() const {
+  return targetEnv >= SPV_ENV_UNIVERSAL_1_4;
+}
+
+bool FeatureManager::isTargetEnvVulkan1p1Spirv1p4OrAbove() const {
+  return targetEnv >= SPV_ENV_VULKAN_1_1_SPIRV_1_4;
+}
+
+bool FeatureManager::isTargetEnvVulkan1p2OrAbove() const {
+  return targetEnv >= SPV_ENV_VULKAN_1_2;
+}
+
+bool FeatureManager::isTargetEnvVulkan1p3OrAbove() const {
+  return targetEnv >= SPV_ENV_VULKAN_1_3;
+}
+
+bool FeatureManager::isTargetEnvVulkan() const {
+  // This assert ensure that this list will be updated, if necessary, when
+  // a new target environment is added.
+  static_assert(SPV_ENV_VULKAN_1_4 + 1 == SPV_ENV_MAX);
+
+  switch (targetEnv) {
+  case SPV_ENV_VULKAN_1_0:
+  case SPV_ENV_VULKAN_1_1:
+  case SPV_ENV_VULKAN_1_2:
+  case SPV_ENV_VULKAN_1_1_SPIRV_1_4:
+  case SPV_ENV_VULKAN_1_3:
+  case SPV_ENV_VULKAN_1_4:
+    return true;
+  default:
+    return false;
+  }
 }
 
 } // end namespace spirv

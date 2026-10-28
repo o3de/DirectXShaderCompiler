@@ -30,6 +30,13 @@ enum class StructInterfaceType : uint32_t {
   UniformBuffer = 2,
 };
 
+struct BitfieldInfo {
+  // Offset of the bitfield, in bits, from the basetype start.
+  uint32_t offsetInBits;
+  // Size of the bitfield, in bits.
+  uint32_t sizeInBits;
+};
+
 class SpirvType {
 public:
   enum Kind {
@@ -44,11 +51,16 @@ public:
     TK_SampledImage,
     TK_Array,
     TK_RuntimeArray,
+    TK_NodePayloadArrayAMD,
     TK_Struct,
     TK_Pointer,
+    TK_ForwardPointer,
     TK_Function,
     TK_AccelerationStructureNV,
     TK_RayQueryKHR,
+    TK_SpirvIntrinsicType,
+    TK_BufferEXT,
+    TK_UntypedPointerKHR,
     // Order matters: all the following are hybrid types
     TK_HybridStruct,
     TK_HybridPointer,
@@ -282,6 +294,26 @@ private:
   llvm::Optional<uint32_t> stride;
 };
 
+class NodePayloadArrayType : public SpirvType {
+public:
+  NodePayloadArrayType(const SpirvType *elemType, const ParmVarDecl *decl)
+      : SpirvType(TK_NodePayloadArrayAMD), elementType(elemType),
+        nodeDecl(decl) {}
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_NodePayloadArrayAMD;
+  }
+
+  bool operator==(const NodePayloadArrayType &that) const;
+
+  const SpirvType *getElementType() const { return elementType; }
+  const ParmVarDecl *getNodeDecl() const { return nodeDecl; }
+
+private:
+  const SpirvType *elementType;
+  const ParmVarDecl *nodeDecl;
+};
+
 // The StructType is the lowered type that best represents what a structure type
 // is in SPIR-V. Contains all necessary information for properly emitting a
 // SPIR-V structure type.
@@ -289,14 +321,17 @@ class StructType : public SpirvType {
 public:
   struct FieldInfo {
   public:
-    FieldInfo(const SpirvType *type_, llvm::StringRef name_ = "",
+    FieldInfo(const SpirvType *type_, uint32_t fieldIndex_,
+              llvm::StringRef name_ = "",
               llvm::Optional<uint32_t> offset_ = llvm::None,
               llvm::Optional<uint32_t> matrixStride_ = llvm::None,
               llvm::Optional<bool> isRowMajor_ = llvm::None,
-              bool relaxedPrecision = false, bool precise = false)
-        : type(type_), name(name_), offset(offset_), sizeInBytes(llvm::None),
-          matrixStride(matrixStride_), isRowMajor(isRowMajor_),
-          isRelaxedPrecision(relaxedPrecision), isPrecise(precise) {
+              bool relaxedPrecision = false, bool precise = false,
+              llvm::Optional<AttrVec> attributes = llvm::None)
+        : type(type_), fieldIndex(fieldIndex_), name(name_), offset(offset_),
+          sizeInBytes(llvm::None), matrixStride(matrixStride_),
+          isRowMajor(isRowMajor_), isRelaxedPrecision(relaxedPrecision),
+          isPrecise(precise), bitfield(llvm::None), attributes(attributes) {
       // A StructType may not contain any hybrid types.
       assert(!isa<HybridType>(type_));
     }
@@ -305,6 +340,10 @@ public:
 
     // The field's type.
     const SpirvType *type;
+    // The index of this field in the composite construct.
+    // When the struct contains bitfields, StructType index and construct index
+    // can diverge as we merge bitfields together.
+    uint32_t fieldIndex;
     // The field's name.
     std::string name;
     // The integer offset in bytes for this field.
@@ -319,6 +358,10 @@ public:
     bool isRelaxedPrecision;
     // Whether this field is marked as 'precise'.
     bool isPrecise;
+    // Information about the bitfield (if applicable).
+    llvm::Optional<BitfieldInfo> bitfield;
+    // Other attributes applied to the field.
+    llvm::Optional<AttrVec> attributes;
   };
 
   StructType(
@@ -348,6 +391,45 @@ private:
   StructInterfaceType interfaceType;
 };
 
+class BufferEXTType : public SpirvType {
+public:
+  BufferEXTType(spv::StorageClass sc)
+      : SpirvType(TK_BufferEXT, "type.buffer.ext"), storageClass(sc) {}
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_BufferEXT;
+  }
+
+  bool operator==(const BufferEXTType &that) const {
+    return storageClass == that.storageClass;
+  }
+
+  spv::StorageClass getStorageClass() const { return storageClass; }
+
+private:
+  spv::StorageClass storageClass;
+};
+
+class UntypedPointerKHRType : public SpirvType {
+public:
+  UntypedPointerKHRType(spv::StorageClass sc)
+      : SpirvType(TK_UntypedPointerKHR, "type.untyped.pointer"),
+        storageClass(sc) {}
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_UntypedPointerKHR;
+  }
+
+  bool operator==(const UntypedPointerKHRType &that) const {
+    return storageClass == that.storageClass;
+  }
+
+  spv::StorageClass getStorageClass() const { return storageClass; }
+
+private:
+  spv::StorageClass storageClass;
+};
+
 /// Represents a SPIR-V pointer type.
 class SpirvPointerType : public SpirvType {
 public:
@@ -366,6 +448,26 @@ public:
 private:
   const SpirvType *pointeeType;
   spv::StorageClass storageClass;
+};
+
+/// Represents a SPIR-V forwarding pointer type.
+class ForwardPointerType : public SpirvType {
+public:
+  ForwardPointerType(QualType pointee)
+      : SpirvType(TK_ForwardPointer), pointeeType(pointee) {}
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_ForwardPointer;
+  }
+
+  const QualType getPointeeType() const { return pointeeType; }
+
+  bool operator==(const ForwardPointerType &that) const {
+    return pointeeType == that.pointeeType;
+  }
+
+private:
+  const QualType pointeeType;
 };
 
 /// Represents a SPIR-V function type. None of the parameters nor the return
@@ -404,12 +506,49 @@ public:
 
 class RayQueryTypeKHR : public SpirvType {
 public:
-  RayQueryTypeKHR()
-      : SpirvType(TK_RayQueryKHR, "rayQueryKHR") {}
+  RayQueryTypeKHR() : SpirvType(TK_RayQueryKHR, "rayQueryKHR") {}
 
   static bool classof(const SpirvType *t) {
     return t->getKind() == TK_RayQueryKHR;
   }
+};
+
+class SpirvInstruction;
+struct SpvIntrinsicTypeOperand {
+  SpvIntrinsicTypeOperand(const SpirvType *type_operand)
+      : operand_as_type(type_operand), isTypeOperand(true) {}
+  SpvIntrinsicTypeOperand(SpirvInstruction *inst_operand)
+      : operand_as_inst(inst_operand), isTypeOperand(false) {}
+  bool operator==(const SpvIntrinsicTypeOperand &that) const;
+  union {
+    const SpirvType *operand_as_type;
+    SpirvInstruction *operand_as_inst;
+  };
+  const bool isTypeOperand;
+};
+
+class SpirvIntrinsicType : public SpirvType {
+public:
+  SpirvIntrinsicType(unsigned typeOp,
+                     llvm::ArrayRef<SpvIntrinsicTypeOperand> inOps);
+
+  static bool classof(const SpirvType *t) {
+    return t->getKind() == TK_SpirvIntrinsicType;
+  }
+  unsigned getOpCode() const { return typeOpCode; }
+  llvm::ArrayRef<SpvIntrinsicTypeOperand> getOperands() const {
+    return operands;
+  }
+
+  bool operator==(const SpirvIntrinsicType &that) const {
+    return typeOpCode == that.typeOpCode &&
+           operands.size() == that.operands.size() &&
+           std::equal(operands.begin(), operands.end(), that.operands.begin());
+  }
+
+private:
+  unsigned typeOpCode;
+  llvm::SmallVector<SpvIntrinsicTypeOperand, 3> operands;
 };
 
 class HybridType : public SpirvType {
@@ -435,9 +574,12 @@ public:
               clang::VKOffsetAttr *offset = nullptr,
               hlsl::ConstantPacking *packOffset = nullptr,
               const hlsl::RegisterAssignment *regC = nullptr,
-              bool precise = false)
+              bool precise = false,
+              llvm::Optional<BitfieldInfo> bitfield = llvm::None,
+              llvm::Optional<AttrVec> attributes = llvm::None)
         : astType(astType_), name(name_), vkOffsetAttr(offset),
-          packOffsetAttr(packOffset), registerC(regC), isPrecise(precise) {}
+          packOffsetAttr(packOffset), registerC(regC), isPrecise(precise),
+          bitfield(std::move(bitfield)), attributes(std::move(attributes)) {}
 
     // The field's type.
     QualType astType;
@@ -451,6 +593,11 @@ public:
     const hlsl::RegisterAssignment *registerC;
     // Whether this field is marked as 'precise'.
     bool isPrecise;
+    // Whether this field is a bitfield or not. If set to false, bitfield width
+    // value is undefined.
+    llvm::Optional<BitfieldInfo> bitfield;
+    // Other attributes applied to the field.
+    llvm::Optional<AttrVec> attributes;
   };
 
   HybridStructType(
@@ -542,6 +689,8 @@ bool SpirvType::isOrContainsType(const SpirvType *type) {
     return isOrContainsType<T, Bitwidth>(pointerType->getPointeeType());
   if (const auto *raType = dyn_cast<RuntimeArrayType>(type))
     return isOrContainsType<T, Bitwidth>(raType->getElementType());
+  if (const auto *npaType = dyn_cast<NodePayloadArrayType>(type))
+    return isOrContainsType<T, Bitwidth>(npaType->getElementType());
   if (const auto *imgType = dyn_cast<ImageType>(type))
     return isOrContainsType<T, Bitwidth>(imgType->getSampledType());
   if (const auto *sampledImageType = dyn_cast<SampledImageType>(type))

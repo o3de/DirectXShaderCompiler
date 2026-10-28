@@ -56,7 +56,7 @@ void MemoryBuffer::init(const char *BufStart, const char *BufEnd,
 
 /// CopyStringRef - Copies contents of a StringRef into a block of memory and
 /// null-terminates it.
-static void CopyStringRef(_Out_cap_x_(Data.size()+1) char *Memory, StringRef Data) {
+static void CopyStringRef(char *Memory, StringRef Data) {
   if (!Data.empty())
     memcpy(Memory, Data.data(), Data.size());
   Memory[Data.size()] = 0; // Null terminate string.
@@ -85,6 +85,11 @@ public:
   MemoryBufferMem(StringRef InputData, bool RequiresNullTerminator) {
     init(InputData.begin(), InputData.end(), RequiresNullTerminator);
   }
+
+  // Disable sized deallocation for MemoryByfferMem, because it has
+  // tail-allocated data.
+  // (See llvm commit 21c303e9eadfbd2d685665176159f5f4738169b1)
+  void operator delete(void *p) { ::operator delete(p); }
 
   const char *getBufferIdentifier() const override {
      // The name is stored after the class itself.
@@ -121,8 +126,9 @@ MemoryBuffer::getMemBufferCopy(StringRef InputData, const Twine &BufferName) {
       getNewUninitMemBuffer(InputData.size(), BufferName);
   if (!Buf)
     return nullptr;
-  memcpy(const_cast<char*>(Buf->getBufferStart()), InputData.data(),
-         InputData.size());
+  if (InputData.size())
+    memcpy(const_cast<char *>(Buf->getBufferStart()), InputData.data(),
+           InputData.size());
   return Buf;
 }
 
@@ -211,6 +217,11 @@ public:
       init(Start, Start + Len, RequiresNullTerminator);
     }
   }
+
+  // Disable sized deallocation for MemoryByfferMem, because it has
+  // tail-allocated data.
+  // (See llvm commit 21c303e9eadfbd2d685665176159f5f4738169b1)
+  void operator delete(void *p) { ::operator delete(p); }
 
   const char *getBufferIdentifier() const override {
     // The name is stored after the class itself.
@@ -362,8 +373,10 @@ getOpenFileImpl(int FD, const Twine &Filename, uint64_t FileSize,
     std::unique_ptr<MemoryBuffer> Result(
         new (NamedBufferAlloc(Filename))
         MemoryBufferMMapFile(RequiresNullTerminator, FD, MapSize, Offset, EC));
-    if (!EC)
-      return std::move(Result);
+    if (!EC) {
+      return ErrorOr(
+          std::move(Result)); // HLSL Change - Fix redundant move warning.
+    }
   }
 
   std::unique_ptr<MemoryBuffer> Buf =
@@ -403,7 +416,7 @@ getOpenFileImpl(int FD, const Twine &Filename, uint64_t FileSize,
     BufPtr += NumRead;
   }
 
-  return std::move(Buf);
+  return ErrorOr(std::move(Buf)); // HLSL Change - Fix redundant move warning.
 }
 
 ErrorOr<std::unique_ptr<MemoryBuffer>>

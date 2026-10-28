@@ -26,6 +26,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Intrinsics.h"
 #include "CGHLSLRuntime.h"    // HLSL Change
+#include "CGHLSLMSHelper.h"    // HLSL Change
 using namespace clang;
 using namespace CodeGen;
 
@@ -334,7 +335,7 @@ CodeGenFunction::EmitCompoundStmtWithoutScope(const CompoundStmt &S,
   return RetAlloca;
 }
 
-void CodeGenFunction::SimplifyForwardingBlocks(llvm::BasicBlock *BB) {
+void CodeGenFunction::SimplifyForwardingBlocks(llvm::BasicBlock *BB, CGHLSLMSHelper::Scope *LoopScope) {
   llvm::BranchInst *BI = dyn_cast<llvm::BranchInst>(BB->getTerminator());
 
   // If there is a cleanup stack, then we it isn't worth trying to
@@ -351,6 +352,14 @@ void CodeGenFunction::SimplifyForwardingBlocks(llvm::BasicBlock *BB) {
   if (BI != BB->begin())
     return;
 
+  // HLSL CHANGE
+  // Need to update the loop scope block when we forward the
+  // branch to the new bb. Otherwise we keep a pointer to
+  // the old deleted block.
+  assert(!LoopScope || LoopScope->loopContinueBB == BB);
+  if (LoopScope)
+    LoopScope->loopContinueBB = BI->getSuccessor(0);
+  // HLSL CHANGE
   BB->replaceAllUsesWith(BI->getSuccessor(0));
   BI->eraseFromParent();
   BB->eraseFromParent();
@@ -516,6 +525,10 @@ void CodeGenFunction::EmitGotoStmt(const GotoStmt &S) {
 
 // HLSL Change Begins.
 void CodeGenFunction::EmitDiscardStmt(const DiscardStmt &S) {
+  // Skip unreachable discard.
+  if (!HaveInsertPoint())
+    return;
+
   CGM.getHLSLRuntime().EmitHLSLDiscard(*this);
 }
 // HLSL Change Ends.
@@ -699,7 +712,7 @@ void CodeGenFunction::EmitCondBrHints(llvm::LLVMContext &Context,
       }
       // Vectorization/interleaving is disabled, set width/count to 1.
       ValueInt = 1;
-      // Fallthrough.
+      LLVM_FALLTHROUGH; // HLSL Change
     case LoopHintAttr::VectorizeWidth:
     case LoopHintAttr::InterleaveCount:
     case LoopHintAttr::UnrollCount:
@@ -821,7 +834,7 @@ void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
   LoopStack.pop();
 
   // HLSL Change Begin.
-  CGM.getHLSLRuntime().MarkScopeEnd(*this);
+  CGHLSLMSHelper::Scope *LoopScope = CGM.getHLSLRuntime().MarkScopeEnd(*this);
   // HLSL Change End.
 
   // Emit the exit block.
@@ -830,7 +843,7 @@ void CodeGenFunction::EmitWhileStmt(const WhileStmt &S,
   // The LoopHeader typically is just a branch if we skipped emitting
   // a branch, try to erase it.
   if (!EmitBoolCondBranch)
-    SimplifyForwardingBlocks(LoopHeader.getBlock());
+    SimplifyForwardingBlocks(LoopHeader.getBlock(), LoopScope);
 }
 
 void CodeGenFunction::EmitDoStmt(const DoStmt &S,
@@ -891,7 +904,7 @@ void CodeGenFunction::EmitDoStmt(const DoStmt &S,
   LoopStack.pop();
 
   // HLSL Change Begin.
-  CGM.getHLSLRuntime().MarkScopeEnd(*this);
+  CGHLSLMSHelper::Scope *LoopScope = CGM.getHLSLRuntime().MarkScopeEnd(*this);
   // HLSL Change End.
 
   // Emit the exit block.
@@ -900,7 +913,7 @@ void CodeGenFunction::EmitDoStmt(const DoStmt &S,
   // The DoCond block typically is just a branch if we skipped
   // emitting a branch, try to erase it.
   if (!EmitBoolCondBranch)
-    SimplifyForwardingBlocks(LoopCond.getBlock());
+    SimplifyForwardingBlocks(LoopCond.getBlock(), LoopScope);
 }
 
 void CodeGenFunction::EmitForStmt(const ForStmt &S,
@@ -1160,6 +1173,14 @@ void CodeGenFunction::EmitReturnStmt(const ReturnStmt &S) {
                                 /*isInit*/ true);
       break;
     case TEK_Aggregate: {
+      CodeGenFunction::HLSLOutParamScope OutParamScope(*this);
+      // HLSL Change Begins.
+      auto MapTemp = [&](const VarDecl *LocalVD, llvm::Value *TmpArg) {
+        OutParamScope.addTemp(LocalVD, TmpArg);
+      };
+      RV = CGM.getHLSLRuntime().CheckReturnStmtCoherenceMismatch(
+          *this, RV, S, FnRetTy, MapTemp);
+      // HLSL Change Ends.
       CharUnits Alignment = getContext().getTypeAlignInChars(RV->getType());
       EmitAggExpr(RV, AggValueSlot::forAddr(ReturnValue, Alignment,
                                             Qualifiers(),

@@ -1360,7 +1360,7 @@ static void emitSignedInt64(SmallVectorImpl<uint64_t> &Vals, uint64_t V) {
   if ((int64_t)V >= 0)
     Vals.push_back(V << 1);
   else
-    Vals.push_back((-V << 1) | 1);
+    Vals.push_back(((~V + 1) << 1) | 1);
 }
 
 static void WriteConstants(unsigned FirstVal, unsigned LastVal,
@@ -1437,7 +1437,7 @@ static void WriteConstants(unsigned FirstVal, unsigned LastVal,
       continue;
     }
     const Constant *C = cast<Constant>(V);
-    unsigned Code = -1U;
+    unsigned Code = ~0U;
     unsigned AbbrevToUse = 0;
     if (C->isNullValue()) {
       Code = bitc::CST_CODE_NULL;
@@ -2494,7 +2494,8 @@ static void EmitDarwinBCHeaderAndTrailer(SmallVectorImpl<char> &Buffer,
 /// WriteBitcodeToFile - Write the specified module to the specified output
 /// stream.
 void llvm::WriteBitcodeToFile(const Module *M, raw_ostream &Out,
-                              bool ShouldPreserveUseListOrder) {
+                              bool ShouldPreserveUseListOrder,
+                              BitstreamWriter::ConstantHandlerFn WriteCallback) { // O3DE change
   SmallVector<char, 0> Buffer;
   Buffer.reserve(256*1024);
 
@@ -2507,6 +2508,9 @@ void llvm::WriteBitcodeToFile(const Module *M, raw_ostream &Out,
   // Emit the module into the buffer.
   {
     BitstreamWriter Stream(Buffer);
+    // O3DE change start
+    Stream.WriteConstantCallback = WriteCallback;
+    // O3DE change end
 
     // Emit the file header.
     Stream.Emit((unsigned)'B', 8);

@@ -19,16 +19,14 @@
 #include "llvm/Support/raw_os_ostream.h"
 
 #include "dxc/DXIL/DxilConstants.h"
-#include "dxc/HLSL/DxilGenerationPass.h"
-#include "dxc/HLSL/HLOperations.h"
-#include "dxc/HLSL/HLModule.h"
-#include "dxc/HlslIntrinsicOp.h"
 #include "dxc/HLSL/DxilConvergentName.h"
+#include "dxc/HLSL/DxilGenerationPass.h"
+#include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/HLOperations.h"
+#include "dxc/HlslIntrinsicOp.h"
 
 using namespace llvm;
 using namespace hlsl;
-
-
 
 ///////////////////////////////////////////////////////////////////////////////
 // DxilConvergent.
@@ -40,17 +38,18 @@ class DxilConvergentMark : public ModulePass {
 public:
   static char ID; // Pass identification, replacement for typeid
   explicit DxilConvergentMark() : ModulePass(ID) {}
+  bool SupportsVectors = false;
 
-  const char *getPassName() const override {
-    return "DxilConvergentMark";
-  }
+  StringRef getPassName() const override { return "DxilConvergentMark"; }
 
   bool runOnModule(Module &M) override {
-    if (M.HasHLModule()) {
-      const ShaderModel *SM = M.GetHLModule().GetShaderModel();
-      if (!SM->IsPS() && !SM->IsLib() && (!SM->IsSM66Plus() || (!SM->IsCS() && !SM->IsMS() && !SM->IsAS())))
-        return false;
-    }
+    const ShaderModel *SM = M.GetOrCreateHLModule().GetShaderModel();
+    // Can skip if in a shader and version that doesn't support derivatives.
+    if (!SM->IsPS() && !SM->IsLib() &&
+        (!SM->IsSM66Plus() || (!SM->IsCS() && !SM->IsMS() && !SM->IsAS())))
+      return false;
+    SupportsVectors = SM->IsSM69Plus();
+
     bool bUpdated = false;
 
     for (Function &F : M.functions()) {
@@ -82,17 +81,24 @@ private:
   bool PropagateConvergent(Value *V, Function *F,
                            DominatorTreeBase<BasicBlock> &PostDom);
   bool PropagateConvergentImpl(Value *V, Function *F,
-                           DominatorTreeBase<BasicBlock> &PostDom, std::set<Value*>& visited);
+                               DominatorTreeBase<BasicBlock> &PostDom,
+                               std::set<Value *> &visited);
 };
 
 char DxilConvergentMark::ID = 0;
 
 void DxilConvergentMark::MarkConvergent(Value *V, IRBuilder<> &Builder,
                                         Module &M) {
-  Type *Ty = V->getType()->getScalarType();
+  Type *Ty = V->getType();
+  bool NeedVectorExpansion = false;
+  VectorType *VTy = dyn_cast<VectorType>(Ty);
+  if (VTy && (!SupportsVectors || VTy->getNumElements() == 1)) {
+    Ty = Ty->getScalarType();
+    NeedVectorExpansion = true;
+  }
+
   // Only work on vector/scalar types.
-  if (Ty->isAggregateType() ||
-      Ty->isPointerTy())
+  if (Ty->isAggregateType() || Ty->isPointerTy())
     return;
   FunctionType *FT = FunctionType::get(Ty, Ty, false);
   std::string str = kConvergentFunctionPrefix;
@@ -101,7 +107,8 @@ void DxilConvergentMark::MarkConvergent(Value *V, IRBuilder<> &Builder,
   os.flush();
   Function *ConvF = cast<Function>(M.getOrInsertFunction(str, FT));
   ConvF->addFnAttr(Attribute::AttrKind::Convergent);
-  if (VectorType *VT = dyn_cast<VectorType>(V->getType())) {
+  if (NeedVectorExpansion) {
+    VectorType *VT = cast<VectorType>(V->getType());
     Value *ConvV = UndefValue::get(V->getType());
     std::vector<ExtractElementInst *> extractList(VT->getNumElements());
     for (unsigned i = 0; i < VT->getNumElements(); i++) {
@@ -128,8 +135,9 @@ bool DxilConvergentMark::PropagateConvergent(
   return PropagateConvergentImpl(V, F, PostDom, visited);
 }
 
-bool DxilConvergentMark::PropagateConvergentImpl(Value *V, Function *F,
-  DominatorTreeBase<BasicBlock> &PostDom, std::set<Value*>& visited) {
+bool DxilConvergentMark::PropagateConvergentImpl(
+    Value *V, Function *F, DominatorTreeBase<BasicBlock> &PostDom,
+    std::set<Value *> &visited) {
   // Don't go through already visted nodes
   if (visited.find(V) != visited.end())
     return false;
@@ -184,7 +192,8 @@ Value *DxilConvergentMark::FindConvergentOperand(Instruction *I) {
         return CI->getArgOperand(HLOperandIndex::kSampleCoordArgIndex);
       case IntrinsicOp::MOP_WriteSamplerFeedback:
       case IntrinsicOp::MOP_WriteSamplerFeedbackBias:
-        return CI->getArgOperand(HLOperandIndex::kWriteSamplerFeedbackCoordArgIndex);
+        return CI->getArgOperand(
+            HLOperandIndex::kWriteSamplerFeedbackCoordArgIndex);
       default:
         // No other ops have convergent operands.
         break;
@@ -210,9 +219,7 @@ public:
   static char ID; // Pass identification, replacement for typeid
   explicit DxilConvergentClear() : ModulePass(ID) {}
 
-  const char *getPassName() const override {
-    return "DxilConvergentClear";
-  }
+  StringRef getPassName() const override { return "DxilConvergentClear"; }
 
   bool runOnModule(Module &M) override {
     std::vector<Function *> convergentList;

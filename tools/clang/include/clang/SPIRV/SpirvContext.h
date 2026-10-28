@@ -10,9 +10,12 @@
 #define LLVM_CLANG_SPIRV_SPIRVCONTEXT_H
 
 #include <array>
+#include <limits>
+#include <optional>
 
 #include "dxc/DXIL/DxilShaderModel.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/TypeOrdering.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/SPIRV/SpirvInstruction.h"
 #include "clang/SPIRV/SpirvType.h"
@@ -95,6 +98,21 @@ struct RuntimeArrayTypeMapInfo {
   }
 };
 
+// Provides DenseMapInfo for NodePayloadArrayType so we can create a DenseSet of
+// node payload array types.
+struct NodePayloadArrayTypeMapInfo {
+  static inline NodePayloadArrayType *getEmptyKey() { return nullptr; }
+  static inline NodePayloadArrayType *getTombstoneKey() { return nullptr; }
+  static unsigned getHashValue(const NodePayloadArrayType *Val) {
+    return llvm::hash_combine(Val->getElementType(), Val->getNodeDecl());
+  }
+  static bool isEqual(const NodePayloadArrayType *LHS,
+                      const NodePayloadArrayType *RHS) {
+    // Either both are null, or both should have the same underlying type.
+    return (LHS == RHS) || (LHS && RHS && *LHS == *RHS);
+  }
+};
+
 // Provides DenseMapInfo for ImageType so we can create a DenseSet of
 // image types.
 struct ImageTypeMapInfo {
@@ -130,6 +148,21 @@ struct FunctionTypeMapInfo {
     // Either both are null, or both should have the same underlying type.
     return (LHS == RHS) || (LHS && RHS && *LHS == *RHS);
   }
+};
+
+// Vulkan specific image features for a variable with an image type.
+struct VkImageFeatures {
+  // True if it is a Vulkan "Combined Image Sampler".
+  bool isCombinedImageSampler;
+  std::optional<spv::ImageFormat> format; // SPIR-V image format.
+};
+
+// A struct that contains the information of a resource that will be used to
+// combine an image and a sampler to a sampled image.
+struct ResourceInfoToCombineSampledImage {
+  QualType type;
+  uint32_t descriptorSet;
+  uint32_t binding;
 };
 
 /// The class owning various SPIR-V entities allocated in memory during CodeGen.
@@ -193,6 +226,10 @@ public:
                                      SpirvDebugInstruction *elemType,
                                      uint32_t elemCount);
 
+  SpirvDebugType *getDebugTypeMatrix(const SpirvType *spirvType,
+                                     SpirvDebugInstruction *vectorType,
+                                     uint32_t vectorCount);
+
   SpirvDebugType *getDebugTypeFunction(const SpirvType *spirvType,
                                        uint32_t flags, SpirvDebugType *ret,
                                        llvm::ArrayRef<SpirvDebugType *> params);
@@ -248,6 +285,9 @@ public:
   const RuntimeArrayType *
   getRuntimeArrayType(const SpirvType *elemType,
                       llvm::Optional<uint32_t> arrayStride);
+  const NodePayloadArrayType *
+  getNodePayloadArrayType(const SpirvType *elemType,
+                          const ParmVarDecl *nodeDecl);
 
   const StructType *getStructType(
       llvm::ArrayRef<StructType::FieldInfo> fields, llvm::StringRef name,
@@ -256,6 +296,8 @@ public:
 
   const SpirvPointerType *getPointerType(const SpirvType *pointee,
                                          spv::StorageClass);
+
+  const UntypedPointerKHRType *getUntypedPointerKHRType(spv::StorageClass sc);
 
   FunctionType *getFunctionType(const SpirvType *ret,
                                 llvm::ArrayRef<const SpirvType *> param);
@@ -267,9 +309,16 @@ public:
     return accelerationStructureTypeNV;
   }
 
-  const RayQueryTypeKHR *getRayQueryTypeKHR() const {
-    return rayQueryTypeKHR;
-  }
+  const RayQueryTypeKHR *getRayQueryTypeKHR() const { return rayQueryTypeKHR; }
+
+  const SpirvIntrinsicType *getOrCreateSpirvIntrinsicType(
+      unsigned typeId, unsigned typeOpCode,
+      llvm::ArrayRef<SpvIntrinsicTypeOperand> operands);
+
+  const SpirvIntrinsicType *getOrCreateSpirvIntrinsicType(
+      unsigned typeOpCode, llvm::ArrayRef<SpvIntrinsicTypeOperand> operands);
+
+  SpirvIntrinsicType *getCreatedSpirvIntrinsicType(unsigned typeId);
 
   /// --- Hybrid type getter functions ---
   ///
@@ -287,6 +336,13 @@ public:
       StructInterfaceType interfaceType = StructInterfaceType::InternalStorage);
 
   const HybridPointerType *getPointerType(QualType pointee, spv::StorageClass);
+
+  const ForwardPointerType *getForwardPointerType(QualType pointee);
+
+  const SpirvPointerType *getForwardReference(QualType type);
+
+  void registerForwardReference(QualType type,
+                                const SpirvPointerType *pointerType);
 
   /// Generates (or reuses an existing) OpString for the given string literal.
   SpirvString *getSpirvString(llvm::StringRef str);
@@ -310,6 +366,7 @@ public:
   bool isDS() const { return curShaderModelKind == ShaderModelKind::Domain; }
   bool isCS() const { return curShaderModelKind == ShaderModelKind::Compute; }
   bool isLib() const { return curShaderModelKind == ShaderModelKind::Library; }
+  bool isNode() const { return curShaderModelKind == ShaderModelKind::Node; }
   bool isRay() const {
     return curShaderModelKind >= ShaderModelKind::RayGeneration &&
            curShaderModelKind <= ShaderModelKind::Callable;
@@ -339,18 +396,34 @@ public:
     return currentLexicalScope;
   }
 
-  /// Function to add/get the mapping from a SPIR-V OpVariable to its image
-  /// format.
-  void registerImageFormatForSpirvVariable(const SpirvVariable *spvVar,
-                                           spv::ImageFormat format) {
+  /// Function to register/get the mapping from a SPIR-V OpVariable to its
+  /// Vulkan specific image feature.
+  void registerVkImageFeaturesForSpvVariable(const SpirvVariable *spvVar,
+                                             VkImageFeatures features) {
     assert(spvVar != nullptr);
-    spvVarToImageFormat[spvVar] = format;
+    spvVarToVkImageFeatures[spvVar] = features;
   }
-  spv::ImageFormat getImageFormatForSpirvVariable(const SpirvVariable *spvVar) {
-    auto itr = spvVarToImageFormat.find(spvVar);
-    if (itr == spvVarToImageFormat.end())
-      return spv::ImageFormat::Unknown;
+  VkImageFeatures
+  getVkImageFeaturesForSpirvVariable(const SpirvVariable *spvVar) {
+    auto itr = spvVarToVkImageFeatures.find(spvVar);
+    if (itr == spvVarToVkImageFeatures.end())
+      return {false, std::nullopt};
     return itr->second;
+  }
+
+  /// Function to register the resource information (QualType, descriptor set,
+  /// and binding) to combine images and samplers.
+  void registerResourceInfoForSampledImage(QualType type,
+                                           uint32_t descriptorSet,
+                                           uint32_t binding) {
+    resourceInfoForSampledImages.push_back({type, descriptorSet, binding});
+  }
+
+  /// Function to get all the resource information (QualType, descriptor set,
+  /// and binding) to combine images and samplers.
+  llvm::SmallVector<ResourceInfoToCombineSampledImage, 4>
+  getResourceInfoForSampledImages() {
+    return resourceInfoForSampledImages;
   }
 
   /// Function to add/get the mapping from a SPIR-V type to its Decl for
@@ -383,6 +456,31 @@ public:
   bool hasLoweredType(const SpirvInstruction *inst) {
     return instructionsWithLoweredType.find(inst) !=
            instructionsWithLoweredType.end();
+  }
+
+  void registerDispatchGridIndex(const RecordDecl *decl, unsigned index) {
+    auto iter = dispatchGridIndices.find(decl);
+    if (iter == dispatchGridIndices.end()) {
+      dispatchGridIndices[decl] = index;
+    }
+  }
+
+  llvm::Optional<unsigned> getDispatchGridIndex(const RecordDecl *decl) {
+    auto iter = dispatchGridIndices.find(decl);
+    if (iter != dispatchGridIndices.end()) {
+      return iter->second;
+    }
+    return llvm::None;
+  }
+
+  void registerNodeDeclPayloadType(const NodePayloadArrayType *type,
+                                   const ParmVarDecl *decl) {
+    nodeDecls[decl] = type;
+  }
+
+  const NodePayloadArrayType *getNodeDeclPayloadType(const ParmVarDecl *decl) {
+    auto iter = nodeDecls.find(decl);
+    return iter == nodeDecls.end() ? nullptr : iter->second;
   }
 
 private:
@@ -429,11 +527,20 @@ private:
   llvm::DenseSet<const ArrayType *, ArrayTypeMapInfo> arrayTypes;
   llvm::DenseSet<const RuntimeArrayType *, RuntimeArrayTypeMapInfo>
       runtimeArrayTypes;
+  llvm::DenseSet<const NodePayloadArrayType *, NodePayloadArrayTypeMapInfo>
+      nodePayloadArrayTypes;
   llvm::SmallVector<const StructType *, 8> structTypes;
   llvm::SmallVector<const HybridStructType *, 8> hybridStructTypes;
   llvm::DenseMap<const SpirvType *, SCToPtrTyMap> pointerTypes;
   llvm::SmallVector<const HybridPointerType *, 8> hybridPointerTypes;
+  llvm::DenseMap<spv::StorageClass, const UntypedPointerKHRType *,
+                 StorageClassDenseMapInfo>
+      untypedPointerKHRTypes;
+  llvm::MapVector<QualType, const ForwardPointerType *> forwardPointerTypes;
+  llvm::MapVector<QualType, const SpirvPointerType *> forwardReferences;
   llvm::DenseSet<FunctionType *, FunctionTypeMapInfo> functionTypes;
+  llvm::DenseMap<unsigned, SpirvIntrinsicType *> spirvIntrinsicTypesById;
+  llvm::SmallVector<const SpirvIntrinsicType *, 8> spirvIntrinsicTypes;
   const AccelerationStructureTypeNV *accelerationStructureTypeNV;
   const RayQueryTypeKHR *rayQueryTypeKHR;
 
@@ -450,6 +557,9 @@ private:
   /// recursively.
   llvm::StringMap<RichDebugInfo> debugInfo;
   SpirvDebugInstruction *currentLexicalScope;
+
+  // Mapping from graphics node input record types to member decoration maps.
+  llvm::MapVector<const RecordDecl *, unsigned> dispatchGridIndices;
 
   // Mapping from SPIR-V type to debug type instruction.
   // The purpose is not to generate several DebugType* instructions for the same
@@ -472,11 +582,20 @@ private:
   llvm::DenseMap<const FunctionDecl *, SpirvDebugFunction *>
       declToDebugFunction;
 
-  // Mapping from SPIR-V OpVariable to SPIR-V image format.
-  llvm::DenseMap<const SpirvVariable *, spv::ImageFormat> spvVarToImageFormat;
+  // Mapping from SPIR-V OpVariable to Vulkan image features.
+  llvm::DenseMap<const SpirvVariable *, VkImageFeatures>
+      spvVarToVkImageFeatures;
+
+  // Vector of resource information to be used to combine images and samplers.
+  llvm::SmallVector<ResourceInfoToCombineSampledImage, 4>
+      resourceInfoForSampledImages;
 
   // Set of instructions that already have lowered SPIR-V types.
   llvm::DenseSet<const SpirvInstruction *> instructionsWithLoweredType;
+
+  // Mapping from shader entry function parameter declaration to node payload
+  // array type.
+  llvm::MapVector<const ParmVarDecl *, const NodePayloadArrayType *> nodeDecls;
 };
 
 } // end namespace spirv

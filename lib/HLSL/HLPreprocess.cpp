@@ -10,9 +10,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "llvm/IR/Function.h"
-#include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Module.h"
 
 #include "dxc/HLSL/DxilGenerationPass.h"
 
@@ -31,7 +31,7 @@ public:
   static char ID; // Pass identification, replacement for typeid
   explicit HLPreprocess() : ModulePass(ID) {}
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "Preprocess HLModule after inline";
   }
 
@@ -50,7 +50,7 @@ public:
         I->eraseFromParent();
       }
 
-      for (auto it = StackSave->user_begin(); it != StackSave->user_end(); ) {
+      for (auto it = StackSave->user_begin(); it != StackSave->user_end();) {
         Instruction *I = cast<Instruction>(*(it++));
         I->eraseFromParent();
       }

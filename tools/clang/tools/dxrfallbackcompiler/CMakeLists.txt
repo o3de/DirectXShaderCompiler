@@ -14,6 +14,7 @@ set(LLVM_LINK_COMPONENTS
 #  debuginfodwarf # no support for DWARF files (IR debug info is OK)
 #  debuginfopdb # no support for PDB files
   dxcsupport
+  dxcbindingtable
   dxrfallback
   dxil
   dxilcontainer
@@ -26,7 +27,7 @@ set(LLVM_LINK_COMPONENTS
 #  libdriver
 #  lineeditor
   linker
-  lto
+#  lto
 #  mirparser # no support for LLVM codegen
   mssupport
 #  object # no support for object files (coff, elf)
@@ -53,7 +54,7 @@ set(SOURCES
   )
 
 add_clang_library(dxrfallbackcompiler SHARED ${SOURCES})
-target_link_libraries(dxrfallbackcompiler PRIVATE ${LIBRARIES} ${DIASDK_LIBRARIES})
+target_link_libraries(dxrfallbackcompiler PRIVATE ${LIBRARIES} ${DIASDK_LIBRARIES} dxcvalidator)
 # SPIRV change starts
 if (ENABLE_SPIRV_CODEGEN)
   target_link_libraries(dxrfallbackcompiler PRIVATE clangSPIRV)
@@ -61,6 +62,7 @@ endif (ENABLE_SPIRV_CODEGEN)
 # SPIRV change ends
 add_dependencies(dxrfallbackcompiler DxcEtw)
 include_directories(AFTER ${LLVM_INCLUDE_DIR}/dxc/Tracing ${DIASDK_INCLUDE_DIRS})
+include_directories(${LLVM_SOURCE_DIR}/tools/clang/tools/dxcvalidator)
 
 set_target_properties(dxrfallbackcompiler
   PROPERTIES

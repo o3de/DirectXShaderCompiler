@@ -9,35 +9,41 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
+#include "dxc/DXIL/DxilConstants.h"
 #define _USE_MATH_DEFINES
 #include <array>
 #include <cmath>
-#include <unordered_set>
 #include <functional>
+#include <unordered_set>
 
+#include "dxc/DXIL/DxilConstants.h"
+#include "dxc/DXIL/DxilInstructions.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilResourceProperties.h"
+#include "dxc/DXIL/DxilUtil.h"
+#include "dxc/HLSL/DxilPoisonValues.h"
+#include "dxc/HLSL/HLLowerUDT.h"
 #include "dxc/HLSL/HLMatrixLowerHelper.h"
 #include "dxc/HLSL/HLMatrixType.h"
 #include "dxc/HLSL/HLModule.h"
-#include "dxc/DXIL/DxilUtil.h"
 #include "dxc/HLSL/HLOperationLower.h"
 #include "dxc/HLSL/HLOperationLowerExtension.h"
 #include "dxc/HLSL/HLOperations.h"
 #include "dxc/HlslIntrinsicOp.h"
-#include "dxc/DXIL/DxilResourceProperties.h"
 
+#include "llvm/ADT/APSInt.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
-#include "llvm/ADT/APSInt.h"
 
 using namespace llvm;
 using namespace hlsl;
 
 struct HLOperationLowerHelper {
+  HLModule &M;
   OP &hlslOP;
   Type *voidTy;
   Type *f32Ty;
@@ -47,16 +53,16 @@ struct HLOperationLowerHelper {
   Type *i8Ty;
   DxilTypeSystem &dxilTypeSys;
   DxilFunctionProps *functionProps;
-  bool bLegacyCBufferLoad;
   DataLayout dataLayout;
+  SmallDenseMap<Type *, Type *, 4> loweredTypes;
   HLOperationLowerHelper(HLModule &HLM);
 };
 
 HLOperationLowerHelper::HLOperationLowerHelper(HLModule &HLM)
-    : hlslOP(*HLM.GetOP()), dxilTypeSys(HLM.GetTypeSystem()),
+    : M(HLM), hlslOP(*HLM.GetOP()), dxilTypeSys(HLM.GetTypeSystem()),
       dataLayout(DataLayout(HLM.GetHLOptions().bUseMinPrecision
-                                  ? hlsl::DXIL::kLegacyLayoutString
-                                  : hlsl::DXIL::kNewLayoutString)) {
+                                ? hlsl::DXIL::kLegacyLayoutString
+                                : hlsl::DXIL::kNewLayoutString)) {
   llvm::LLVMContext &Ctx = HLM.GetCtx();
   voidTy = Type::getVoidTy(Ctx);
   f32Ty = Type::getFloatTy(Ctx);
@@ -68,7 +74,6 @@ HLOperationLowerHelper::HLOperationLowerHelper(HLModule &HLM)
   functionProps = nullptr;
   if (HLM.HasDxilFunctionProps(EntryFunc))
     functionProps = &HLM.GetDxilFunctionProps(EntryFunc);
-  bLegacyCBufferLoad = HLM.GetHLOptions().bLegacyCBufferLoad;
 }
 
 struct HLObjectOperationLowerHelper {
@@ -81,7 +86,7 @@ private:
     Type *ResourceType;
   };
   std::unordered_map<Value *, ResAttribute> HandleMetaMap;
-  std::unordered_set<LoadInst *> &UpdateCounterSet;
+  std::unordered_set<Instruction *> &UpdateCounterSet;
   // Map from pointer of cbuffer to pointer of resource.
   // For cbuffer like this:
   //   cbuffer A {
@@ -93,7 +98,7 @@ private:
 
 public:
   HLObjectOperationLowerHelper(HLModule &HLM,
-                               std::unordered_set<LoadInst *> &UpdateCounter)
+                               std::unordered_set<Instruction *> &UpdateCounter)
       : HLM(HLM), UpdateCounterSet(UpdateCounter) {}
   DXIL::ResourceClass GetRC(Value *Handle) {
     ResAttribute &Res = FindCreateHandleResourceBase(Handle);
@@ -110,10 +115,12 @@ public:
 
   void MarkHasCounter(Value *handle, Type *i8Ty) {
     CallInst *CIHandle = cast<CallInst>(handle);
-    DXASSERT(hlsl::GetHLOpcodeGroup(CIHandle->getCalledFunction()) == HLOpcodeGroup::HLAnnotateHandle, "else invalid handle");
+    DXASSERT(hlsl::GetHLOpcodeGroup(CIHandle->getCalledFunction()) ==
+                 HLOpcodeGroup::HLAnnotateHandle,
+             "else invalid handle");
     // Mark has counter for the input handle.
     Value *counterHandle =
-        CIHandle->getArgOperand(HLOperandIndex::kAnnotateHandleHandleOpIdx);
+        CIHandle->getArgOperand(HLOperandIndex::kHandleOpIdx);
     // Change kind into StructurBufferWithCounter.
     Constant *Props = cast<Constant>(CIHandle->getArgOperand(
         HLOperandIndex::kAnnotateHandleResourcePropertiesOpIdx));
@@ -122,16 +129,44 @@ public:
 
     CIHandle->setArgOperand(
         HLOperandIndex::kAnnotateHandleResourcePropertiesOpIdx,
-        resource_helper::getAsConstant(
-            RP,
-            HLM.GetOP()->GetResourcePropertiesType(),
-            *HLM.GetShaderModel()));
+        resource_helper::getAsConstant(RP,
+                                       HLM.GetOP()->GetResourcePropertiesType(),
+                                       *HLM.GetShaderModel()));
 
     DXIL::ResourceClass RC = GetRC(handle);
     DXASSERT_LOCALVAR(RC, RC == DXIL::ResourceClass::UAV,
                       "must UAV for counter");
     std::unordered_set<Value *> resSet;
     MarkHasCounterOnCreateHandle(counterHandle, resSet);
+  }
+
+  DxilResourceBase *FindCBufferResourceFromHandle(Value *handle) {
+    if (CallInst *CI = dyn_cast<CallInst>(handle)) {
+      hlsl::HLOpcodeGroup group =
+          hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction());
+      if (group == HLOpcodeGroup::HLAnnotateHandle) {
+        handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+      }
+    }
+
+    Constant *symbol = nullptr;
+    if (CallInst *CI = dyn_cast<CallInst>(handle)) {
+      hlsl::HLOpcodeGroup group =
+          hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction());
+      if (group == HLOpcodeGroup::HLCreateHandle) {
+        symbol = dyn_cast<Constant>(
+            CI->getArgOperand(HLOperandIndex::kCreateHandleResourceOpIdx));
+      }
+    }
+
+    if (!symbol)
+      return nullptr;
+
+    for (const std::unique_ptr<DxilCBuffer> &res : HLM.GetCBuffers()) {
+      if (res->GetGlobalSymbol() == symbol)
+        return res.get();
+    }
+    return nullptr;
   }
 
   Value *GetOrCreateResourceForCbPtr(GetElementPtrInst *CbPtr,
@@ -175,8 +210,7 @@ public:
   DxilResourceProperties GetResPropsFromAnnotateHandle(CallInst *Anno) {
     Constant *Props = cast<Constant>(Anno->getArgOperand(
         HLOperandIndex::kAnnotateHandleResourcePropertiesOpIdx));
-    DxilResourceProperties RP = resource_helper::loadPropsFromConstant(
-        *Props);
+    DxilResourceProperties RP = resource_helper::loadPropsFromConstant(*Props);
     return RP;
   }
 
@@ -186,9 +220,9 @@ private:
       return HandleMetaMap[Handle];
 
     // Add invalid first to avoid dead loop.
-    HandleMetaMap[Handle] = {DXIL::ResourceClass::Invalid,
-                             DXIL::ResourceKind::Invalid,
-                             StructType::get(Type::getVoidTy(HLM.GetCtx()), nullptr)};
+    HandleMetaMap[Handle] = {
+        DXIL::ResourceClass::Invalid, DXIL::ResourceKind::Invalid,
+        StructType::get(Type::getVoidTy(HLM.GetCtx()), nullptr)};
     if (CallInst *CI = dyn_cast<CallInst>(Handle)) {
       hlsl::HLOpcodeGroup group =
           hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction());
@@ -208,7 +242,8 @@ private:
         return HandleMetaMap[Handle];
       }
     }
-    Handle->getContext().emitError("cannot map resource to handle");
+    dxilutil::EmitErrorOnContext(Handle->getContext(),
+                                 "cannot map resource to handle.");
 
     return HandleMetaMap[Handle];
   }
@@ -249,11 +284,25 @@ private:
       Value *Res =
           CI->getArgOperand(HLOperandIndex::kCreateHandleResourceOpIdx);
       LoadInst *LdRes = dyn_cast<LoadInst>(Res);
-      if (!LdRes) {
-        dxilutil::EmitErrorOnInstruction(CI, "cannot map resource to handle.");
+      if (LdRes) {
+        UpdateCounterSet.insert(LdRes);
         return;
       }
-      UpdateCounterSet.insert(LdRes);
+      if (CallInst *CallRes = dyn_cast<CallInst>(Res)) {
+        hlsl::HLOpcodeGroup group =
+            hlsl::GetHLOpcodeGroup(CallRes->getCalledFunction());
+        if (group == HLOpcodeGroup::HLCast) {
+          HLCastOpcode opcode =
+              static_cast<HLCastOpcode>(hlsl::GetHLOpcode(CallRes));
+          if (opcode == HLCastOpcode::HandleToResCast) {
+            if (Instruction *Hdl = dyn_cast<Instruction>(
+                    CallRes->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx)))
+              UpdateCounterSet.insert(Hdl);
+            return;
+          }
+        }
+      }
+      dxilutil::EmitErrorOnInstruction(CI, "cannot map resource to handle.");
       return;
     }
     if (SelectInst *Sel = dyn_cast<SelectInst>(handle)) {
@@ -288,7 +337,8 @@ private:
   Value *CreateResourceForCbPtr(GetElementPtrInst *CbPtr, GlobalVariable *CbGV,
                                 DxilResourceProperties &RP) {
     Type *CbTy = CbPtr->getPointerOperandType();
-    DXASSERT_LOCALVAR(CbTy, CbTy == CbGV->getType(), "else arg not point to var");
+    DXASSERT_LOCALVAR(CbTy, CbTy == CbGV->getType(),
+                      "else arg not point to var");
 
     gep_type_iterator GEPIt = gep_type_begin(CbPtr), E = gep_type_end(CbPtr);
     unsigned i = 0;
@@ -321,7 +371,8 @@ private:
 
     Type *Ty = CbPtr->getResultElementType();
     // Not support resource array in cbuffer.
-    unsigned ResBinding = HLM.GetBindingForResourceInCB(CbPtr, CbGV, RP.getResourceClass());
+    unsigned ResBinding =
+        HLM.GetBindingForResourceInCB(CbPtr, CbGV, RP.getResourceClass());
     return CreateResourceGV(Ty, Name, RP, ResBinding);
   }
 
@@ -339,28 +390,27 @@ private:
 
 // Helper for lowering resource extension methods.
 struct HLObjectExtensionLowerHelper : public hlsl::HLResourceLookup {
-    explicit HLObjectExtensionLowerHelper(HLObjectOperationLowerHelper &ObjHelper)
-        : m_ObjHelper(ObjHelper)
-    { }
+  explicit HLObjectExtensionLowerHelper(HLObjectOperationLowerHelper &ObjHelper)
+      : m_ObjHelper(ObjHelper) {}
 
-    virtual bool GetResourceKindName(Value *HLHandle, const char **ppName)
-    {
-        DXIL::ResourceKind K = m_ObjHelper.GetRK(HLHandle);
-        bool Success = K != DXIL::ResourceKind::Invalid;
-        if (Success)
-        {
-            *ppName = hlsl::GetResourceKindName(K);
-        }
-        return Success;
+  virtual bool GetResourceKindName(Value *HLHandle, const char **ppName) {
+    DXIL::ResourceKind K = m_ObjHelper.GetRK(HLHandle);
+    bool Success = K != DXIL::ResourceKind::Invalid;
+    if (Success) {
+      *ppName = hlsl::GetResourceKindName(K);
     }
+    return Success;
+  }
 
 private:
-    HLObjectOperationLowerHelper &m_ObjHelper;
+  HLObjectOperationLowerHelper &m_ObjHelper;
 };
 
 using IntrinsicLowerFuncTy = Value *(CallInst *CI, IntrinsicOp IOP,
                                      DXIL::OpCode opcode,
-                                     HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated);
+                                     HLOperationLowerHelper &helper,
+                                     HLObjectOperationLowerHelper *pObjHelper,
+                                     bool &Translated);
 
 struct IntrinsicLower {
   // Intrinsic opcode.
@@ -374,11 +424,27 @@ struct IntrinsicLower {
 // IOP intrinsics.
 namespace {
 
-Value *TrivialDxilOperation(Function *dxilFunc, OP::OpCode opcode, ArrayRef<Value *> refArgs,
-                            Type *Ty, Type *RetTy, OP *hlslOP,
-                            IRBuilder<> &Builder) {
-  unsigned argNum = refArgs.size();
+CallInst *CreateTrivialDxilCall(Function *Func, OP::OpCode Opcode,
+                                ArrayRef<Value *> Args, const Twine &Name,
+                                IRBuilder<> &Builder) {
+  CallInst *Call = Builder.CreateCall(Func, Args, Name);
+  if (OP::IsDxilOpConvergent(Opcode))
+    Call->addAttribute(AttributeSet::FunctionIndex, Attribute::Convergent);
+  return Call;
+}
 
+// Creates the necessary scalar calls to for a "trivial" operation where only
+// call instructions to a single function type are needed.
+// The overload type `Ty` determines what scalarization might be required.
+// Elements of any vectors in `refArgs` are extracted  into scalars for each
+// call generated while the same scalar values are used unaltered in each call.
+// Utility objects `HlslOp` and `Builder` are used to generate calls to the
+// given `DxilFunc` for each set of scalar arguments.
+// The results are reconstructed into the given `RetTy` as needed.
+Value *TrivialDxilOperation(Function *dxilFunc, OP::OpCode opcode,
+                            ArrayRef<Value *> refArgs, Type *Ty, Type *RetTy,
+                            OP *hlslOP, IRBuilder<> &Builder) {
+  unsigned argNum = refArgs.size();
   std::vector<Value *> args = refArgs;
 
   if (Ty->isVectorTy()) {
@@ -393,32 +459,59 @@ Value *TrivialDxilOperation(Function *dxilFunc, OP::OpCode opcode, ArrayRef<Valu
           args[argIdx] = Builder.CreateExtractElement(arg, i);
         }
       }
-      Value *EltOP =
-          Builder.CreateCall(dxilFunc, args, hlslOP->GetOpCodeName(opcode));
+      Value *EltOP = CreateTrivialDxilCall(
+          dxilFunc, opcode, args, hlslOP->GetOpCodeName(opcode), Builder);
       retVal = Builder.CreateInsertElement(retVal, EltOP, i);
     }
     return retVal;
-  } else {
-    if (!RetTy->isVoidTy()) {
-      Value *retVal =
-          Builder.CreateCall(dxilFunc, args, hlslOP->GetOpCodeName(opcode));
-      return retVal;
-    } else {
-      // Cannot add name to void.
-      return Builder.CreateCall(dxilFunc, args);
-    }
   }
+
+  // Cannot add name to void.
+  if (RetTy->isVoidTy())
+    return CreateTrivialDxilCall(dxilFunc, opcode, args, "", Builder);
+
+  return CreateTrivialDxilCall(dxilFunc, opcode, args,
+                               hlslOP->GetOpCodeName(opcode), Builder);
 }
-// Generates a DXIL operation over an overloaded type (Ty), returning a
-// RetTy value; when Ty is a vector, it will replicate per-element operations
-// into RetTy to rebuild it.
+
+// Creates a native vector call to for a "trivial" operation where only a single
+// call instruction is needed. The overload and return types are the same vector
+// type `Ty`.
+// Utility objects `HlslOp` and `Builder` are used to create a call to the given
+// `DxilFunc` with `RefArgs` arguments.
+Value *TrivialDxilVectorOperation(Function *Func, OP::OpCode Opcode,
+                                  ArrayRef<Value *> Args, Type *Ty, OP *OP,
+                                  IRBuilder<> &Builder) {
+  return CreateTrivialDxilCall(Func, Opcode, Args,
+                               Ty->isVoidTy() ? "" : OP->GetOpCodeName(Opcode),
+                               Builder);
+}
+
+// Generates a DXIL operation with the overloaded type based on `Ty` and return
+// type `RetTy`. When Ty is a vector, it will either generate per-element calls
+// for each vector element and reconstruct the vector type from those results or
+// operate on and return native vectors depending on vector size and the
+// legality of the vector overload.
 Value *TrivialDxilOperation(OP::OpCode opcode, ArrayRef<Value *> refArgs,
                             Type *Ty, Type *RetTy, OP *hlslOP,
                             IRBuilder<> &Builder) {
+
+  // If supported and the overload type is a vector with more than 1 element,
+  // create a native vector operation.
+  if (Ty->isVectorTy() && Ty->getVectorNumElements() > 1 &&
+      hlslOP->GetModule()->GetHLModule().GetShaderModel()->IsSM69Plus() &&
+      OP::IsOverloadLegal(opcode, Ty)) {
+    Function *dxilFunc = hlslOP->GetOpFunc(opcode, Ty);
+    return TrivialDxilVectorOperation(dxilFunc, opcode, refArgs, Ty, hlslOP,
+                                      Builder);
+  }
+
+  // Set overload type to the scalar type of `Ty` and generate call(s).
   Type *EltTy = Ty->getScalarType();
   Function *dxilFunc = hlslOP->GetOpFunc(opcode, EltTy);
 
-  return TrivialDxilOperation(dxilFunc, opcode, refArgs, Ty, RetTy, hlslOP, Builder);
+  return TrivialDxilOperation(dxilFunc, opcode, refArgs, Ty, RetTy, hlslOP,
+                              Builder);
 }
 
 Value *TrivialDxilOperation(OP::OpCode opcode, ArrayRef<Value *> refArgs,
@@ -433,20 +526,34 @@ Value *TrivialDxilOperation(OP::OpCode opcode, ArrayRef<Value *> refArgs,
   return TrivialDxilOperation(opcode, refArgs, Ty, Inst->getType(), hlslOP, B);
 }
 
-Value *TrivialDxilUnaryOperationRet(OP::OpCode opcode, Value *src, Type *RetTy,
-                                    hlsl::OP *hlslOP, IRBuilder<> &Builder) {
-  Type *Ty = src->getType();
+// Translate call that converts to a dxil unary operation with a different
+// return type from the overload by passing the argument, explicit return type,
+// and helper objects to the scalarizing unary dxil operation creation.
+Value *TrivialUnaryOperationRet(CallInst *CI, IntrinsicOp IOP,
+                                OP::OpCode OpCode,
+                                HLOperationLowerHelper &Helper,
+                                HLObjectOperationLowerHelper *,
+                                bool &Translated) {
+  Value *Src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
+  Type *Ty = Src->getType();
 
-  Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  Value *args[] = {opArg, src};
+  IRBuilder<> Builder(CI);
+  hlsl::OP *OP = &Helper.hlslOP;
+  Type *RetTy = CI->getType();
+  Constant *OpArg = OP->GetU32Const((unsigned)OpCode);
+  Value *Args[] = {OpArg, Src};
 
-  return TrivialDxilOperation(opcode, args, Ty, RetTy, hlslOP, Builder);
+  return TrivialDxilOperation(OpCode, Args, Ty, RetTy, OP, Builder);
 }
 
-Value *TrivialDxilUnaryOperation(OP::OpCode opcode, Value *src,
-                                 hlsl::OP *hlslOP, IRBuilder<> &Builder) {
-  return TrivialDxilUnaryOperationRet(opcode, src, src->getType(), hlslOP,
-                                      Builder);
+Value *TrivialDxilUnaryOperation(OP::OpCode OpCode, Value *Src, hlsl::OP *Op,
+                                 IRBuilder<> &Builder) {
+  Type *Ty = Src->getType();
+
+  Constant *OpArg = Op->GetU32Const((unsigned)OpCode);
+  Value *Args[] = {OpArg, Src};
+
+  return TrivialDxilOperation(OpCode, Args, Ty, Ty, Op, Builder);
 }
 
 Value *TrivialDxilBinaryOperation(OP::OpCode opcode, Value *src0, Value *src1,
@@ -470,17 +577,27 @@ Value *TrivialDxilTrinaryOperation(OP::OpCode opcode, Value *src0, Value *src1,
   return TrivialDxilOperation(opcode, args, Ty, Ty, hlslOP, Builder);
 }
 
+// Translate call that trivially converts to a dxil unary operation by passing
+// argument, return type, and helper objects to either scalarizing or native
+// vector dxil operation creation depending on version and vector size.
 Value *TrivialUnaryOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   Value *src0 = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
   hlsl::OP *hlslOP = &helper.hlslOP;
-  Value *retVal = TrivialDxilUnaryOperationRet(opcode, src0, CI->getType(), hlslOP, Builder);
-  return retVal;
+
+  return TrivialDxilUnaryOperation(opcode, src0, hlslOP, Builder);
 }
 
+// Translate call that trivially converts to a dxil binary operation by passing
+// arguments, return type, and helper objects to either scalarizing or native
+// vector dxil operation creation depending on version and vector size.
 Value *TrivialBinaryOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                              HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                              HLOperationLowerHelper &helper,
+                              HLObjectOperationLowerHelper *pObjHelper,
+                              bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -491,8 +608,14 @@ Value *TrivialBinaryOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   return binOp;
 }
 
+// Translate call that trivially converts to a dxil trinary (aka tertiary)
+// operation by passing arguments, return type, and helper objects to either
+// scalarizing or native vector dxil operation creation depending on version
+// and vector size.
 Value *TrivialTrinaryOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                               HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
@@ -505,7 +628,9 @@ Value *TrivialTrinaryOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TrivialIsSpecialFloat(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
@@ -528,8 +653,10 @@ bool IsResourceGEP(GetElementPtrInst *I) {
   return dxilutil::IsHLSLResourceType(Ty);
 }
 
-Value *TranslateNonUniformResourceIndex(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateNonUniformResourceIndex(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   Value *V = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *hdlTy = helper.hlslOP.GetHandleType();
   for (User *U : CI->users()) {
@@ -543,6 +670,9 @@ Value *TranslateNonUniformResourceIndex(CallInst *CI, IntrinsicOp IOP, OP::OpCod
           // Only mark on GEP which point to resource.
           if (IsResourceGEP(I))
             DxilMDHelper::MarkNonUniform(I);
+        } else if (CallInst *CI = dyn_cast<CallInst>(castU)) {
+          if (CI->getType() == hdlTy)
+            DxilMDHelper::MarkNonUniform(CI);
         }
       }
     } else if (CallInst *CI = dyn_cast<CallInst>(U)) {
@@ -555,7 +685,9 @@ Value *TranslateNonUniformResourceIndex(CallInst *CI, IntrinsicOp IOP, OP::OpCod
 }
 
 Value *TrivialBarrier(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *OP = &helper.hlslOP;
   Function *dxilFunc = OP->GetOpFunc(OP::OpCode::Barrier, CI->getType());
   Constant *opArg = OP->GetU32Const((unsigned)OP::OpCode::Barrier);
@@ -563,7 +695,8 @@ Value *TrivialBarrier(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   unsigned uglobal = static_cast<unsigned>(DXIL::BarrierMode::UAVFenceGlobal);
   unsigned g = static_cast<unsigned>(DXIL::BarrierMode::TGSMFence);
   unsigned t = static_cast<unsigned>(DXIL::BarrierMode::SyncThreadGroup);
-  // unsigned ut = static_cast<unsigned>(DXIL::BarrierMode::UAVFenceThreadGroup);
+  // unsigned ut =
+  // static_cast<unsigned>(DXIL::BarrierMode::UAVFenceThreadGroup);
 
   unsigned barrierMode = 0;
   switch (IOP) {
@@ -600,7 +733,9 @@ Value *TrivialBarrier(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 
 Value *TranslateD3DColorToUByte4(CallInst *CI, IntrinsicOp IOP,
                                  OP::OpCode opcode,
-                                 HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                 HLOperationLowerHelper &helper,
+                                 HLObjectOperationLowerHelper *pObjHelper,
+                                 bool &Translated) {
   IRBuilder<> Builder(CI);
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *Ty = val->getType();
@@ -612,15 +747,16 @@ Value *TranslateD3DColorToUByte4(CallInst *CI, IntrinsicOp IOP,
 
   if (Ty->isVectorTy()) {
     static constexpr int supportedVecElemCount = 4;
-    if (Ty->getVectorNumElements() == supportedVecElemCount) {
-      toByteConst = ConstantVector::getSplat(supportedVecElemCount, toByteConst);
-      // Swizzle the input val -> val.zyxw
-      std::vector<int> mask { 2, 1, 0, 3 };
-      val = Builder.CreateShuffleVector(val, val, mask);
-    } else {
-      dxilutil::EmitErrorOnInstruction(CI, "Unsupported input type for intrinsic D3DColorToUByte4.");
+    if (Ty->getVectorNumElements() != supportedVecElemCount) {
+      llvm_unreachable(
+          "Unsupported input type for intrinsic D3DColorToUByte4.");
       return UndefValue::get(CI->getType());
     }
+
+    toByteConst = ConstantVector::getSplat(supportedVecElemCount, toByteConst);
+    // Swizzle the input val -> val.zyxw
+    SmallVector<int, 4> mask{2, 1, 0, 3};
+    val = Builder.CreateShuffleVector(val, val, mask);
   }
 
   Value *byte4 = Builder.CreateFMul(toByteConst, val);
@@ -628,10 +764,12 @@ Value *TranslateD3DColorToUByte4(CallInst *CI, IntrinsicOp IOP,
 }
 
 // Returns true if pow can be implemented using Fxc's mul-only code gen pattern.
-// Fxc uses the below rules when choosing mul-only code gen pattern to implement pow function.
-// Rule 1: Applicable only to power values in the range [INT32_MIN, INT32_MAX]
-// Rule 2: The maximum number of mul ops needed shouldn't exceed (2n+1) or (n+1) based on whether the power
-//         is a positive or a negative value. Here "n" is the number of scalar elements in power.
+// Fxc uses the below rules when choosing mul-only code gen pattern to implement
+// pow function. Rule 1: Applicable only to power values in the range
+// [INT32_MIN, INT32_MAX] Rule 2: The maximum number of mul ops needed shouldn't
+// exceed (2n+1) or (n+1) based on whether the power
+//         is a positive or a negative value. Here "n" is the number of scalar
+//         elements in power.
 // Rule 3: Power must be an exact value.
 // +----------+---------------------+------------------+
 // | BaseType | IsExponentPositive  | MaxMulOpsAllowed |
@@ -650,7 +788,8 @@ Value *TranslateD3DColorToUByte4(CallInst *CI, IntrinsicOp IOP,
 // | float    | False               |                2 |
 // +----------+---------------------+------------------+
 
-bool CanUseFxcMulOnlyPatternForPow(IRBuilder<>& Builder, Value *x, Value *pow, int32_t& powI) {
+bool CanUseFxcMulOnlyPatternForPow(IRBuilder<> &Builder, Value *x, Value *pow,
+                                   int32_t &powI) {
   // Applicable only when power is a literal.
   if (!isa<ConstantDataVector>(pow) && !isa<ConstantFP>(pow)) {
     return false;
@@ -663,13 +802,22 @@ bool CanUseFxcMulOnlyPatternForPow(IRBuilder<>& Builder, Value *x, Value *pow, i
     }
   }
 
-  APFloat powAPF = isa<ConstantDataVector>(pow) ?
-    cast<ConstantDataVector>(pow)->getElementAsAPFloat(0) : // should be a splat value
-    cast<ConstantFP>(pow)->getValueAPF();
+  // Only apply on aggregates of 16 or fewer elements,
+  // representing the max 4x4 matrix size.
+  Type *Ty = x->getType();
+  if (Ty->isVectorTy() && Ty->getVectorNumElements() > 16)
+    return false;
+
+  APFloat powAPF = isa<ConstantDataVector>(pow)
+                       ? cast<ConstantDataVector>(pow)->getElementAsAPFloat(0)
+                       : // should be a splat value
+                       cast<ConstantFP>(pow)->getValueAPF();
   APSInt powAPS(32, false);
   bool isExact = false;
-  // Try converting float value of power to integer and also check if the float value is exact.
-  APFloat::opStatus status = powAPF.convertToInteger(powAPS, APFloat::rmTowardZero, &isExact);
+  // Try converting float value of power to integer and also check if the float
+  // value is exact.
+  APFloat::opStatus status =
+      powAPF.convertToInteger(powAPS, APFloat::rmTowardZero, &isExact);
   if (status == APFloat::opStatus::opOK && isExact) {
     powI = powAPS.getExtValue();
     uint32_t powU = abs(powI);
@@ -683,7 +831,8 @@ bool CanUseFxcMulOnlyPatternForPow(IRBuilder<>& Builder, Value *x, Value *pow, i
     }
 
     DXASSERT(maxBitSetPos <= 30, "msb should always be zero.");
-    unsigned numElem = isa<ConstantDataVector>(pow) ? x->getType()->getVectorNumElements() : 1;
+    unsigned numElem =
+        isa<ConstantDataVector>(pow) ? x->getType()->getVectorNumElements() : 1;
     int mulOpThreshold = powI < 0 ? numElem + 1 : 2 * numElem + 1;
     int mulOpNeeded = maxBitSetPos + setBitCount - 1;
     return mulOpNeeded <= mulOpThreshold;
@@ -692,7 +841,8 @@ bool CanUseFxcMulOnlyPatternForPow(IRBuilder<>& Builder, Value *x, Value *pow, i
   return false;
 }
 
-Value *TranslatePowUsingFxcMulOnlyPattern(IRBuilder<>& Builder, Value *x, const int32_t y) {
+Value *TranslatePowUsingFxcMulOnlyPattern(IRBuilder<> &Builder, Value *x,
+                                          const int32_t y) {
   uint32_t absY = abs(y);
   // If y is zero then always return 1.
   if (absY == 0) {
@@ -707,8 +857,7 @@ Value *TranslatePowUsingFxcMulOnlyPattern(IRBuilder<>& Builder, Value *x, const 
       for (int j = i; j > lastSetPos; j--) {
         if (!mul) {
           mul = x;
-        }
-        else {
+        } else {
           mul = Builder.CreateFMul(mul, mul);
         }
       }
@@ -720,38 +869,39 @@ Value *TranslatePowUsingFxcMulOnlyPattern(IRBuilder<>& Builder, Value *x, const 
 
   // Compute reciprocal for negative power values.
   if (y < 0) {
-    Value* constOne = ConstantFP::get(x->getType(), 1);
+    Value *constOne = ConstantFP::get(x->getType(), 1);
     result = Builder.CreateFDiv(constOne, result);
   }
 
   return result;
 }
 
-Value *TranslatePowImpl(hlsl::OP *hlslOP, IRBuilder<>& Builder, Value *x, Value *y, bool isFXCCompatMode = false) {
+Value *TranslatePowImpl(hlsl::OP *hlslOP, IRBuilder<> &Builder, Value *x,
+                        Value *y, bool isFXCCompatMode = false) {
   // As applicable implement pow using only mul ops as done by Fxc.
   int32_t p = 0;
   if (CanUseFxcMulOnlyPatternForPow(Builder, x, y, p)) {
-    if (isFXCCompatMode) {
-    return TranslatePowUsingFxcMulOnlyPattern(Builder, x, p);
-    } else if (p == 2) {
-      // Only take care 2 for it will not affect register pressure.
+    if (isFXCCompatMode)
+      return TranslatePowUsingFxcMulOnlyPattern(Builder, x, p);
+    // Only take care 2 for it will not affect register pressure.
+    if (p == 2)
       return Builder.CreateFMul(x, x);
-    }
   }
 
   // Default to log-mul-exp pattern if previous scenarios don't apply.
   // t = log(x);
   Value *logX =
-    TrivialDxilUnaryOperation(DXIL::OpCode::Log, x, hlslOP, Builder);
+      TrivialDxilUnaryOperation(DXIL::OpCode::Log, x, hlslOP, Builder);
   // t = y * t;
   Value *mulY = Builder.CreateFMul(logX, y);
   // pow = exp(t);
   return TrivialDxilUnaryOperation(DXIL::OpCode::Exp, mulY, hlslOP, Builder);
 }
 
-Value *TranslateAddUint64(CallInst *CI, IntrinsicOp IOP,
-                                 OP::OpCode opcode,
-                                 HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateAddUint64(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                          HLOperationLowerHelper &helper,
+                          HLObjectOperationLowerHelper *pObjHelper,
+                          bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   IRBuilder<> Builder(CI);
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
@@ -776,10 +926,10 @@ Value *TranslateAddUint64(CallInst *CI, IntrinsicOp IOP,
 
   Function *AddC = hlslOP->GetOpFunc(DXIL::OpCode::UAddc, helper.i32Ty);
   Value *opArg = Builder.getInt32(static_cast<unsigned>(DXIL::OpCode::UAddc));
-  for (unsigned i=0; i<size; i+=2) {
+  for (unsigned i = 0; i < size; i += 2) {
     Value *low0 = Builder.CreateExtractElement(op0, i);
     Value *low1 = Builder.CreateExtractElement(op1, i);
-    Value *lowWithC = Builder.CreateCall(AddC, { opArg, low0, low1});
+    Value *lowWithC = Builder.CreateCall(AddC, {opArg, low0, low1});
     Value *low = Builder.CreateExtractValue(lowWithC, 0);
     RetVal = Builder.CreateInsertElement(RetVal, low, i);
 
@@ -787,15 +937,14 @@ Value *TranslateAddUint64(CallInst *CI, IntrinsicOp IOP,
     // Ext i1 to i32
     carry = Builder.CreateZExt(carry, helper.i32Ty);
 
-    Value *hi0 = Builder.CreateExtractElement(op0, i+1);
-    Value *hi1 = Builder.CreateExtractElement(op1, i+1);
+    Value *hi0 = Builder.CreateExtractElement(op0, i + 1);
+    Value *hi1 = Builder.CreateExtractElement(op1, i + 1);
     Value *hi = Builder.CreateAdd(hi0, hi1);
     hi = Builder.CreateAdd(hi, carry);
-    RetVal = Builder.CreateInsertElement(RetVal, hi, i+1);
+    RetVal = Builder.CreateInsertElement(RetVal, hi, i + 1);
   }
   return RetVal;
 }
-
 
 bool IsValidLoadInput(Value *V) {
   // Must be load input.
@@ -822,8 +971,9 @@ Value *FindScalarSource(Value *src, unsigned vecIdx = 0) {
     if (src->getType()->isVectorTy()) {
       if (InsertElementInst *IE = dyn_cast<InsertElementInst>(src)) {
         unsigned curIdx = (unsigned)cast<ConstantInt>(IE->getOperand(2))
-          ->getUniqueInteger().getLimitedValue();
-        src = IE->getOperand( (curIdx == vecIdx) ? 1 : 0 );
+                              ->getUniqueInteger()
+                              .getLimitedValue();
+        src = IE->getOperand((curIdx == vecIdx) ? 1 : 0);
       } else if (ShuffleVectorInst *SV = dyn_cast<ShuffleVectorInst>(src)) {
         int newIdx = SV->getMaskValue(vecIdx);
         if (newIdx < 0)
@@ -836,17 +986,18 @@ Value *FindScalarSource(Value *src, unsigned vecIdx = 0) {
           src = SV->getOperand(1);
         }
       } else {
-        return UndefValue::get(srcTy);  // Didn't find it.
+        return UndefValue::get(srcTy); // Didn't find it.
       }
     } else {
       if (ExtractElementInst *EE = dyn_cast<ExtractElementInst>(src)) {
         vecIdx = (unsigned)cast<ConstantInt>(EE->getIndexOperand())
-          ->getUniqueInteger().getLimitedValue();
+                     ->getUniqueInteger()
+                     .getLimitedValue();
         src = EE->getVectorOperand();
       } else if (hlsl::dxilutil::IsConvergentMarker(src)) {
         src = hlsl::dxilutil::GetConvergentSource(src);
       } else {
-        break;  // Found it.
+        break; // Found it.
       }
     }
   }
@@ -857,57 +1008,69 @@ Value *FindScalarSource(Value *src, unsigned vecIdx = 0) {
 // resulting vector or scalar.
 // Uses functor that takes (inputElemID, rowIdx, colIdx), and returns
 // translation for one input scalar.
-Value *TranslateEvalHelper(CallInst *CI, Value *val, IRBuilder<> &Builder,
-    std::function<Value*(Value*, Value*, Value*)> fnTranslateScalarInput) {
+Value *TranslateEvalHelper(
+    CallInst *CI, Value *val, IRBuilder<> &Builder,
+    std::function<Value *(Value *, Value *, Value *)> fnTranslateScalarInput) {
   Type *Ty = CI->getType();
   Value *result = UndefValue::get(Ty);
   if (Ty->isVectorTy()) {
     for (unsigned i = 0; i < Ty->getVectorNumElements(); ++i) {
       Value *InputEl = FindScalarSource(val, i);
       if (!IsValidLoadInput(InputEl)) {
-        dxilutil::EmitErrorOnInstruction(CI, "attribute evaluation can only be done "
-                                             "on values taken directly from inputs.");
+        dxilutil::EmitErrorOnInstruction(
+            CI, "attribute evaluation can only be done "
+                "on values taken directly from inputs.");
         return result;
       }
       CallInst *loadInput = cast<CallInst>(InputEl);
-      Value *inputElemID = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputIDOpIdx);
-      Value *rowIdx = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputRowOpIdx);
-      Value *colIdx = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputColOpIdx);
+      Value *inputElemID =
+          loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputIDOpIdx);
+      Value *rowIdx =
+          loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputRowOpIdx);
+      Value *colIdx =
+          loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputColOpIdx);
       Value *Elt = fnTranslateScalarInput(inputElemID, rowIdx, colIdx);
       result = Builder.CreateInsertElement(result, Elt, i);
     }
-  }
-  else {
+  } else {
     Value *InputEl = FindScalarSource(val);
     if (!IsValidLoadInput(InputEl)) {
-      dxilutil::EmitErrorOnInstruction(CI, "attribute evaluation can only be done "
-                                           "on values taken directly from inputs.");
+      dxilutil::EmitErrorOnInstruction(CI,
+                                       "attribute evaluation can only be done "
+                                       "on values taken directly from inputs.");
       return result;
     }
     CallInst *loadInput = cast<CallInst>(InputEl);
-    Value *inputElemID = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputIDOpIdx);
-    Value *rowIdx = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputRowOpIdx);
-    Value *colIdx = loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputColOpIdx);
+    Value *inputElemID =
+        loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputIDOpIdx);
+    Value *rowIdx =
+        loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputRowOpIdx);
+    Value *colIdx =
+        loadInput->getArgOperand(DXIL::OperandIndex::kLoadInputColOpIdx);
     result = fnTranslateScalarInput(inputElemID, rowIdx, colIdx);
   }
   return result;
 }
 
 Value *TranslateEvalSample(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                           HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *val = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *sampleIdx = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   IRBuilder<> Builder(CI);
-  OP::OpCode opcode = OP::OpCode::EvalSampleIndex; 
+  OP::OpCode opcode = OP::OpCode::EvalSampleIndex;
   Value *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  Function *evalFunc = hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
+  Function *evalFunc =
+      hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
 
-  return TranslateEvalHelper(CI, val, Builder,
-    [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value* {
-      return Builder.CreateCall(evalFunc, { opArg, inputElemID, rowIdx, colIdx, sampleIdx });
-    }
-  );
+  return TranslateEvalHelper(
+      CI, val, Builder,
+      [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value * {
+        return Builder.CreateCall(
+            evalFunc, {opArg, inputElemID, rowIdx, colIdx, sampleIdx});
+      });
 }
 
 Value *TranslateEvalSnapped(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
@@ -920,15 +1083,17 @@ Value *TranslateEvalSnapped(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
   IRBuilder<> Builder(CI);
   Value *offsetX = Builder.CreateExtractElement(offset, (uint64_t)0);
   Value *offsetY = Builder.CreateExtractElement(offset, 1);
-  OP::OpCode opcode = OP::OpCode::EvalSnapped; 
+  OP::OpCode opcode = OP::OpCode::EvalSnapped;
   Value *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  Function *evalFunc = hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
+  Function *evalFunc =
+      hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
 
-  return TranslateEvalHelper(CI, val, Builder,
-    [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value* {
-      return Builder.CreateCall(evalFunc, { opArg, inputElemID, rowIdx, colIdx, offsetX, offsetY });
-    }
-  );
+  return TranslateEvalHelper(
+      CI, val, Builder,
+      [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value * {
+        return Builder.CreateCall(
+            evalFunc, {opArg, inputElemID, rowIdx, colIdx, offsetX, offsetY});
+      });
 }
 
 Value *TranslateEvalCentroid(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
@@ -938,18 +1103,62 @@ Value *TranslateEvalCentroid(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *val = CI->getArgOperand(DXIL::OperandIndex::kUnarySrc0OpIdx);
   IRBuilder<> Builder(CI);
-  OP::OpCode opcode = OP::OpCode::EvalCentroid; 
+  OP::OpCode opcode = OP::OpCode::EvalCentroid;
   Value *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  Function *evalFunc = hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
+  Function *evalFunc =
+      hlslOP->GetOpFunc(opcode, CI->getType()->getScalarType());
 
-  return TranslateEvalHelper(CI, val, Builder,
-    [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value* {
-      return Builder.CreateCall(evalFunc, { opArg, inputElemID, rowIdx, colIdx });
-    }
-  );
+  return TranslateEvalHelper(
+      CI, val, Builder,
+      [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value * {
+        return Builder.CreateCall(evalFunc,
+                                  {opArg, inputElemID, rowIdx, colIdx});
+      });
 }
 
-Value *TranslateGetAttributeAtVertex(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+/*
+HLSL: bool RWDispatchNodeInputRecord<recordType>::FinishedCrossGroupSharing()
+DXIL: i1 @dx.op.finishedCrossGroupSharing(i32 %Opcode,
+%dx.types.NodeRecordHandle %NodeInputRecordHandle)
+*/
+Value *TranslateNodeFinishedCrossGroupSharing(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *OP = &helper.hlslOP;
+
+  Function *dxilFunc = OP->GetOpFunc(op, Type::getVoidTy(CI->getContext()));
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  DXASSERT_NOMSG(handle->getType() == OP->GetNodeRecordHandleType());
+  Value *opArg = OP->GetU32Const((unsigned)op);
+
+  IRBuilder<> Builder(CI);
+  return Builder.CreateCall(dxilFunc, {opArg, handle});
+}
+
+/*
+HLSL:
+    bool NodeOutput<recordType>::IsValid()
+    bool EmptyNodeOutput::IsValid()
+DXIL:
+  i1 @dx.op.nodeOutputIsValid(i32 %Opcode, %dx.types.NodeHandle
+%NodeOutputHandle)
+*/
+Value *TranslateNodeOutputIsValid(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                                  HLOperationLowerHelper &helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool &Translated) {
+  hlsl::OP *OP = &helper.hlslOP;
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  Function *dxilFunc = OP->GetOpFunc(op, Type::getVoidTy(CI->getContext()));
+  Value *opArg = OP->GetU32Const((unsigned)op);
+
+  IRBuilder<> Builder(CI);
+  return Builder.CreateCall(dxilFunc, {opArg, handle});
+}
+
+Value *TranslateGetAttributeAtVertex(CallInst *CI, IntrinsicOp IOP,
+                                     OP::OpCode op,
                                      HLOperationLowerHelper &helper,
                                      HLObjectOperationLowerHelper *pObjHelper,
                                      bool &Translated) {
@@ -958,19 +1167,149 @@ Value *TranslateGetAttributeAtVertex(CallInst *CI, IntrinsicOp IOP, OP::OpCode o
   IRBuilder<> Builder(CI);
   Value *val = CI->getArgOperand(DXIL::OperandIndex::kBinarySrc0OpIdx);
   Value *vertexIdx = CI->getArgOperand(DXIL::OperandIndex::kBinarySrc1OpIdx);
-  Value *vertexI8Idx = Builder.CreateTrunc(vertexIdx, Type::getInt8Ty(CI->getContext()));
+  Value *vertexI8Idx =
+      Builder.CreateTrunc(vertexIdx, Type::getInt8Ty(CI->getContext()));
   Value *opArg = hlslOP->GetU32Const((unsigned)op);
   Function *evalFunc = hlslOP->GetOpFunc(op, val->getType()->getScalarType());
 
-  return TranslateEvalHelper(CI, val, Builder,
-    [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value* {
-      return Builder.CreateCall(evalFunc, { opArg, inputElemID, rowIdx, colIdx,  vertexI8Idx });
-    }
-  );
+  return TranslateEvalHelper(
+      CI, val, Builder,
+      [&](Value *inputElemID, Value *rowIdx, Value *colIdx) -> Value * {
+        return Builder.CreateCall(
+            evalFunc, {opArg, inputElemID, rowIdx, colIdx, vertexI8Idx});
+      });
+}
+/*
+
+HLSL:
+void Barrier(uint MemoryTypeFlags, uint SemanticFlags)
+void Barrier(Object o, uint SemanticFlags)
+
+All UAVs and/or Node Records by types:
+void @dx.op.barrierByMemoryType(i32 %Opcode,
+  i32 %MemoryTypeFlags, i32 %SemanticFlags)
+
+UAV by handle:
+void @dx.op.barrierByMemoryHandle(i32 %Opcode,
+  %dx.types.Handle %Object, i32 %SemanticFlags)
+
+Node Record by handle:
+void @dx.op.barrierByMemoryHandle(i32 %Opcode,
+  %dx.types.NodeRecordHandle %Object, i32 %SemanticFlags)
+*/
+
+Value *TranslateBarrier(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
+  hlsl::OP *OP = &helper.hlslOP;
+  Value *HandleOrMemoryFlags =
+      CI->getArgOperand(HLOperandIndex::kBarrierMemoryTypeFlagsOpIdx);
+  Value *SemanticFlags =
+      CI->getArgOperand(HLOperandIndex::kBarrierSemanticFlagsOpIdx);
+  IRBuilder<> Builder(CI);
+
+  if (HandleOrMemoryFlags->getType()->isIntegerTy()) {
+    op = OP::OpCode::BarrierByMemoryType;
+  } else if (HandleOrMemoryFlags->getType() == OP->GetHandleType()) {
+    op = OP::OpCode::BarrierByMemoryHandle;
+  } else if (HandleOrMemoryFlags->getType() == OP->GetNodeRecordHandleType()) {
+    op = OP::OpCode::BarrierByNodeRecordHandle;
+  } else {
+    DXASSERT(false, "Shouldn't get here");
+  }
+
+  Function *dxilFunc = OP->GetOpFunc(op, CI->getType());
+  Constant *opArg = OP->GetU32Const((unsigned)op);
+
+  Value *args[] = {opArg, HandleOrMemoryFlags, SemanticFlags};
+
+  Builder.CreateCall(dxilFunc, args);
+  return nullptr;
+}
+
+Value *TranslateGetGroupOrThreadNodeOutputRecords(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool isPerThreadRecord, bool &Translated) {
+  IRBuilder<> Builder(CI);
+  hlsl::OP *OP = &helper.hlslOP;
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  Function *dxilFunc = OP->GetOpFunc(op, Builder.getVoidTy());
+  Value *opArg = OP->GetU32Const((unsigned)op);
+  Value *count =
+      CI->getArgOperand(HLOperandIndex::kAllocateRecordNumRecordsIdx);
+  Value *perThread = OP->GetI1Const(isPerThreadRecord);
+
+  Value *args[] = {opArg, handle, count, perThread};
+
+  return Builder.CreateCall(dxilFunc, args);
+}
+
+/*
+HLSL:
+GroupNodeOutputRecords<recordType>
+NodeOutput<recordType>::GetGroupNodeOutputRecords(uint numRecords); DXIL:
+%dx.types.NodeRecordHandle @dx.op.allocateNodeOutputRecords(i32 %Opcode,
+%dx.types.NodeHandle %NodeOutputHandle, i32 %NumRecords, i1 %PerThread)
+*/
+Value *
+TranslateGetGroupNodeOutputRecords(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                                   HLOperationLowerHelper &helper,
+                                   HLObjectOperationLowerHelper *pObjHelper,
+                                   bool &Translated) {
+  return TranslateGetGroupOrThreadNodeOutputRecords(
+      CI, IOP, op, helper, pObjHelper, /* isPerThreadRecord */ false,
+      Translated);
+}
+
+/*
+HLSL:
+ThreadNodeOutputRecords<recordType>
+NodeOutput<recordType>::GetThreadNodeOutputRecords(uint numRecords) DXIL:
+%dx.types.NodeRecordHandle @dx.op.allocateNodeOutputRecords(i32 %Opcode,
+%dx.types.NodeHandle %NodeOutputHandle, i32 %NumRecords, i1 %PerThread)
+*/
+Value *TranslateGetThreadNodeOutputRecords(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  return TranslateGetGroupOrThreadNodeOutputRecords(
+      CI, IOP, op, helper, pObjHelper, /* isPerThreadRecord */ true,
+      Translated);
+}
+
+/*
+HLSL:
+uint EmptyNodeInput::Count()
+uint GroupNodeInputRecords<recordType>::Count()
+uint RWGroupNodeInputRecords<recordType>::Count()
+
+DXIL:
+i32 @dx.op.getInputRecordCount(i32 %Opcode, %dx.types.NodeRecordHandle
+%NodeInputHandle)
+*/
+Value *
+TranslateNodeGetInputRecordCount(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                                 HLOperationLowerHelper &helper,
+                                 HLObjectOperationLowerHelper *pObjHelper,
+                                 bool &Translated) {
+  hlsl::OP *OP = &helper.hlslOP;
+
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  DXASSERT_NOMSG(handle->getType() == OP->GetNodeRecordHandleType());
+  Function *dxilFunc = OP->GetOpFunc(op, Type::getVoidTy(CI->getContext()));
+  Value *opArg = OP->GetU32Const((unsigned)op);
+  Value *args[] = {opArg, handle};
+
+  IRBuilder<> Builder(CI);
+  return Builder.CreateCall(dxilFunc, args);
 }
 
 Value *TrivialNoArgOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Type *Ty = Type::getVoidTy(CI->getContext());
 
@@ -982,8 +1321,11 @@ Value *TrivialNoArgOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   return dxilOp;
 }
 
-Value *TrivialNoArgWithRetOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TrivialNoArgWithRetOperation(CallInst *CI, IntrinsicOp IOP,
+                                    OP::OpCode opcode,
+                                    HLOperationLowerHelper &helper,
+                                    HLObjectOperationLowerHelper *pObjHelper,
+                                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Type *Ty = CI->getType();
 
@@ -995,8 +1337,24 @@ Value *TrivialNoArgWithRetOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode op
   return dxilOp;
 }
 
+Value *TrivialNoArgWithRetNoOverloadOperation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+  Type *Ty = CI->getType();
+
+  Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
+  Value *args[] = {opArg};
+  IRBuilder<> Builder(CI);
+  return TrivialDxilOperation(opcode, args, Builder.getVoidTy(), Ty, hlslOP,
+                              Builder);
+}
+
 Value *TranslateGetRTSamplePos(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                               HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   OP::OpCode opcode = OP::OpCode::RenderTargetGetSamplePosition;
   IRBuilder<> Builder(CI);
@@ -1019,24 +1377,60 @@ Value *TranslateGetRTSamplePos(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 // val QuadReadLaneAt(val, uint);
-Value *TranslateQuadReadLaneAt(CallInst *CI, IntrinsicOp IOP,
-                                  OP::OpCode opcode,
-                                  HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateQuadReadLaneAt(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *refArgs[] = {nullptr, CI->getOperand(1), CI->getOperand(2)};
   return TrivialDxilOperation(DXIL::OpCode::QuadReadLaneAt, refArgs,
                               CI->getOperand(1)->getType(), CI, hlslOP);
 }
+
+// Quad intrinsics of the form fn(val,QuadOpKind)->val
+Value *TranslateQuadAnyAll(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+  DXIL::QuadVoteOpKind opKind;
+  switch (IOP) {
+  case IntrinsicOp::IOP_QuadAll:
+    opKind = DXIL::QuadVoteOpKind::All;
+    break;
+  case IntrinsicOp::IOP_QuadAny:
+    opKind = DXIL::QuadVoteOpKind::Any;
+    break;
+  default:
+    llvm_unreachable(
+        "QuadAny/QuadAll translation called with wrong isntruction");
+  }
+  Constant *OpArg = hlslOP->GetI8Const((unsigned)opKind);
+  Value *refArgs[] = {nullptr, CI->getOperand(1), OpArg};
+  return TrivialDxilOperation(DXIL::OpCode::QuadVote, refArgs,
+                              CI->getOperand(1)->getType(), CI, hlslOP);
+}
+
 // Wave intrinsics of the form fn(val,QuadOpKind)->val
 Value *TranslateQuadReadAcross(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                               HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   DXIL::QuadOpKind opKind;
   switch (IOP) {
-  case IntrinsicOp::IOP_QuadReadAcrossX: opKind = DXIL::QuadOpKind::ReadAcrossX; break;
-  case IntrinsicOp::IOP_QuadReadAcrossY: opKind = DXIL::QuadOpKind::ReadAcrossY; break;
-  default: DXASSERT_NOMSG(IOP == IntrinsicOp::IOP_QuadReadAcrossDiagonal);
-  case IntrinsicOp::IOP_QuadReadAcrossDiagonal: opKind = DXIL::QuadOpKind::ReadAcrossDiagonal; break;
+  case IntrinsicOp::IOP_QuadReadAcrossX:
+    opKind = DXIL::QuadOpKind::ReadAcrossX;
+    break;
+  case IntrinsicOp::IOP_QuadReadAcrossY:
+    opKind = DXIL::QuadOpKind::ReadAcrossY;
+    break;
+  default:
+    DXASSERT_NOMSG(IOP == IntrinsicOp::IOP_QuadReadAcrossDiagonal);
+    LLVM_FALLTHROUGH;
+  case IntrinsicOp::IOP_QuadReadAcrossDiagonal:
+    opKind = DXIL::QuadOpKind::ReadAcrossDiagonal;
+    break;
   }
   Constant *OpArg = hlslOP->GetI8Const((unsigned)opKind);
   Value *refArgs[] = {nullptr, CI->getOperand(1), OpArg};
@@ -1046,7 +1440,9 @@ Value *TranslateQuadReadAcross(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 
 // WaveAllEqual(val<n>)->bool<n>
 Value *TranslateWaveAllEqual(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src = CI->getArgOperand(HLOperandIndex::kWaveAllEqualValueOpIdx);
   IRBuilder<> Builder(CI);
@@ -1056,11 +1452,23 @@ Value *TranslateWaveAllEqual(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   if (Ty->isVectorTy())
     RetTy = VectorType::get(RetTy, Ty->getVectorNumElements());
 
-  Constant *opArg = hlslOP->GetU32Const((unsigned)DXIL::OpCode::WaveActiveAllEqual);
+  Constant *opArg =
+      hlslOP->GetU32Const((unsigned)DXIL::OpCode::WaveActiveAllEqual);
   Value *args[] = {opArg, src};
 
   return TrivialDxilOperation(DXIL::OpCode::WaveActiveAllEqual, args, Ty, RetTy,
                               hlslOP, Builder);
+}
+
+static Value *TranslateWaveMatchFixReturn(IRBuilder<> &Builder, Type *TargetTy,
+                                          Value *RetVal) {
+  Value *ResVec = UndefValue::get(TargetTy);
+  for (unsigned i = 0; i != 4; ++i) {
+    Value *Elt = Builder.CreateExtractValue(RetVal, i);
+    ResVec = Builder.CreateInsertElement(ResVec, Elt, i);
+  }
+
+  return ResVec;
 }
 
 // WaveMatch(val<n>)->uint4
@@ -1071,69 +1479,70 @@ Value *TranslateWaveMatch(CallInst *CI, IntrinsicOp IOP, OP::OpCode Opc,
   hlsl::OP *Op = &Helper.hlslOP;
   IRBuilder<> Builder(CI);
 
+  Value *Val = CI->getArgOperand(1);
+  Type *ValTy = Val->getType();
+  Type *EltTy = ValTy->getScalarType();
+  Constant *OpcArg = Op->GetU32Const((unsigned)DXIL::OpCode::WaveMatch);
+
+  // If we don't need to scalarize, just emit the call and exit
+  const bool Scalarize =
+      ValTy->isVectorTy() &&
+      !Op->GetModule()->GetHLModule().GetShaderModel()->IsSM69Plus();
+  if (!Scalarize) {
+    Value *Fn = Op->GetOpFunc(OP::OpCode::WaveMatch, ValTy);
+    Value *Args[] = {OpcArg, Val};
+    Value *Ret = Builder.CreateCall(Fn, Args);
+    return TranslateWaveMatchFixReturn(Builder, CI->getType(), Ret);
+  }
+
   // Generate a dx.op.waveMatch call for each scalar in the input, and perform
-  // a bitwise AND between each result to derive the final bitmask in the case
-  // of vector inputs.
+  // a bitwise AND between each result to derive the final bitmask
 
   // (1) Collect the list of all scalar inputs (e.g. decompose vectors)
   SmallVector<Value *, 4> ScalarInputs;
 
-  Value *Val = CI->getArgOperand(1);
-  Type *ValTy = Val->getType();
-  Type *EltTy = ValTy->getScalarType();
-
-  if (ValTy->isVectorTy()) {
-    for (uint64_t i = 0, e = ValTy->getVectorNumElements(); i != e; ++i) {
-      Value *Elt = Builder.CreateExtractElement(Val, i);
-      ScalarInputs.push_back(Elt);
-    }
-  } else {
-    ScalarInputs.push_back(Val);
+  for (uint64_t I = 0, E = ValTy->getVectorNumElements(); I != E; ++I) {
+    Value *Elt = Builder.CreateExtractElement(Val, I);
+    ScalarInputs.push_back(Elt);
   }
-
-  Value *Res = nullptr;
-  Constant *OpcArg = Op->GetU32Const((unsigned)DXIL::OpCode::WaveMatch);
-  Value *Fn = Op->GetOpFunc(OP::OpCode::WaveMatch, EltTy);
 
   // (2) For each scalar, emit a call to dx.op.waveMatch. If this is not the
   // first scalar, then AND the result with the accumulator.
-  for (unsigned i = 0, e = ScalarInputs.size(); i != e; ++i) {
-    Value *Args[] = { OpcArg, ScalarInputs[i] };
+  Value *Fn = Op->GetOpFunc(OP::OpCode::WaveMatch, EltTy);
+  Value *Args[] = {OpcArg, ScalarInputs[0]};
+  Value *Res = Builder.CreateCall(Fn, Args);
+
+  for (unsigned I = 1, E = ScalarInputs.size(); I != E; ++I) {
+    Value *Args[] = {OpcArg, ScalarInputs[I]};
     Value *Call = Builder.CreateCall(Fn, Args);
 
-    if (Res) {
-      // Generate bitwise AND of the components
-      for (unsigned j = 0; j != 4; ++j) {
-        Value *ResVal = Builder.CreateExtractValue(Res, j);
-        Value *CallVal = Builder.CreateExtractValue(Call, j);
-        Value *And = Builder.CreateAnd(ResVal, CallVal);
-        Res = Builder.CreateInsertValue(Res, And, j);
-      }
-    } else {
-      Res = Call;
+    // Generate bitwise AND of the components
+    for (unsigned J = 0; J != 4; ++J) {
+      Value *ResVal = Builder.CreateExtractValue(Res, J);
+      Value *CallVal = Builder.CreateExtractValue(Call, J);
+      Value *And = Builder.CreateAnd(ResVal, CallVal);
+      Res = Builder.CreateInsertValue(Res, And, J);
     }
   }
 
   // (3) Convert the final aggregate into a vector to make the types match
-  Value *ResVec = UndefValue::get(CI->getType());
-  for (unsigned i = 0; i != 4; ++i) {
-    Value *Elt = Builder.CreateExtractValue(Res, i);
-    ResVec = Builder.CreateInsertElement(ResVec, Elt, i);
-  }
-
-  return ResVec;
+  return TranslateWaveMatchFixReturn(Builder, CI->getType(), Res);
 }
 
 // Wave intrinsics of the form fn(valA)->valB, where no overloading takes place
 Value *TranslateWaveA2B(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *refArgs[] = {nullptr, CI->getOperand(1)};
   return TrivialDxilOperation(opcode, refArgs, helper.voidTy, CI, hlslOP);
 }
 // Wave ballot intrinsic.
 Value *TranslateWaveBallot(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   // The high-level operation is uint4 ballot(i1).
   // The DXIL operation is struct.u4 ballot(i1).
   // To avoid updating users with more than a simple replace, we translate into
@@ -1144,9 +1553,11 @@ Value *TranslateWaveBallot(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   // Make the DXIL call itself.
   hlsl::OP *hlslOP = &helper.hlslOP;
   Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  Value *refArgs[] = { opArg, CI->getOperand(1) };
-  Function *dxilFunc = hlslOP->GetOpFunc(opcode, Type::getVoidTy(CI->getContext()));
-  Value *dxilVal = B.CreateCall(dxilFunc, refArgs, hlslOP->GetOpCodeName(opcode));
+  Value *refArgs[] = {opArg, CI->getOperand(1)};
+  Function *dxilFunc =
+      hlslOP->GetOpFunc(opcode, Type::getVoidTy(CI->getContext()));
+  Value *dxilVal =
+      B.CreateCall(dxilFunc, refArgs, hlslOP->GetOpCodeName(opcode));
 
   // Assign from the call results into a vector.
   Type *ResTy = CI->getType();
@@ -1225,7 +1636,7 @@ static unsigned WaveIntrinsicToOpKind(IntrinsicOp IOP) {
     return (unsigned)DXIL::WaveMultiPrefixOpKind::Sum;
   default:
     DXASSERT(IOP == IntrinsicOp::IOP_WaveActiveProduct ||
-             IOP == IntrinsicOp::IOP_WaveActiveUProduct,
+                 IOP == IntrinsicOp::IOP_WaveActiveUProduct,
              "else caller passed incorrect value");
     return (unsigned)DXIL::WaveOpKind::Product;
   }
@@ -1267,8 +1678,8 @@ Value *TranslateWaveMultiPrefix(CallInst *CI, IntrinsicOp IOP, OP::OpCode Opc,
   Value *Mask2 = Builder.CreateExtractElement(Mask, (uint64_t)2);
   Value *Mask3 = Builder.CreateExtractElement(Mask, (uint64_t)3);
 
-  Value *Args[] = { nullptr, CI->getOperand(1),
-                    Mask0, Mask1, Mask2, Mask3, KindValInt, SignValInt };
+  Value *Args[] = {nullptr, CI->getOperand(1), Mask0,     Mask1, Mask2,
+                   Mask3,   KindValInt,        SignValInt};
 
   return TrivialDxilOperation(Opc, Args, CI->getOperand(1)->getType(), CI, Op);
 }
@@ -1289,14 +1700,16 @@ Value *TranslateWaveMultiPrefixBitCount(CallInst *CI, IntrinsicOp IOP,
   Value *Mask2 = Builder.CreateExtractElement(Mask, (uint64_t)2);
   Value *Mask3 = Builder.CreateExtractElement(Mask, (uint64_t)3);
 
-  Value *Args[] = { nullptr, CI->getOperand(1), Mask0, Mask1, Mask2, Mask3 };
+  Value *Args[] = {nullptr, CI->getOperand(1), Mask0, Mask1, Mask2, Mask3};
 
   return TrivialDxilOperation(Opc, Args, Helper.voidTy, CI, Op);
 }
 
 // Wave intrinsics of the form fn()->val
 Value *TranslateWaveToVal(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                          HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                          HLOperationLowerHelper &helper,
+                          HLObjectOperationLowerHelper *pObjHelper,
+                          bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *refArgs[] = {nullptr};
   return TrivialDxilOperation(opcode, refArgs, helper.voidTy, CI, hlslOP);
@@ -1304,7 +1717,9 @@ Value *TranslateWaveToVal(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 
 // Wave intrinsics of the form fn(val,lane)->val
 Value *TranslateWaveReadLaneAt(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                               HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *refArgs[] = {nullptr, CI->getOperand(1), CI->getOperand(2)};
   return TrivialDxilOperation(DXIL::OpCode::WaveReadLaneAt, refArgs,
@@ -1314,7 +1729,9 @@ Value *TranslateWaveReadLaneAt(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 // Wave intrinsics of the form fn(val)->val
 Value *TranslateWaveReadLaneFirst(CallInst *CI, IntrinsicOp IOP,
                                   OP::OpCode opcode,
-                                  HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                  HLOperationLowerHelper &helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *refArgs[] = {nullptr, CI->getOperand(1)};
   return TrivialDxilOperation(DXIL::OpCode::WaveReadLaneFirst, refArgs,
@@ -1322,25 +1739,41 @@ Value *TranslateWaveReadLaneFirst(CallInst *CI, IntrinsicOp IOP,
 }
 
 Value *TranslateAbs(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Type *pOverloadTy = CI->getType()->getScalarType();
   if (pOverloadTy->isFloatingPointTy()) {
     Value *refArgs[] = {nullptr, CI->getOperand(1)};
     return TrivialDxilOperation(DXIL::OpCode::FAbs, refArgs, CI->getType(), CI,
                                 hlslOP);
-  } else {
-    Value *src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
-    IRBuilder<> Builder(CI);
-    Value *neg = Builder.CreateNeg(src);
-    return TrivialDxilBinaryOperation(DXIL::OpCode::IMax, src, neg, hlslOP,
-                                      Builder);
   }
+
+  Value *src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
+  IRBuilder<> Builder(CI);
+  Value *neg = Builder.CreateNeg(src);
+  return TrivialDxilBinaryOperation(DXIL::OpCode::IMax, src, neg, hlslOP,
+                                    Builder);
 }
 
 Value *TranslateUAbs(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   return CI->getOperand(HLOperandIndex::kUnaryOpSrc0Idx); // No-op
+}
+
+Value *GenerateVectorCmpNEZero(Value *Val, IRBuilder<> Builder) {
+  Type *Ty = Val->getType();
+  Type *EltTy = Ty->getScalarType();
+
+  Value *ZeroInit = ConstantAggregateZero::get(Ty);
+
+  if (EltTy->isFloatingPointTy())
+    return Builder.CreateFCmpUNE(Val, ZeroInit);
+
+  return Builder.CreateICmpNE(Val, ZeroInit);
 }
 
 Value *GenerateCmpNEZero(Value *val, IRBuilder<> Builder) {
@@ -1353,64 +1786,97 @@ Value *GenerateCmpNEZero(Value *val, IRBuilder<> Builder) {
   else
     zero = ConstantInt::get(EltTy, 0);
 
-  if (Ty != EltTy) {
+  if (Ty != EltTy)
     zero = ConstantVector::getSplat(Ty->getVectorNumElements(), zero);
-  }
 
   if (EltTy->isFloatingPointTy())
     return Builder.CreateFCmpUNE(val, zero);
-  else
-    return Builder.CreateICmpNE(val, zero);
+
+  return Builder.CreateICmpNE(val, zero);
 }
 
-Value *TranslateAllForValue(Value *val, IRBuilder<> &Builder) {
-  Value *cond = GenerateCmpNEZero(val, Builder);
-
-  Type *Ty = val->getType();
-  Type *EltTy = Ty->getScalarType();
-
-  if (Ty != EltTy) {
-    Value *Result = Builder.CreateExtractElement(cond, (uint64_t)0);
-    for (unsigned i = 1; i < Ty->getVectorNumElements(); i++) {
-      Value *Elt = Builder.CreateExtractElement(cond, i);
-      Result = Builder.CreateAnd(Result, Elt);
-    }
-    return Result;
-  } else
-    return cond;
-}
-
-Value *TranslateAll(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
-  Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
-  IRBuilder<> Builder(CI);
-  return TranslateAllForValue(val, Builder);
-}
-
-Value *TranslateAny(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
-  Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
-
+Value *TranslateBitwisePredicate(CallInst *CI, IntrinsicOp IOP,
+                                 hlsl::OP *HlslOP) {
+  Value *Arg = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
 
-  Value *cond = GenerateCmpNEZero(val, Builder);
-
-  Type *Ty = val->getType();
+  Type *Ty = Arg->getType();
   Type *EltTy = Ty->getScalarType();
 
-  if (Ty != EltTy) {
-    Value *Result = Builder.CreateExtractElement(cond, (uint64_t)0);
-    for (unsigned i = 1; i < Ty->getVectorNumElements(); i++) {
-      Value *Elt = Builder.CreateExtractElement(cond, i);
-      Result = Builder.CreateOr(Result, Elt);
+  if (Ty == EltTy)
+    return GenerateCmpNEZero(Arg, Builder);
+
+  if (HlslOP->GetModule()->GetHLModule().GetShaderModel()->IsSM69Plus()) {
+    DXIL::OpCode ReduceOp = DXIL::OpCode::VectorReduceAnd;
+    switch (IOP) {
+    case IntrinsicOp::IOP_all:
+      ReduceOp = DXIL::OpCode::VectorReduceAnd;
+      break;
+    case IntrinsicOp::IOP_any:
+      ReduceOp = DXIL::OpCode::VectorReduceOr;
+      break;
+    default:
+      assert(false && "Unexpected reduction IOP");
+      break;
     }
-    return Result;
-  } else
-    return cond;
+
+    // Compare each element to zero
+    Value *VecCmpZero = GenerateVectorCmpNEZero(Arg, Builder);
+    Type *VecCmpTy = VecCmpZero->getType();
+
+    // Reduce the vector with the appropiate op
+    Constant *OpArg = HlslOP->GetU32Const((unsigned)ReduceOp);
+    Value *Args[] = {OpArg, VecCmpZero};
+    Function *DxilFunc = HlslOP->GetOpFunc(ReduceOp, VecCmpTy);
+    return TrivialDxilVectorOperation(DxilFunc, ReduceOp, Args, VecCmpTy,
+                                      HlslOP, Builder);
+  }
+
+  SmallVector<Value *, 4> EltIsNEZero;
+  for (unsigned I = 0; I < Ty->getVectorNumElements(); I++) {
+    Value *Elt = Builder.CreateExtractElement(Arg, I);
+    Elt = GenerateCmpNEZero(Elt, Builder);
+    EltIsNEZero.push_back(Elt);
+  }
+
+  // and/or the components together
+  Value *Reduce = EltIsNEZero[0];
+  for (unsigned I = 1; I < EltIsNEZero.size(); I++) {
+    Value *Elt = EltIsNEZero[I];
+    switch (IOP) {
+    case IntrinsicOp::IOP_all:
+      Reduce = Builder.CreateAnd(Reduce, Elt);
+      break;
+    case IntrinsicOp::IOP_any:
+      Reduce = Builder.CreateOr(Reduce, Elt);
+      break;
+    default:
+      assert(false && "Unexpected reduction IOP");
+      break;
+    }
+  }
+
+  return Reduce;
+}
+
+Value *TranslateAll(CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+                    HLOperationLowerHelper &Helper,
+                    HLObjectOperationLowerHelper *PObjHelper,
+                    bool &Translated) {
+  return TranslateBitwisePredicate(CI, IOP, &Helper.hlslOP);
+}
+
+Value *TranslateAny(CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+                    HLOperationLowerHelper &Helper,
+                    HLObjectOperationLowerHelper *PObjHelper,
+                    bool &Translated) {
+  return TranslateBitwisePredicate(CI, IOP, &Helper.hlslOP);
 }
 
 Value *TranslateBitcast(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   Type *Ty = CI->getType();
   Value *op = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
@@ -1425,7 +1891,6 @@ Value *TranslateDoubleAsUint(Value *x, Value *lo, Value *hi,
 
   Function *dxilFunc = hlslOP->GetOpFunc(opcode, Ty->getScalarType());
   Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
-
 
   if (Ty->isVectorTy()) {
     Value *retValLo = llvm::UndefValue::get(outTy);
@@ -1459,33 +1924,37 @@ Value *TranslateAsUint(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
                        HLOperationLowerHelper &helper,
                        HLObjectOperationLowerHelper *pObjHelper,
                        bool &Translated) {
-  if (CI->getNumArgOperands() == 2) {
+  if (CI->getNumArgOperands() == 2)
     return TranslateBitcast(CI, IOP, opcode, helper, pObjHelper, Translated);
-  } else {
-    DXASSERT_NOMSG(CI->getNumArgOperands() == 4);
-    hlsl::OP *hlslOP = &helper.hlslOP;
-    Value *x = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
-    DXASSERT_NOMSG(x->getType()->getScalarType()->isDoubleTy());
-    Value *lo = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
-    Value *hi = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc2Idx);
-    IRBuilder<> Builder(CI);
-    return TranslateDoubleAsUint(x, lo, hi, Builder, hlslOP);
-  }
+
+  DXASSERT_NOMSG(CI->getNumArgOperands() == 4);
+  hlsl::OP *hlslOP = &helper.hlslOP;
+  Value *x = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
+  DXASSERT_NOMSG(x->getType()->getScalarType()->isDoubleTy());
+  Value *lo = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
+  Value *hi = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc2Idx);
+  IRBuilder<> Builder(CI);
+  return TranslateDoubleAsUint(x, lo, hi, Builder, hlslOP);
 }
 
 Value *TranslateAsDouble(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                         HLOperationLowerHelper &helper,
+                         HLObjectOperationLowerHelper *pObjHelper,
+                         bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *y = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
 
   Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
   IRBuilder<> Builder(CI);
-  return TrivialDxilOperation(opcode, { opArg, x, y }, CI->getType(), CI->getType(), hlslOP, Builder);
+  return TrivialDxilOperation(opcode, {opArg, x, y}, CI->getType(),
+                              CI->getType(), hlslOP, Builder);
 }
 
 Value *TranslateAtan2(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *y = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1537,7 +2006,9 @@ Value *TranslateAtan2(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateClamp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Type *Ty = CI->getType();
   Type *EltTy = Ty->getScalarType();
@@ -1563,7 +2034,9 @@ Value *TranslateClamp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateClip(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Function *discard =
       hlslOP->GetOpFunc(OP::OpCode::Discard, Type::getVoidTy(CI->getContext()));
@@ -1593,7 +2066,9 @@ Value *TranslateClip(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateCross(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   VectorType *VT = cast<VectorType>(CI->getType());
   DXASSERT_NOMSG(VT->getNumElements() == 3);
 
@@ -1627,7 +2102,9 @@ Value *TranslateCross(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateDegrees(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   IRBuilder<> Builder(CI);
   Type *Ty = CI->getType();
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
@@ -1641,7 +2118,9 @@ Value *TranslateDegrees(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateDst(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   Type *Ty = src1->getType();
@@ -1668,46 +2147,64 @@ Value *TranslateFirstbitHi(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
                            HLOperationLowerHelper &helper,
                            HLObjectOperationLowerHelper *pObjHelper,
                            bool &Translated) {
-  Value *firstbitHi =
-      TrivialUnaryOperation(CI, IOP, opcode, helper, pObjHelper, Translated);
-  // firstbitHi == -1? -1 : (bitWidth-1 -firstbitHi);
+  hlsl::OP *OP = &helper.hlslOP;
   IRBuilder<> Builder(CI);
-  Constant *neg1 = Builder.getInt32(-1);
-  Value *src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
+  Value *Src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
 
-  Type *Ty = src->getType();
-  IntegerType *EltTy = cast<IntegerType>(Ty->getScalarType());
-  Constant *bitWidth = Builder.getInt32(EltTy->getBitWidth()-1);
-
-  if (Ty == Ty->getScalarType()) {
-    Value *sub = Builder.CreateSub(bitWidth, firstbitHi);
-    Value *cond = Builder.CreateICmpEQ(neg1, firstbitHi);
-    return Builder.CreateSelect(cond, neg1, sub);
-  } else {
-    Value *result = UndefValue::get(CI->getType());
-    unsigned vecSize = Ty->getVectorNumElements();
-    for (unsigned i = 0; i < vecSize; i++) {
-      Value *EltFirstBit = Builder.CreateExtractElement(firstbitHi, i);
-      Value *sub = Builder.CreateSub(bitWidth, EltFirstBit);
-      Value *cond = Builder.CreateICmpEQ(neg1, EltFirstBit);
-      Value *Elt = Builder.CreateSelect(cond, neg1, sub);
-      result = Builder.CreateInsertElement(result, Elt, i);
-    }
-    return result;
+  Type *Ty = Src->getType();
+  Type *RetTy = Type::getInt32Ty(CI->getContext());
+  unsigned NumElements = 0;
+  if (Ty->isVectorTy()) {
+    NumElements = Ty->getVectorNumElements();
+    RetTy = VectorType::get(RetTy, NumElements);
   }
+
+  Constant *OpArg = OP->GetU32Const((unsigned)opcode);
+  Value *Args[] = {OpArg, Src};
+
+  Value *FirstbitHi =
+      TrivialDxilOperation(opcode, Args, Ty, RetTy, OP, Builder);
+
+  IntegerType *EltTy = cast<IntegerType>(Ty->getScalarType());
+  Constant *Neg1 = Builder.getInt32(-1);
+  Constant *BitWidth = Builder.getInt32(EltTy->getBitWidth() - 1);
+
+  if (NumElements > 0) {
+    Neg1 = ConstantVector::getSplat(NumElements, Neg1);
+    BitWidth = ConstantVector::getSplat(NumElements, BitWidth);
+  }
+
+  Value *Sub = Builder.CreateSub(BitWidth, FirstbitHi);
+  Value *Cond = Builder.CreateICmpEQ(Neg1, FirstbitHi);
+  return Builder.CreateSelect(Cond, Neg1, Sub);
 }
 
 Value *TranslateFirstbitLo(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
                            HLOperationLowerHelper &helper,
                            HLObjectOperationLowerHelper *pObjHelper,
                            bool &Translated) {
-  Value *firstbitLo =
-      TrivialUnaryOperation(CI, IOP, opcode, helper, pObjHelper, Translated);
-  return firstbitLo;
+  hlsl::OP *OP = &helper.hlslOP;
+  IRBuilder<> Builder(CI);
+  Value *Src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
+
+  Type *Ty = Src->getType();
+  Type *RetTy = Type::getInt32Ty(CI->getContext());
+  if (Ty->isVectorTy())
+    RetTy = VectorType::get(RetTy, Ty->getVectorNumElements());
+
+  Constant *OpArg = OP->GetU32Const((unsigned)opcode);
+  Value *Args[] = {OpArg, Src};
+
+  Value *FirstbitLo =
+      TrivialDxilOperation(opcode, Args, Ty, RetTy, OP, Builder);
+
+  return FirstbitLo;
 }
 
 Value *TranslateLit(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   Value *n_dot_l = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
   Value *n_dot_h = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
   Value *m = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc2Idx);
@@ -1729,15 +2226,19 @@ Value *TranslateLit(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   // specular = ((n_dot_l < 0) || (n_dot_h < 0)) ? 0: (n_dot_h ^ m).
   Value *nhCmp = Builder.CreateFCmpOLT(n_dot_h, zeroConst);
   Value *specCond = Builder.CreateOr(nlCmp, nhCmp);
-  bool isFXCCompatMode = CI->getModule()->GetHLModule().GetHLOptions().bFXCCompatMode;
-  Value *nhPowM = TranslatePowImpl(&helper.hlslOP, Builder, n_dot_h, m, isFXCCompatMode);
+  bool isFXCCompatMode =
+      CI->getModule()->GetHLModule().GetHLOptions().bFXCCompatMode;
+  Value *nhPowM =
+      TranslatePowImpl(&helper.hlslOP, Builder, n_dot_h, m, isFXCCompatMode);
   Value *spec = Builder.CreateSelect(specCond, zeroConst, nhPowM);
   Result = Builder.CreateInsertElement(Result, spec, 2);
   return Result;
 }
 
 Value *TranslateRadians(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   IRBuilder<> Builder(CI);
   Type *Ty = CI->getType();
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
@@ -1751,28 +2252,30 @@ Value *TranslateRadians(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateF16ToF32(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                         HLOperationLowerHelper &helper,
+                         HLObjectOperationLowerHelper *pObjHelper,
+                         bool &Translated) {
   IRBuilder<> Builder(CI);
 
   Value *x = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *Ty = CI->getType();
 
-  Function *f16tof32 =
-      helper.hlslOP.GetOpFunc(opcode, helper.voidTy);
+  Function *f16tof32 = helper.hlslOP.GetOpFunc(opcode, helper.voidTy);
   return TrivialDxilOperation(
       f16tof32, opcode, {Builder.getInt32(static_cast<unsigned>(opcode)), x},
       x->getType(), Ty, &helper.hlslOP, Builder);
 }
 
 Value *TranslateF32ToF16(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                         HLOperationLowerHelper &helper,
+                         HLObjectOperationLowerHelper *pObjHelper,
+                         bool &Translated) {
   IRBuilder<> Builder(CI);
 
   Value *x = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *Ty = CI->getType();
 
-  Function *f32tof16 =
-      helper.hlslOP.GetOpFunc(opcode, helper.voidTy);
+  Function *f32tof16 = helper.hlslOP.GetOpFunc(opcode, helper.voidTy);
   return TrivialDxilOperation(
       f32tof16, opcode, {Builder.getInt32(static_cast<unsigned>(opcode)), x},
       x->getType(), Ty, &helper.hlslOP, Builder);
@@ -1807,14 +2310,18 @@ Value *TranslateLength(CallInst *CI, Value *val, hlsl::OP *hlslOP) {
 }
 
 Value *TranslateLength(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                       HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   return TranslateLength(CI, val, hlslOP);
 }
 
 Value *TranslateModF(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *val = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *outIntPtr = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1827,7 +2334,9 @@ Value *TranslateModF(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateDistance(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                         HLOperationLowerHelper &helper,
+                         HLObjectOperationLowerHelper *pObjHelper,
+                         bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1837,7 +2346,9 @@ Value *TranslateDistance(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateExp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   IRBuilder<> Builder(CI);
   Type *Ty = CI->getType();
@@ -1853,7 +2364,9 @@ Value *TranslateExp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateLog(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   IRBuilder<> Builder(CI);
   Type *Ty = CI->getType();
@@ -1868,7 +2381,9 @@ Value *TranslateLog(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateLog10(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   IRBuilder<> Builder(CI);
   Type *Ty = CI->getType();
@@ -1884,7 +2399,9 @@ Value *TranslateLog10(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateFMod(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1902,7 +2419,9 @@ Value *TranslateFMod(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateFUIBinary(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                          HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                          HLOperationLowerHelper &helper,
+                          HLObjectOperationLowerHelper *pObjHelper,
+                          bool &Translated) {
   bool isFloat = CI->getType()->getScalarType()->isFloatingPointTy();
   if (isFloat) {
     switch (IOP) {
@@ -1916,11 +2435,14 @@ Value *TranslateFUIBinary(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
       break;
     }
   }
-  return TrivialBinaryOperation(CI, IOP, opcode, helper, pObjHelper, Translated);
+  return TrivialBinaryOperation(CI, IOP, opcode, helper, pObjHelper,
+                                Translated);
 }
 
 Value *TranslateFUITrinary(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                           HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   bool isFloat = CI->getType()->getScalarType()->isFloatingPointTy();
   if (isFloat) {
     switch (IOP) {
@@ -1931,11 +2453,14 @@ Value *TranslateFUITrinary(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
       break;
     }
   }
-  return TrivialTrinaryOperation(CI, IOP, opcode, helper, pObjHelper, Translated);
+  return TrivialTrinaryOperation(CI, IOP, opcode, helper, pObjHelper,
+                                 Translated);
 }
 
 Value *TranslateFrexp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *val = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *expPtr = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1987,7 +2512,9 @@ Value *TranslateFrexp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateLdExp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -1998,7 +2525,9 @@ Value *TranslateLdExp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateFWidth(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                       HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
@@ -2014,7 +2543,9 @@ Value *TranslateFWidth(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateLerp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   // x + s(y-x)
   Value *x = CI->getArgOperand(HLOperandIndex::kLerpOpXIdx);
   Value *y = CI->getArgOperand(HLOperandIndex::kLerpOpYIdx);
@@ -2025,9 +2556,8 @@ Value *TranslateLerp(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   return Builder.CreateFAdd(x, sMulSub);
 }
 
-Value *TrivialDotOperation(OP::OpCode opcode, Value *src0,
-                           Value *src1, hlsl::OP *hlslOP,
-                           IRBuilder<> &Builder) {
+Value *TrivialDotOperation(OP::OpCode opcode, Value *src0, Value *src1,
+                           hlsl::OP *hlslOP, IRBuilder<> &Builder) {
   Type *Ty = src0->getType()->getScalarType();
   Function *dxilFunc = hlslOP->GetOpFunc(opcode, Ty);
   Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
@@ -2046,15 +2576,23 @@ Value *TrivialDotOperation(OP::OpCode opcode, Value *src0,
   return dotOP;
 }
 
-Value *TranslateIDot(Value *arg0, Value *arg1, unsigned vecSize, hlsl::OP *hlslOP, IRBuilder<> &Builder, bool Unsigned = false) {
-  auto madOpCode = Unsigned ? DXIL::OpCode::UMad : DXIL::OpCode::IMad;
+// Instead of using a DXIL intrinsic, implement a dot product operation using
+// multiply and add operations. Used for integer dots and long vectors.
+Value *ExpandDot(Value *arg0, Value *arg1, unsigned vecSize, hlsl::OP *hlslOP,
+                 IRBuilder<> &Builder,
+                 DXIL::OpCode MadOpCode = DXIL::OpCode::IMad) {
   Value *Elt0 = Builder.CreateExtractElement(arg0, (uint64_t)0);
   Value *Elt1 = Builder.CreateExtractElement(arg1, (uint64_t)0);
-  Value *Result = Builder.CreateMul(Elt0, Elt1);
-  for (unsigned iVecElt = 1; iVecElt < vecSize; ++iVecElt) {
-    Elt0 = Builder.CreateExtractElement(arg0, iVecElt);
-    Elt1 = Builder.CreateExtractElement(arg1, iVecElt);
-    Result = TrivialDxilTrinaryOperation(madOpCode, Elt0, Elt1, Result, hlslOP, Builder);
+  Value *Result;
+  if (Elt0->getType()->isFloatingPointTy())
+    Result = Builder.CreateFMul(Elt0, Elt1);
+  else
+    Result = Builder.CreateMul(Elt0, Elt1);
+  for (unsigned Elt = 1; Elt < vecSize; ++Elt) {
+    Elt0 = Builder.CreateExtractElement(arg0, Elt);
+    Elt1 = Builder.CreateExtractElement(arg1, Elt);
+    Result = TrivialDxilTrinaryOperation(MadOpCode, Elt0, Elt1, Result, hlslOP,
+                                         Builder);
   }
 
   return Result;
@@ -2083,18 +2621,40 @@ Value *TranslateFDot(Value *arg0, Value *arg1, unsigned vecSize,
 }
 
 Value *TranslateDot(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *arg0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Type *Ty = arg0->getType();
+  Type *EltTy = Ty->getScalarType();
+
+  // SM6.9 introduced a DXIL operation for vectorized dot product
+  // The operation is only advantageous for vect size>1, vec1s will be
+  // lowered to a single Mul.
+  if (hlslOP->GetModule()->GetHLModule().GetShaderModel()->IsSM69Plus() &&
+      EltTy->isFloatingPointTy() && Ty->getVectorNumElements() > 1) {
+    Value *arg1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
+    IRBuilder<> Builder(CI);
+    Constant *opArg = hlslOP->GetU32Const((unsigned)DXIL::OpCode::FDot);
+    Value *args[] = {opArg, arg0, arg1};
+    Function *dxilFunc = hlslOP->GetOpFunc(DXIL::OpCode::FDot, Ty);
+    return TrivialDxilVectorOperation(dxilFunc, DXIL::OpCode::FDot, args, Ty,
+                                      hlslOP, Builder);
+  }
+
   unsigned vecSize = Ty->getVectorNumElements();
   Value *arg1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   IRBuilder<> Builder(CI);
-  if (Ty->getScalarType()->isFloatingPointTy()) {
+  if (EltTy->isFloatingPointTy() && Ty->getVectorNumElements() <= 4)
     return TranslateFDot(arg0, arg1, vecSize, hlslOP, Builder);
-  } else {
-    return TranslateIDot(arg0, arg1, vecSize, hlslOP, Builder);
-  }
+
+  DXIL::OpCode MadOpCode = DXIL::OpCode::IMad;
+  if (IOP == IntrinsicOp::IOP_udot)
+    MadOpCode = DXIL::OpCode::UMad;
+  else if (EltTy->isFloatingPointTy())
+    MadOpCode = DXIL::OpCode::FMad;
+  return ExpandDot(arg0, arg1, vecSize, hlslOP, Builder, MadOpCode);
 }
 
 Value *TranslateNormalize(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
@@ -2122,7 +2682,9 @@ Value *TranslateNormalize(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateReflect(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   //  v = i - 2 * n * dot(i, n).
   IRBuilder<> Builder(CI);
@@ -2133,7 +2695,7 @@ Value *TranslateReflect(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
   unsigned vecSize = VT->getNumElements();
   Value *dot = TranslateFDot(i, n, vecSize, hlslOP, Builder);
   // 2 * dot (i, n).
-  dot = Builder.CreateFMul(hlslOP->GetFloatConst(2), dot);
+  dot = Builder.CreateFMul(ConstantFP::get(dot->getType(), 2.0), dot);
   // 2 * n * dot(i, n).
   Value *vecDot = Builder.CreateVectorSplat(vecSize, dot);
   Value *nMulDot = Builder.CreateFMul(vecDot, n);
@@ -2142,7 +2704,9 @@ Value *TranslateReflect(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *TranslateRefract(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                        HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                        HLOperationLowerHelper &helper,
+                        HLObjectOperationLowerHelper *pObjHelper,
+                        bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   //  d = dot(i, n);
   //  t = 1 - eta * eta * ( 1 - d*d);
@@ -2193,7 +2757,9 @@ Value *TranslateRefract(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *TranslateSmoothStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                           HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   // s = saturate((x-min)/(max-min)).
   IRBuilder<> Builder(CI);
@@ -2207,8 +2773,8 @@ Value *TranslateSmoothStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   Value *s = TrivialDxilUnaryOperation(DXIL::OpCode::Saturate, satVal, hlslOP,
                                        Builder);
   // return s * s *(3-2*s).
-  Constant *c2 = ConstantFP::get(CI->getType(),2);
-  Constant *c3 = ConstantFP::get(CI->getType(),3);
+  Constant *c2 = ConstantFP::get(CI->getType(), 2);
+  Constant *c3 = ConstantFP::get(CI->getType(), 3);
 
   Value *sMul2 = Builder.CreateFMul(s, c2);
   Value *result = Builder.CreateFSub(c3, sMul2);
@@ -2218,7 +2784,9 @@ Value *TranslateSmoothStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateMSad4(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *ref = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
   Value *src = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
@@ -2273,7 +2841,9 @@ Value *TranslateMSad4(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateRCP(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   Type *Ty = CI->getType();
   Value *op = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   IRBuilder<> Builder(CI);
@@ -2285,22 +2855,28 @@ Value *TranslateRCP(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateSign(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *Ty = val->getType();
   bool IsInt = Ty->getScalarType()->isIntegerTy();
 
   IRBuilder<> Builder(CI);
   Constant *zero = Constant::getNullValue(Ty);
-  Value *zeroLtVal = IsInt ? Builder.CreateICmpSLT(zero, val) : Builder.CreateFCmpOLT(zero, val);
-  Value *valLtZero = IsInt ? Builder.CreateICmpSLT(val, zero) : Builder.CreateFCmpOLT(val, zero);
+  Value *zeroLtVal = IsInt ? Builder.CreateICmpSLT(zero, val)
+                           : Builder.CreateFCmpOLT(zero, val);
+  Value *valLtZero = IsInt ? Builder.CreateICmpSLT(val, zero)
+                           : Builder.CreateFCmpOLT(val, zero);
   zeroLtVal = Builder.CreateZExt(zeroLtVal, CI->getType());
   valLtZero = Builder.CreateZExt(valLtZero, CI->getType());
   return Builder.CreateSub(zeroLtVal, valLtZero);
 }
 
 Value *TranslateUSign(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                      HLOperationLowerHelper &helper,
+                      HLObjectOperationLowerHelper *pObjHelper,
+                      bool &Translated) {
   Value *val = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
   Type *Ty = val->getType();
 
@@ -2311,7 +2887,9 @@ Value *TranslateUSign(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslateStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                     HLOperationLowerHelper &helper,
+                     HLObjectOperationLowerHelper *pObjHelper,
+                     bool &Translated) {
   Value *edge = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   Type *Ty = CI->getType();
@@ -2330,13 +2908,16 @@ Value *TranslateStep(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 }
 
 Value *TranslatePow(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                    HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *y = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
-  bool isFXCCompatMode = CI->getModule()->GetHLModule().GetHLOptions().bFXCCompatMode;
+  bool isFXCCompatMode =
+      CI->getModule()->GetHLModule().GetHLOptions().bFXCCompatMode;
   IRBuilder<> Builder(CI);
-  return TranslatePowImpl(hlslOP,Builder,x,y,isFXCCompatMode);
+  return TranslatePowImpl(hlslOP, Builder, x, y, isFXCCompatMode);
 }
 
 Value *TranslatePrintf(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
@@ -2344,12 +2925,15 @@ Value *TranslatePrintf(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
                        HLObjectOperationLowerHelper *pObjHelper,
                        bool &Translated) {
   Translated = false;
-  CI->getContext().emitError(CI, "use of undeclared identifier 'printf'");
+  dxilutil::EmitErrorOnInstruction(CI,
+                                   "use of unsupported identifier 'printf'");
   return nullptr;
 }
 
 Value *TranslateFaceforward(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                            HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                            HLOperationLowerHelper &helper,
+                            HLObjectOperationLowerHelper *pObjHelper,
+                            bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Type *Ty = CI->getType();
 
@@ -2371,13 +2955,15 @@ Value *TranslateFaceforward(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *TrivialSetMeshOutputCounts(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                  HLOperationLowerHelper &helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   IRBuilder<> Builder(CI);
   Constant *opArg = hlslOP->GetU32Const((unsigned)op);
-  Value *args[] = { opArg, src0, src1 };
+  Value *args[] = {opArg, src0, src1};
   Function *dxilFunc = hlslOP->GetOpFunc(op, Type::getVoidTy(CI->getContext()));
 
   Builder.CreateCall(dxilFunc, args);
@@ -2385,7 +2971,9 @@ Value *TrivialSetMeshOutputCounts(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *TrivialDispatchMesh(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *src0 = CI->getArgOperand(HLOperandIndex::kDispatchMeshOpThreadX);
   Value *src1 = CI->getArgOperand(HLOperandIndex::kDispatchMeshOpThreadY);
@@ -2393,19 +2981,21 @@ Value *TrivialDispatchMesh(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
   Value *src3 = CI->getArgOperand(HLOperandIndex::kDispatchMeshOpPayload);
   IRBuilder<> Builder(CI);
   Constant *opArg = hlslOP->GetU32Const((unsigned)op);
-  Value *args[] = { opArg, src0, src1, src2, src3 };
+  Value *args[] = {opArg, src0, src1, src2, src3};
   Function *dxilFunc = hlslOP->GetOpFunc(op, src3->getType());
 
   Builder.CreateCall(dxilFunc, args);
   return nullptr;
 }
-}
+} // namespace
 
 // MOP intrinsics
 namespace {
 
 Value *TranslateGetSamplePosition(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                                  HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                  HLOperationLowerHelper &helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
 
@@ -2430,7 +3020,9 @@ Value *TranslateGetSamplePosition(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
-                              HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                              HLOperationLowerHelper &helper,
+                              HLObjectOperationLowerHelper *pObjHelper,
+                              bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
 
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -2528,7 +3120,9 @@ Value *TranslateGetDimensions(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
 }
 
 Value *GenerateUpdateCounter(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
 
@@ -2548,7 +3142,8 @@ Value *GenerateUpdateCounter(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   return Builder.CreateCall(F, Args);
 }
 
-static Value *ScalarizeResRet(Type *RetTy, Value *ResRet, IRBuilder<> &Builder) {
+static Value *ScalarizeResRet(Type *RetTy, Value *ResRet,
+                              IRBuilder<> &Builder) {
   // Extract value part.
   Value *retVal = llvm::UndefValue::get(RetTy);
   if (RetTy->isVectorTy()) {
@@ -2562,26 +3157,11 @@ static Value *ScalarizeResRet(Type *RetTy, Value *ResRet, IRBuilder<> &Builder) 
   return retVal;
 }
 
-static Value *ScalarizeElements(Type *RetTy, ArrayRef<Value*> Elts, IRBuilder<> &Builder) {
-  // Extract value part.
-  Value *retVal = llvm::UndefValue::get(RetTy);
-  if (RetTy->isVectorTy()) {
-    unsigned vecSize = RetTy->getVectorNumElements();
-    DXASSERT(vecSize <= Elts.size(), "vector size mismatch");
-    for (unsigned i = 0; i < vecSize; i++) {
-      Value *retComp = Elts[i];
-      retVal = Builder.CreateInsertElement(retVal, retComp, i);
-    }
-  } else {
-    retVal = Elts[0];
-  }
-  return retVal;
-}
-
 void UpdateStatus(Value *ResRet, Value *status, IRBuilder<> &Builder,
-                  hlsl::OP *hlslOp) {
+                  hlsl::OP *hlslOp,
+                  unsigned StatusIndex = DXIL::kResRetStatusIndex) {
   if (status && !isa<UndefValue>(status)) {
-    Value *statusVal = Builder.CreateExtractValue(ResRet, DXIL::kResRetStatusIndex);
+    Value *statusVal = Builder.CreateExtractValue(ResRet, StatusIndex);
     Value *checkAccessOp = hlslOp->GetI32Const(
         static_cast<unsigned>(DXIL::OpCode::CheckAccessFullyMapped));
     Function *checkAccessFn = hlslOp->GetOpFunc(
@@ -2603,7 +3183,9 @@ Value *SplatToVector(Value *Elt, Type *DstTy, IRBuilder<> &Builder) {
 }
 
 Value *TranslateMul(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
 
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *arg0 = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
@@ -2619,16 +3201,16 @@ Value *TranslateMul(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
       if (arg0Ty->getScalarType()->isFloatingPointTy()) {
         return TranslateFDot(arg0, arg1, vecSize, hlslOP, Builder);
       }
-      else {
-        return TranslateIDot(arg0, arg1, vecSize, hlslOP, Builder, IOP == IntrinsicOp::IOP_umul);
-      }
-    }
-    else {
+
+      DXIL::OpCode MadOpCode = DXIL::OpCode::IMad;
+      if (IOP == IntrinsicOp::IOP_umul)
+        MadOpCode = DXIL::OpCode::UMad;
+      return ExpandDot(arg0, arg1, vecSize, hlslOP, Builder, MadOpCode);
+    } else {
       // mul(vector, scalar) == vector * scalar-splat
       arg1 = SplatToVector(arg1, arg0Ty, Builder);
     }
-  }
-  else {
+  } else {
     if (arg1Ty->isVectorTy()) {
       // mul(scalar, vector) == scalar-splat * vector
       arg0 = SplatToVector(arg0, arg1Ty, Builder);
@@ -2640,14 +3222,13 @@ Value *TranslateMul(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   if (arg0Ty->getScalarType()->isFloatingPointTy()) {
     return Builder.CreateFMul(arg0, arg1);
   }
-  else {
-    return Builder.CreateMul(arg0, arg1);
-  }
+  return Builder.CreateMul(arg0, arg1);
 }
 
 // Sample intrinsics.
 struct SampleHelper {
-  SampleHelper(CallInst *CI, OP::OpCode op, HLObjectOperationLowerHelper *pObjHelper);
+  SampleHelper(CallInst *CI, OP::OpCode op,
+               HLObjectOperationLowerHelper *pObjHelper);
 
   OP::OpCode opcode = OP::OpCode::NumOpCodes;
   DXIL::ResourceKind resourceKind = DXIL::ResourceKind::Invalid;
@@ -2759,8 +3340,8 @@ struct SampleHelper {
   }
 };
 
-SampleHelper::SampleHelper(
-    CallInst *CI, OP::OpCode op, HLObjectOperationLowerHelper *pObjHelper)
+SampleHelper::SampleHelper(CallInst *CI, OP::OpCode op,
+                           HLObjectOperationLowerHelper *pObjHelper)
     : opcode(op) {
 
   texHandle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -2770,58 +3351,95 @@ SampleHelper::SampleHelper(
     return;
   }
 
-  coordDimensions = opcode == DXIL::OpCode::CalculateLOD ? DxilResource::GetNumDimensionsForCalcLOD(resourceKind)
-                                                         : DxilResource::GetNumCoords(resourceKind);
+  coordDimensions = opcode == DXIL::OpCode::CalculateLOD
+                        ? DxilResource::GetNumDimensionsForCalcLOD(resourceKind)
+                        : DxilResource::GetNumCoords(resourceKind);
   offsetDimensions = DxilResource::GetNumOffsets(resourceKind);
 
   const bool bFeedbackOp = hlsl::OP::IsDxilOpFeedback(op);
-  sampledTexHandle = bFeedbackOp ? CI->getArgOperand(HLOperandIndex::kWriteSamplerFeedbackSampledArgIndex)
-                                 : nullptr;
-  const unsigned kSamplerArgIndex = bFeedbackOp ? HLOperandIndex::kWriteSamplerFeedbackSamplerArgIndex
-                                                : HLOperandIndex::kSampleSamplerArgIndex;
+  sampledTexHandle =
+      bFeedbackOp ? CI->getArgOperand(
+                        HLOperandIndex::kWriteSamplerFeedbackSampledArgIndex)
+                  : nullptr;
+  const unsigned kSamplerArgIndex =
+      bFeedbackOp ? HLOperandIndex::kWriteSamplerFeedbackSamplerArgIndex
+                  : HLOperandIndex::kSampleSamplerArgIndex;
   samplerHandle = CI->getArgOperand(kSamplerArgIndex);
 
-  const unsigned kCoordArgIdx = bFeedbackOp ? HLOperandIndex::kWriteSamplerFeedbackCoordArgIndex
-                                            : HLOperandIndex::kSampleCoordArgIndex;
+  const unsigned kCoordArgIdx =
+      bFeedbackOp ? HLOperandIndex::kWriteSamplerFeedbackCoordArgIndex
+                  : HLOperandIndex::kSampleCoordArgIndex;
   TranslateCoord(CI, kCoordArgIdx);
 
-  // TextureCube does not support offsets, shifting each subsequent arg index down by 1
+  // TextureCube does not support offsets, shifting each subsequent arg index
+  // down by 1
   unsigned cube = (resourceKind == DXIL::ResourceKind::TextureCube ||
                    resourceKind == DXIL::ResourceKind::TextureCubeArray)
-                  ? 1 : 0;
+                      ? 1
+                      : 0;
 
   switch (op) {
   case OP::OpCode::Sample:
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleOffsetArgIndex);
     SetClamp(CI, HLOperandIndex::kSampleClampArgIndex - cube);
     SetStatus(CI, HLOperandIndex::kSampleStatusArgIndex - cube);
     break;
   case OP::OpCode::SampleLevel:
     SetLOD(CI, HLOperandIndex::kSampleLLevelArgIndex);
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleLOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleLOffsetArgIndex);
     SetStatus(CI, HLOperandIndex::kSampleLStatusArgIndex - cube);
     break;
   case OP::OpCode::SampleBias:
     SetBias(CI, HLOperandIndex::kSampleBBiasArgIndex);
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleBOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleBOffsetArgIndex);
     SetClamp(CI, HLOperandIndex::kSampleBClampArgIndex - cube);
     SetStatus(CI, HLOperandIndex::kSampleBStatusArgIndex - cube);
     break;
   case OP::OpCode::SampleCmp:
     SetCompareValue(CI, HLOperandIndex::kSampleCmpCmpValArgIndex);
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleCmpOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleCmpOffsetArgIndex);
     SetClamp(CI, HLOperandIndex::kSampleCmpClampArgIndex - cube);
+    SetStatus(CI, HLOperandIndex::kSampleCmpStatusArgIndex - cube);
+    break;
+  case OP::OpCode::SampleCmpBias:
+    SetBias(CI, HLOperandIndex::kSampleCmpBBiasArgIndex);
+    SetCompareValue(CI, HLOperandIndex::kSampleCmpBCmpValArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleCmpBOffsetArgIndex);
+    SetClamp(CI, HLOperandIndex::kSampleCmpBClampArgIndex - cube);
+    SetStatus(CI, HLOperandIndex::kSampleCmpBStatusArgIndex - cube);
+    break;
+  case OP::OpCode::SampleCmpGrad:
+    SetDDX(CI, HLOperandIndex::kSampleCmpGDDXArgIndex);
+    SetDDY(CI, HLOperandIndex::kSampleCmpGDDYArgIndex);
+    SetCompareValue(CI, HLOperandIndex::kSampleCmpGCmpValArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleCmpGOffsetArgIndex);
+    SetClamp(CI, HLOperandIndex::kSampleCmpGClampArgIndex - cube);
+    SetStatus(CI, HLOperandIndex::kSampleCmpGStatusArgIndex - cube);
+    break;
+  case OP::OpCode::SampleCmpLevel:
+    SetCompareValue(CI, HLOperandIndex::kSampleCmpCmpValArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleCmpLOffsetArgIndex);
+    SetLOD(CI, HLOperandIndex::kSampleCmpLLevelArgIndex);
     SetStatus(CI, HLOperandIndex::kSampleCmpStatusArgIndex - cube);
     break;
   case OP::OpCode::SampleCmpLevelZero:
     SetCompareValue(CI, HLOperandIndex::kSampleCmpLZCmpValArgIndex);
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleCmpLZOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleCmpLZOffsetArgIndex);
     SetStatus(CI, HLOperandIndex::kSampleCmpLZStatusArgIndex - cube);
     break;
   case OP::OpCode::SampleGrad:
     SetDDX(CI, HLOperandIndex::kSampleGDDXArgIndex);
     SetDDY(CI, HLOperandIndex::kSampleGDDYArgIndex);
-    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx : HLOperandIndex::kSampleGOffsetArgIndex);
+    TranslateOffset(CI, cube ? HLOperandIndex::kInvalidIdx
+                             : HLOperandIndex::kSampleGOffsetArgIndex);
     SetClamp(CI, HLOperandIndex::kSampleGClampArgIndex - cube);
     SetStatus(CI, HLOperandIndex::kSampleGStatusArgIndex - cube);
     break;
@@ -2852,7 +3470,9 @@ SampleHelper::SampleHelper(
 }
 
 Value *TranslateCalculateLOD(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   SampleHelper sampleHelper(CI, OP::OpCode::CalculateLOD, pObjHelper);
   if (sampleHelper.opcode == DXIL::OpCode::NumOpCodes) {
@@ -2911,7 +3531,9 @@ void GenerateDxilSample(CallInst *CI, Function *F, ArrayRef<Value *> sampleArgs,
 }
 
 Value *TranslateSample(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                       HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   SampleHelper sampleHelper(CI, opcode, pObjHelper);
 
@@ -2980,6 +3602,40 @@ Value *TranslateSample(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
         sampleHelper.clamp};
     GenerateDxilSample(CI, F, sampleArgs, sampleHelper.status, hlslOP);
   } break;
+  case OP::OpCode::SampleCmpBias: {
+    Value *sampleArgs[] = {
+        opArg, sampleHelper.texHandle, sampleHelper.samplerHandle,
+        // Coord.
+        sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
+        sampleHelper.coord[3],
+        // Offset.
+        sampleHelper.offset[0], sampleHelper.offset[1], sampleHelper.offset[2],
+        // CmpVal.
+        sampleHelper.compareValue,
+        // Bias.
+        sampleHelper.bias,
+        // Clamp.
+        sampleHelper.clamp};
+    GenerateDxilSample(CI, F, sampleArgs, sampleHelper.status, hlslOP);
+  } break;
+  case OP::OpCode::SampleCmpGrad: {
+    Value *sampleArgs[] = {
+        opArg, sampleHelper.texHandle, sampleHelper.samplerHandle,
+        // Coord.
+        sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
+        sampleHelper.coord[3],
+        // Offset.
+        sampleHelper.offset[0], sampleHelper.offset[1], sampleHelper.offset[2],
+        // CmpVal.
+        sampleHelper.compareValue,
+        // Ddx.
+        sampleHelper.ddx[0], sampleHelper.ddx[1], sampleHelper.ddx[2],
+        // Ddy.
+        sampleHelper.ddy[0], sampleHelper.ddy[1], sampleHelper.ddy[2],
+        // Clamp.
+        sampleHelper.clamp};
+    GenerateDxilSample(CI, F, sampleArgs, sampleHelper.status, hlslOP);
+  } break;
   case OP::OpCode::SampleCmp: {
     Value *sampleArgs[] = {
         opArg, sampleHelper.texHandle, sampleHelper.samplerHandle,
@@ -2992,6 +3648,20 @@ Value *TranslateSample(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
         sampleHelper.compareValue,
         // Clamp.
         sampleHelper.clamp};
+    GenerateDxilSample(CI, F, sampleArgs, sampleHelper.status, hlslOP);
+  } break;
+  case OP::OpCode::SampleCmpLevel: {
+    Value *sampleArgs[] = {
+        opArg, sampleHelper.texHandle, sampleHelper.samplerHandle,
+        // Coord.
+        sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
+        sampleHelper.coord[3],
+        // Offset.
+        sampleHelper.offset[0], sampleHelper.offset[1], sampleHelper.offset[2],
+        // CmpVal.
+        sampleHelper.compareValue,
+        // LOD.
+        sampleHelper.lod};
     GenerateDxilSample(CI, F, sampleArgs, sampleHelper.status, hlslOP);
   } break;
   case OP::OpCode::SampleCmpLevelZero:
@@ -3023,7 +3693,8 @@ struct GatherHelper {
     GatherAlpha,
   };
 
-  GatherHelper(CallInst *CI, OP::OpCode op, HLObjectOperationLowerHelper *pObjHelper,
+  GatherHelper(CallInst *CI, OP::OpCode op,
+               HLObjectOperationLowerHelper *pObjHelper,
                GatherHelper::GatherChannel ch);
 
   OP::OpCode opcode;
@@ -3114,9 +3785,9 @@ struct GatherHelper {
   }
 };
 
-GatherHelper::GatherHelper(
-    CallInst *CI, OP::OpCode op, HLObjectOperationLowerHelper *pObjHelper,
-    GatherHelper::GatherChannel ch)
+GatherHelper::GatherHelper(CallInst *CI, OP::OpCode op,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           GatherHelper::GatherChannel ch)
     : opcode(op), special(nullptr), hasSampleOffsets(false) {
 
   switch (ch) {
@@ -3166,12 +3837,9 @@ GatherHelper::GatherHelper(
       if (ch != GatherChannel::GatherAll)
         TranslateSampleOffset(CI, HLOperandIndex::kGatherSampleOffsetArgIndex,
                               offsetSize);
-      if (hasSampleOffsets) {
-        statusIdx = HLOperandIndex::kGatherStatusWithSampleOffsetArgIndex;
-      } else {
-        opcode = OP::OpCode::TextureGatherImm;
-        statusIdx = HLOperandIndex::kGatherStatusArgIndex;
-      }
+      statusIdx = hasSampleOffsets
+                      ? HLOperandIndex::kGatherStatusWithSampleOffsetArgIndex
+                      : HLOperandIndex::kGatherStatusArgIndex;
     }
     SetStatus(CI, statusIdx);
   } break;
@@ -3185,15 +3853,24 @@ GatherHelper::GatherHelper(
       TranslateOffset(CI, HLOperandIndex::kGatherCmpOffsetArgIndex, offsetSize);
       // Gather all don't have sample offset version overload.
       if (ch != GatherChannel::GatherAll)
-        TranslateSampleOffset(CI, HLOperandIndex::kGatherCmpSampleOffsetArgIndex,
-                              offsetSize);
-      if (hasSampleOffsets) {
-        statusIdx = HLOperandIndex::kGatherCmpStatusWithSampleOffsetArgIndex;
-      } else {
-        opcode = OP::OpCode::TextureGatherCmpImm;
-        statusIdx = HLOperandIndex::kGatherCmpStatusArgIndex;
-      }
+        TranslateSampleOffset(
+            CI, HLOperandIndex::kGatherCmpSampleOffsetArgIndex, offsetSize);
+      statusIdx = hasSampleOffsets
+                      ? HLOperandIndex::kGatherCmpStatusWithSampleOffsetArgIndex
+                      : HLOperandIndex::kGatherCmpStatusArgIndex;
     }
+    SetStatus(CI, statusIdx);
+  } break;
+  case OP::OpCode::TextureGatherRaw: {
+    unsigned statusIdx;
+    TranslateOffset(CI, HLOperandIndex::kGatherOffsetArgIndex, offsetSize);
+    // Gather all don't have sample offset version overload.
+    DXASSERT(ch == GatherChannel::GatherAll,
+             "Raw gather must use all channels");
+    DXASSERT(!cube, "Raw gather can't be used with cube textures");
+    DXASSERT(!hasSampleOffsets,
+             "Raw gather doesn't support individual offsets");
+    statusIdx = HLOperandIndex::kGatherStatusArgIndex;
     SetStatus(CI, statusIdx);
   } break;
   default:
@@ -3250,12 +3927,15 @@ void GenerateDxilGather(CallInst *CI, Function *F,
 }
 
 Value *TranslateGather(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                       HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   GatherHelper::GatherChannel ch = GatherHelper::GatherChannel::GatherAll;
   switch (IOP) {
   case IntrinsicOp::MOP_Gather:
   case IntrinsicOp::MOP_GatherCmp:
+  case IntrinsicOp::MOP_GatherRaw:
     ch = GatherHelper::GatherChannel::GatherAll;
     break;
   case IntrinsicOp::MOP_GatherRed:
@@ -3294,31 +3974,42 @@ Value *TranslateGather(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
 
   switch (opcode) {
   case OP::OpCode::TextureGather: {
-    Value *gatherArgs[] = {
-        opArg, gatherHelper.texHandle, gatherHelper.samplerHandle,
-        // Coord.
-        gatherHelper.coord[0], gatherHelper.coord[1], gatherHelper.coord[2],
-        gatherHelper.coord[3],
-        // Offset.
-        gatherHelper.offset[0], gatherHelper.offset[1],
-        // Channel.
-        channelArg};
+    Value *gatherArgs[] = {opArg, gatherHelper.texHandle,
+                           gatherHelper.samplerHandle,
+                           // Coord.
+                           gatherHelper.coord[0], gatherHelper.coord[1],
+                           gatherHelper.coord[2], gatherHelper.coord[3],
+                           // Offset.
+                           gatherHelper.offset[0], gatherHelper.offset[1],
+                           // Channel.
+                           channelArg};
     GenerateDxilGather(CI, F, gatherArgs, gatherHelper, hlslOP);
   } break;
   case OP::OpCode::TextureGatherCmp: {
-    Value *gatherArgs[] = {
-        opArg, gatherHelper.texHandle, gatherHelper.samplerHandle,
-        // Coord.
-        gatherHelper.coord[0], gatherHelper.coord[1], gatherHelper.coord[2],
-        gatherHelper.coord[3],
-        // Offset.
-        gatherHelper.offset[0], gatherHelper.offset[1],
-        // Channel.
-        channelArg,
-        // CmpVal.
-        gatherHelper.special};
+    Value *gatherArgs[] = {opArg, gatherHelper.texHandle,
+                           gatherHelper.samplerHandle,
+                           // Coord.
+                           gatherHelper.coord[0], gatherHelper.coord[1],
+                           gatherHelper.coord[2], gatherHelper.coord[3],
+                           // Offset.
+                           gatherHelper.offset[0], gatherHelper.offset[1],
+                           // Channel.
+                           channelArg,
+                           // CmpVal.
+                           gatherHelper.special};
     GenerateDxilGather(CI, F, gatherArgs, gatherHelper, hlslOP);
   } break;
+  case OP::OpCode::TextureGatherRaw: {
+    Value *gatherArgs[] = {opArg, gatherHelper.texHandle,
+                           gatherHelper.samplerHandle,
+                           // Coord.
+                           gatherHelper.coord[0], gatherHelper.coord[1],
+                           gatherHelper.coord[2], gatherHelper.coord[3],
+                           // Offset.
+                           gatherHelper.offset[0], gatherHelper.offset[1]};
+    GenerateDxilGather(CI, F, gatherArgs, gatherHelper, hlslOP);
+    break;
+  }
   default:
     DXASSERT(0, "invalid opcode for Gather");
     break;
@@ -3327,10 +4018,11 @@ Value *TranslateGather(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   return nullptr;
 }
 
-static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::OpCode opcode,
-                                            HLOperationLowerHelper& helper,
-                                            HLObjectOperationLowerHelper* pObjHelper,
-                                            bool& Translated) {
+static Value *
+TranslateWriteSamplerFeedback(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                              HLOperationLowerHelper &helper,
+                              HLObjectOperationLowerHelper *pObjHelper,
+                              bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   SampleHelper sampleHelper(CI, opcode, pObjHelper);
 
@@ -3349,7 +4041,8 @@ static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::O
   switch (opcode) {
   case OP::OpCode::WriteSamplerFeedback: {
     Value *samplerFeedbackArgs[] = {
-        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle, sampleHelper.samplerHandle,
+        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle,
+        sampleHelper.samplerHandle,
         // Coord.
         sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
         sampleHelper.coord[3],
@@ -3359,7 +4052,8 @@ static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::O
   } break;
   case OP::OpCode::WriteSamplerFeedbackBias: {
     Value *samplerFeedbackArgs[] = {
-        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle, sampleHelper.samplerHandle,
+        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle,
+        sampleHelper.samplerHandle,
         // Coord.
         sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
         sampleHelper.coord[3],
@@ -3371,7 +4065,8 @@ static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::O
   } break;
   case OP::OpCode::WriteSamplerFeedbackGrad: {
     Value *samplerFeedbackArgs[] = {
-        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle, sampleHelper.samplerHandle,
+        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle,
+        sampleHelper.samplerHandle,
         // Coord.
         sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
         sampleHelper.coord[3],
@@ -3385,7 +4080,8 @@ static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::O
   } break;
   case OP::OpCode::WriteSamplerFeedbackLevel: {
     Value *samplerFeedbackArgs[] = {
-        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle, sampleHelper.samplerHandle,
+        opArg, sampleHelper.texHandle, sampleHelper.sampledTexHandle,
+        sampleHelper.samplerHandle,
         // Coord.
         sampleHelper.coord[0], sampleHelper.coord[1], sampleHelper.coord[2],
         sampleHelper.coord[3],
@@ -3401,16 +4097,41 @@ static Value* TranslateWriteSamplerFeedback(CallInst* CI, IntrinsicOp IOP, OP::O
 }
 
 // Load/Store intrinsics.
+OP::OpCode LoadOpFromResKind(DxilResource::Kind RK) {
+  switch (RK) {
+  case DxilResource::Kind::RawBuffer:
+  case DxilResource::Kind::StructuredBuffer:
+    return OP::OpCode::RawBufferLoad;
+  case DxilResource::Kind::TypedBuffer:
+    return OP::OpCode::BufferLoad;
+  case DxilResource::Kind::Invalid:
+    DXASSERT(0, "invalid resource kind");
+    break;
+  default:
+    return OP::OpCode::TextureLoad;
+  }
+  return OP::OpCode::TextureLoad;
+}
+
 struct ResLoadHelper {
+  // Default constructor uses CI load intrinsic call
+  //  to get the retval and various location indicators.
   ResLoadHelper(CallInst *CI, DxilResource::Kind RK, DxilResourceBase::Class RC,
-                Value *h, IntrinsicOp IOP, bool bForSubscript=false);
-  ResLoadHelper(CallInst *CI, DxilResource::Kind RK, DxilResourceBase::Class RC,
-                Value *h, Value *mip);
-  // For double subscript.
-  ResLoadHelper(Instruction *ldInst, Value *h, Value *idx, Value *mip)
-      : opcode(OP::OpCode::TextureLoad),
-        intrinsicOpCode(IntrinsicOp::Num_Intrinsics), handle(h), retVal(ldInst),
-        addr(idx), offset(nullptr), status(nullptr), mipLevel(mip) {}
+                Value *h, IntrinsicOp IOP, LoadInst *TyBufSubLoad = nullptr);
+  // Alternative constructor explicitly sets the index.
+  // Used for some subscript operators that feed the generic HL call inst
+  // into a load op and by the matrixload call instruction.
+  ResLoadHelper(Instruction *Inst, DxilResource::Kind RK, Value *h, Value *idx,
+                Value *Offset, Value *status = nullptr, Value *mip = nullptr)
+      : intrinsicOpCode(IntrinsicOp::Num_Intrinsics), handle(h), retVal(Inst),
+        addr(idx), offset(Offset), status(status), mipLevel(mip) {
+    opcode = LoadOpFromResKind(RK);
+    Type *Ty = Inst->getType();
+    if (opcode == OP::OpCode::RawBufferLoad && Ty->isVectorTy() &&
+        Ty->getVectorNumElements() > 1 &&
+        Inst->getModule()->GetHLModule().GetShaderModel()->IsSM69Plus())
+      opcode = OP::OpCode::RawBufferVectorLoad;
+  }
   OP::OpCode opcode;
   IntrinsicOp intrinsicOpCode;
   unsigned dxilMajor;
@@ -3423,137 +4144,95 @@ struct ResLoadHelper {
   Value *mipLevel;
 };
 
+// Uses CI arguments to determine the index, offset, and mipLevel also depending
+// on the RK/RC resource kind and class, which determine the opcode.
+// Handle and IOP are set explicitly.
+// For typed buffer loads, the call instruction feeds into a load
+// represented by TyBufSubLoad which determines the instruction to replace.
+// Otherwise, CI is replaced.
 ResLoadHelper::ResLoadHelper(CallInst *CI, DxilResource::Kind RK,
-                             DxilResourceBase::Class RC, Value *hdl, IntrinsicOp IOP, bool bForSubscript)
+                             DxilResourceBase::Class RC, Value *hdl,
+                             IntrinsicOp IOP, LoadInst *TyBufSubLoad)
     : intrinsicOpCode(IOP), handle(hdl), offset(nullptr), status(nullptr) {
-  switch (RK) {
-  case DxilResource::Kind::RawBuffer:
-  case DxilResource::Kind::StructuredBuffer:
-    opcode = OP::OpCode::RawBufferLoad;
-    break;
-  case DxilResource::Kind::TypedBuffer:
-    opcode = OP::OpCode::BufferLoad;
-    break;
-  case DxilResource::Kind::Invalid:
-    DXASSERT(0, "invalid resource kind");
-    break;
-  default:
-    opcode = OP::OpCode::TextureLoad;
-    break;
-  }
-  retVal = CI;
+  opcode = LoadOpFromResKind(RK);
+  bool bForSubscript = false;
+  if (TyBufSubLoad) {
+    bForSubscript = true;
+    retVal = TyBufSubLoad;
+  } else
+    retVal = CI;
   const unsigned kAddrIdx = HLOperandIndex::kBufLoadAddrOpIdx;
   addr = CI->getArgOperand(kAddrIdx);
   unsigned argc = CI->getNumArgOperands();
+  Type *i32Ty = Type::getInt32Ty(CI->getContext());
+  unsigned StatusIdx = HLOperandIndex::kBufLoadStatusOpIdx;
+  unsigned OffsetIdx = HLOperandIndex::kInvalidIdx;
 
   if (opcode == OP::OpCode::TextureLoad) {
-    // mip at last channel
-    unsigned coordSize = DxilResource::GetNumCoords(RK);
-
-    if (RC == DxilResourceBase::Class::SRV) {
-      if (bForSubscript) {
-        // Use 0 when access by [].
-        mipLevel = IRBuilder<>(CI).getInt32(0);
-      } else {
-        if (coordSize == 1 && !addr->getType()->isVectorTy()) {
-          // Use addr when access by Load.
-          mipLevel = addr;
-        } else {
-          mipLevel = IRBuilder<>(CI).CreateExtractElement(addr, coordSize);
-        }
-      }
-    } else {
-      // Set mip level to undef for UAV.
-      mipLevel = UndefValue::get(Type::getInt32Ty(addr->getContext()));
-    }
-
-    if (RC == DxilResourceBase::Class::SRV) {
-      unsigned offsetIdx = HLOperandIndex::kTexLoadOffsetOpIdx;
-      unsigned statusIdx = HLOperandIndex::kTexLoadStatusOpIdx;
-      if (RK == DxilResource::Kind::Texture2DMS ||
-          RK == DxilResource::Kind::Texture2DMSArray) {
-        offsetIdx = HLOperandIndex::kTex2DMSLoadOffsetOpIdx;
-        statusIdx = HLOperandIndex::kTex2DMSLoadStatusOpIdx;
+    bool IsMS = (RK == DxilResource::Kind::Texture2DMS ||
+                 RK == DxilResource::Kind::Texture2DMSArray);
+    // Set mip and status index.
+    offset = UndefValue::get(i32Ty);
+    if (IsMS) {
+      // Retrieve appropriate MS parameters.
+      StatusIdx = HLOperandIndex::kTex2DMSLoadStatusOpIdx;
+      // MS textures keep the sample param (mipLevel) regardless of writability.
+      if (bForSubscript)
+        mipLevel = ConstantInt::get(i32Ty, 0);
+      else
         mipLevel =
             CI->getArgOperand(HLOperandIndex::kTex2DMSLoadSampleIdxOpIdx);
-      }
-
-      if (argc > offsetIdx)
-        offset = CI->getArgOperand(offsetIdx);
-
-      if (argc > statusIdx)
-        status = CI->getArgOperand(statusIdx);
+    } else if (RC == DxilResourceBase::Class::UAV) {
+      // DXIL requires that non-MS UAV accesses set miplevel to undef.
+      mipLevel = UndefValue::get(i32Ty);
+      StatusIdx = HLOperandIndex::kRWTexLoadStatusOpIdx;
     } else {
-      const unsigned kStatusIdx = HLOperandIndex::kRWTexLoadStatusOpIdx;
-
-      if (argc > kStatusIdx)
-        status = CI->getArgOperand(kStatusIdx);
+      // Non-MS SRV case.
+      StatusIdx = HLOperandIndex::kTexLoadStatusOpIdx;
+      if (bForSubscript)
+        // Having no miplevel param, single subscripted SRVs default to 0.
+        mipLevel = ConstantInt::get(i32Ty, 0);
+      else
+        // Mip is stored at the last channel of the coordinate vector.
+        mipLevel = IRBuilder<>(CI).CreateExtractElement(
+            addr, DxilResource::GetNumCoords(RK));
     }
-  } else {
-    const unsigned kStatusIdx = HLOperandIndex::kBufLoadStatusOpIdx;
-    if (argc > kStatusIdx)
-      status = CI->getArgOperand(kStatusIdx);
+    if (RC == DxilResourceBase::Class::SRV)
+      OffsetIdx = IsMS ? HLOperandIndex::kTex2DMSLoadOffsetOpIdx
+                       : HLOperandIndex::kTexLoadOffsetOpIdx;
+  } else if (opcode == OP::OpCode::RawBufferLoad) {
+    // If native vectors are available and this load had a vector
+    // with more than one elements, convert the RawBufferLod to the
+    // native vector variant RawBufferVectorLoad.
+    Type *Ty = CI->getType();
+    if (Ty->isVectorTy() && Ty->getVectorNumElements() > 1 &&
+        CI->getModule()->GetHLModule().GetShaderModel()->IsSM69Plus())
+      opcode = OP::OpCode::RawBufferVectorLoad;
   }
-}
 
-ResLoadHelper::ResLoadHelper(CallInst *CI, DxilResource::Kind RK,
-                             DxilResourceBase::Class RC, Value *hdl, Value *mip)
-    : handle(hdl), offset(nullptr), status(nullptr) {
-  DXASSERT(RK != DxilResource::Kind::RawBuffer &&
-               RK != DxilResource::Kind::TypedBuffer &&
-               RK != DxilResource::Kind::Invalid,
-           "invalid resource kind");
-  opcode = OP::OpCode::TextureLoad;
+  // Set offset.
+  if (DXIL::IsStructuredBuffer(RK))
+    // Structured buffers receive no exterior offset in this constructor,
+    // but may need to increment it later.
+    offset = ConstantInt::get(i32Ty, 0U);
+  else if (argc > OffsetIdx)
+    // Textures may set the offset from an explicit argument.
+    offset = CI->getArgOperand(OffsetIdx);
+  else
+    // All other cases use undef.
+    offset = UndefValue::get(i32Ty);
 
-  retVal = CI;
-  mipLevel = mip;
-
-  const unsigned kAddrIdx = HLOperandIndex::kMipLoadAddrOpIdx;
-  addr = CI->getArgOperand(kAddrIdx);
-  unsigned argc = CI->getNumArgOperands();
-
-  const unsigned kOffsetIdx = HLOperandIndex::kMipLoadOffsetOpIdx;
-  const unsigned kStatusIdx = HLOperandIndex::kMipLoadStatusOpIdx;
-  if (argc > kOffsetIdx)
-    offset = CI->getArgOperand(kOffsetIdx);
-
-  if (argc > kStatusIdx)
-    status = CI->getArgOperand(kStatusIdx);
+  // Retrieve status value if provided.
+  if (argc > StatusIdx)
+    status = CI->getArgOperand(StatusIdx);
 }
 
 void TranslateStructBufSubscript(CallInst *CI, Value *handle, Value *status,
-                                 hlsl::OP *OP, HLResource::Kind RK, const DataLayout &DL);
+                                 hlsl::OP *OP, HLResource::Kind RK,
+                                 const DataLayout &DL);
 
-// Create { v0, v1 } from { v0.lo, v0.hi, v1.lo, v1.hi }
-void Make64bitResultForLoad(Type *EltTy, ArrayRef<Value *> resultElts32,
-                            unsigned size, MutableArrayRef<Value *> resultElts,
-                            hlsl::OP *hlslOP, IRBuilder<> &Builder) {
-  Type *i64Ty = Builder.getInt64Ty();
-  Type *doubleTy = Builder.getDoubleTy();
-  if (EltTy == doubleTy) {
-    Function *makeDouble =
-        hlslOP->GetOpFunc(DXIL::OpCode::MakeDouble, doubleTy);
-    Value *makeDoubleOpArg =
-        Builder.getInt32((unsigned)DXIL::OpCode::MakeDouble);
-    for (unsigned i = 0; i < size; i++) {
-      Value *lo = resultElts32[2 * i];
-      Value *hi = resultElts32[2 * i + 1];
-      Value *V = Builder.CreateCall(makeDouble, {makeDoubleOpArg, lo, hi});
-      resultElts[i] = V;
-    }
-  } else {
-    for (unsigned i = 0; i < size; i++) {
-      Value *lo = resultElts32[2 * i];
-      Value *hi = resultElts32[2 * i + 1];
-      lo = Builder.CreateZExt(lo, i64Ty);
-      hi = Builder.CreateZExt(hi, i64Ty);
-      hi = Builder.CreateShl(hi, 32);
-      resultElts[i] = Builder.CreateOr(lo, hi);
-    }
-  }
-}
-
-static Constant *GetRawBufferMaskForETy(Type *Ty, unsigned NumComponents, hlsl::OP *OP) {
+static Constant *GetRawBufferMaskForETy(Type *Ty, unsigned NumComponents,
+                                        hlsl::OP *OP) {
   unsigned mask = 0;
 
   switch (NumComponents) {
@@ -3578,192 +4257,273 @@ static Constant *GetRawBufferMaskForETy(Type *Ty, unsigned NumComponents, hlsl::
 }
 
 Value *GenerateRawBufLd(Value *handle, Value *bufIdx, Value *offset,
-  Value *status, Type *EltTy,
-  MutableArrayRef<Value *> resultElts, hlsl::OP *OP,
-  IRBuilder<> &Builder, unsigned NumComponents, Constant *alignment);
+                        Value *status, Type *EltTy,
+                        MutableArrayRef<Value *> resultElts, hlsl::OP *OP,
+                        IRBuilder<> &Builder, unsigned NumComponents,
+                        Constant *alignment);
 
-static Value* TranslateRawBufVecLd(Type* VecEltTy, unsigned VecElemCount,
-  IRBuilder<>& Builder, Value* handle, hlsl::OP* OP, Value* status,
-  Value* bufIdx, Value* baseOffset, const DataLayout& DL,
-  std::vector<Value*>& bufLds, unsigned baseAlign, bool isScalarTy = false);
-
-void TranslateLoad(ResLoadHelper &helper, HLResource::Kind RK,
-                   IRBuilder<> &Builder, hlsl::OP *OP, const DataLayout &DL) {
-
-  Type *Ty = helper.retVal->getType();
-  if (Ty->isPointerTy()) {
-    DXASSERT(!DxilResource::IsAnyTexture(RK), "Textures should not be treated as structured buffers.");
-    TranslateStructBufSubscript(cast<CallInst>(helper.retVal), helper.handle,
-                                helper.status, OP, RK, DL);
-    return;
-  }
-
+// Sets up arguments for buffer load call.
+static SmallVector<Value *, 10> GetBufLoadArgs(ResLoadHelper helper,
+                                               HLResource::Kind RK,
+                                               IRBuilder<> Builder,
+                                               unsigned LdSize) {
   OP::OpCode opcode = helper.opcode;
+  llvm::Constant *opArg = Builder.getInt32((uint32_t)opcode);
 
-  Type *i32Ty = Builder.getInt32Ty();
-  Type *i64Ty = Builder.getInt64Ty();
-  Type *doubleTy = Builder.getDoubleTy();
-  Type *EltTy = Ty->getScalarType();
-  unsigned numComponents = 1;
-  if (Ty->isVectorTy()) {
-    numComponents = Ty->getVectorNumElements();
-  }
+  unsigned alignment = RK == DxilResource::Kind::RawBuffer ? 4U : 8U;
+  alignment = std::min(alignment, LdSize);
+  Constant *alignmentVal = Builder.getInt32(alignment);
 
-  if (DXIL::IsStructuredBuffer(RK) || DXIL::IsRawBuffer(RK)) {
-    std::vector<Value*> bufLds;
-    const bool isBool = EltTy->isIntegerTy(1);
+  // Assemble args specific to the type bab/struct/typed:
+  // - Typed needs to handle the possibility of vector coords
+  // - Raws need to calculate alignment and mask values.
+  SmallVector<Value *, 10> Args;
+  Args.emplace_back(opArg);         // opcode @0.
+  Args.emplace_back(helper.handle); // Resource handle @1
 
-    // Bool are represented as i32 in memory
-    Type* MemReprTy = isBool ? Builder.getInt32Ty() : EltTy;
-    bool isScalarTy = !Ty->isVectorTy();
-
-    Value* retValNew = nullptr;
-    if (DXIL::IsStructuredBuffer(RK)) {
-      retValNew = TranslateRawBufVecLd(MemReprTy, numComponents, Builder, helper.handle, OP, helper.status,
-        helper.addr, OP->GetU32Const(0), DL, bufLds, /*baseAlign (in bytes)*/ 8, isScalarTy);
-    } else {
-      retValNew = TranslateRawBufVecLd(MemReprTy, numComponents, Builder, helper.handle, OP, helper.status,
-        nullptr, helper.addr, DL, bufLds, /*baseAlign (in bytes)*/ 4, isScalarTy);
-    }
-
-    DXASSERT_NOMSG(!bufLds.empty());
-    dxilutil::MigrateDebugValue(helper.retVal, bufLds.front());
-
-    if (isBool) {
-      // Convert result back to register representation.
-      retValNew = Builder.CreateICmpNE(retValNew, Constant::getNullValue(retValNew->getType()));
-    }
-
-    helper.retVal->replaceAllUsesWith(retValNew);
-    helper.retVal = retValNew;
-    return;
-  }
-
-  bool isTyped = opcode == OP::OpCode::TextureLoad ||
-                 RK == DxilResource::Kind::TypedBuffer;
-  bool is64 = EltTy == i64Ty || EltTy == doubleTy;
-  if (is64 && isTyped) {
-    EltTy = i32Ty;
-  }
-  bool isBool = EltTy->isIntegerTy(1);
-  if (isBool) {
-    // Value will be loaded in its memory representation.
-    EltTy = i32Ty;
-    if (Ty->isVectorTy()) Ty = VectorType::get(EltTy, numComponents);
-  }
-
-  Function *F = OP->GetOpFunc(opcode, EltTy);
-  llvm::Constant *opArg = OP->GetU32Const((unsigned)opcode);
-
-  llvm::Value *undefI = llvm::UndefValue::get(i32Ty);
-
-  SmallVector<Value *, 12> loadArgs;
-  loadArgs.emplace_back(opArg);         // opcode
-  loadArgs.emplace_back(helper.handle); // resource handle
-
+  // Set offsets appropriate for the load operation.
+  bool isVectorAddr = helper.addr->getType()->isVectorTy();
   if (opcode == OP::OpCode::TextureLoad) {
-    // set mip level
-    loadArgs.emplace_back(helper.mipLevel);
-  }
+    llvm::Value *undefI = llvm::UndefValue::get(Builder.getInt32Ty());
 
-  if (opcode == OP::OpCode::TextureLoad) {
-    // texture coord
+    // Set mip level or sample for MS texutures @2.
+    Args.emplace_back(helper.mipLevel);
+    // Set texture coords according to resource kind @3-5
+    // Coords unused by the resource kind are undefs.
     unsigned coordSize = DxilResource::GetNumCoords(RK);
-    bool isVectorAddr = helper.addr->getType()->isVectorTy();
-    for (unsigned i = 0; i < 3; i++) {
-      if (i < coordSize) {
-        loadArgs.emplace_back(
-          isVectorAddr ? Builder.CreateExtractElement(helper.addr, i) : helper.addr);
-      }
+    for (unsigned i = 0; i < 3; i++)
+      if (i < coordSize)
+        Args.emplace_back(isVectorAddr
+                              ? Builder.CreateExtractElement(helper.addr, i)
+                              : helper.addr);
       else
-        loadArgs.emplace_back(undefI);
-    }
+        Args.emplace_back(undefI);
+
+    // Set texture offsets according to resource kind @7-9
+    // Coords unused by the resource kind are undefs.
+    unsigned offsetSize = DxilResource::GetNumOffsets(RK);
+    if (!helper.offset || isa<llvm::UndefValue>(helper.offset))
+      offsetSize = 0;
+    for (unsigned i = 0; i < 3; i++)
+      if (i < offsetSize)
+        Args.emplace_back(Builder.CreateExtractElement(helper.offset, i));
+      else
+        Args.emplace_back(undefI);
   } else {
-    if (helper.addr->getType()->isVectorTy()) {
-      Value *scalarOffset =
-          Builder.CreateExtractElement(helper.addr, (uint64_t)0);
-
-      // TODO: calculate the real address based on opcode
-
-      loadArgs.emplace_back(scalarOffset); // offset
-    } else {
-      // TODO: calculate the real address based on opcode
-
-      loadArgs.emplace_back(helper.addr); // offset
+    // If not TextureLoad, it could be a typed or raw buffer load.
+    // They have mostly similar arguments.
+    DXASSERT(opcode == OP::OpCode::RawBufferLoad ||
+                 opcode == OP::OpCode::RawBufferVectorLoad ||
+                 opcode == OP::OpCode::BufferLoad,
+             "Wrong opcode in get load args");
+    Args.emplace_back(
+        isVectorAddr ? Builder.CreateExtractElement(helper.addr, (uint64_t)0)
+                     : helper.addr);
+    Args.emplace_back(helper.offset);
+    if (opcode == OP::OpCode::RawBufferLoad) {
+      // Unlike typed buffer load, raw buffer load has mask and alignment.
+      Args.emplace_back(nullptr);      // Mask will be added later %4.
+      Args.emplace_back(alignmentVal); // alignment @5.
+    } else if (opcode == OP::OpCode::RawBufferVectorLoad) {
+      // RawBufferVectorLoad takes just alignment, no mask.
+      Args.emplace_back(alignmentVal); // alignment @4
     }
   }
-  // offset 0
-  if (opcode == OP::OpCode::TextureLoad) {
-    if (helper.offset && !isa<llvm::UndefValue>(helper.offset)) {
-      unsigned offsetSize = DxilResource::GetNumOffsets(RK);
-      for (unsigned i = 0; i < 3; i++) {
-        if (i < offsetSize)
-          loadArgs.emplace_back(Builder.CreateExtractElement(helper.offset, i));
-        else
-          loadArgs.emplace_back(undefI);
+  return Args;
+}
+
+static bool isMinPrecisionType(Type *EltTy, const DataLayout &DL) {
+  return !EltTy->isIntegerTy(1) &&
+         DL.getTypeAllocSizeInBits(EltTy) > EltTy->getPrimitiveSizeInBits();
+}
+
+static Type *widenMinPrecisionType(Type *Ty, LLVMContext &Ctx,
+                                   const DataLayout &DL) {
+  Type *EltTy = Ty->getScalarType();
+  if (!isMinPrecisionType(EltTy, DL))
+    return Ty;
+  Type *WideTy = EltTy->isFloatingPointTy() ? Type::getFloatTy(Ctx)
+                                            : Type::getInt32Ty(Ctx);
+  if (Ty->isVectorTy())
+    return VectorType::get(WideTy, Ty->getVectorNumElements());
+  return WideTy;
+}
+
+// Emits as many calls as needed to load the full vector
+// Performs any needed extractions and conversions of the results.
+Value *TranslateBufLoad(ResLoadHelper &helper, HLResource::Kind RK,
+                        IRBuilder<> &Builder, hlsl::OP *OP,
+                        const DataLayout &DL) {
+  OP::OpCode opcode = helper.opcode;
+  Type *Ty = helper.retVal->getType();
+
+  unsigned NumComponents = 1;
+  if (Ty->isVectorTy())
+    NumComponents = Ty->getVectorNumElements();
+
+  const bool isTyped = DXIL::IsTyped(RK);
+  Type *OrigEltTy = Ty->getScalarType();
+  Type *WidenedTy = widenMinPrecisionType(Ty, Builder.getContext(), DL);
+  Type *EltTy = WidenedTy->getScalarType();
+  const bool isMinPrec = (WidenedTy != Ty);
+  const bool is64 = (EltTy->isIntegerTy(64) || EltTy->isDoubleTy());
+  const bool isBool = EltTy->isIntegerTy(1);
+  // DXIL buffer loads require i32; narrow types are reconverted after load.
+  if (isBool || (is64 && isTyped))
+    EltTy = Builder.getInt32Ty();
+
+  // Calculate load size with the scalar memory element type.
+  unsigned LdSize = DL.getTypeAllocSize(EltTy);
+
+  // Adjust number of components as needed.
+  if (is64 && isTyped) {
+    // 64-bit types are stored as int32 pairs in typed buffers.
+    DXASSERT(NumComponents <= 2, "Typed buffers only allow 4 dwords.");
+    NumComponents *= 2;
+  } else if (opcode == OP::OpCode::RawBufferVectorLoad) {
+    // Native vector loads only have a single vector element in ResRet.
+    EltTy = VectorType::get(EltTy, NumComponents);
+    NumComponents = 1;
+  }
+
+  SmallVector<Value *, 10> Args = GetBufLoadArgs(helper, RK, Builder, LdSize);
+
+  // Keep track of the first load for debug info migration.
+  Value *FirstLd = nullptr;
+
+  unsigned OffsetIdx = 0;
+  if (RK == DxilResource::Kind::RawBuffer)
+    // Raw buffers can't use offset param. Add to coord index.
+    OffsetIdx = DXIL::OperandIndex::kRawBufferLoadIndexOpIdx;
+  else if (RK == DxilResource::Kind::StructuredBuffer)
+    OffsetIdx = DXIL::OperandIndex::kRawBufferLoadElementOffsetOpIdx;
+
+  // Create call(s) to function object and collect results in Elts.
+  // Typed buffer loads are limited to one load of up to 4 32-bit values.
+  // Raw buffer loads might need multiple loads in chunks of 4.
+  SmallVector<Value *, 4> Elts(NumComponents);
+  for (unsigned i = 0; i < NumComponents;) {
+    // Load 4 elements or however many less than 4 are left to load.
+    unsigned chunkSize = std::min(NumComponents - i, 4U);
+
+    // Assign mask for raw buffer loads.
+    if (opcode == OP::OpCode::RawBufferLoad) {
+      Args[DXIL::OperandIndex::kRawBufferLoadMaskOpIdx] =
+          GetRawBufferMaskForETy(EltTy, chunkSize, OP);
+      // If we've loaded a chunk already, update offset to next chunk.
+      if (FirstLd != nullptr)
+        Args[OffsetIdx] =
+            Builder.CreateAdd(Args[OffsetIdx], OP->GetU32Const(4 * LdSize));
+    }
+
+    Function *F = OP->GetOpFunc(opcode, EltTy);
+    Value *Ld = Builder.CreateCall(F, Args, OP::GetOpCodeName(opcode));
+    unsigned StatusIndex;
+
+    // Extract elements from returned ResRet.
+    // Native vector loads just have one vector element in the ResRet.
+    // Others have up to four scalars that need to be individually extracted.
+    if (opcode == OP::OpCode::RawBufferVectorLoad) {
+      Elts[i++] = Builder.CreateExtractValue(Ld, 0);
+      StatusIndex = DXIL::kVecResRetStatusIndex;
+    } else {
+      for (unsigned j = 0; j < chunkSize; j++, i++)
+        Elts[i] = Builder.CreateExtractValue(Ld, j);
+      StatusIndex = DXIL::kResRetStatusIndex;
+    }
+
+    // Update status.
+    UpdateStatus(Ld, helper.status, Builder, OP, StatusIndex);
+
+    if (!FirstLd)
+      FirstLd = Ld;
+  }
+  DXASSERT(FirstLd, "No loads created by TranslateBufLoad");
+
+  // Convert loaded 32-bit integers to intended 64-bit type representation.
+  if (isTyped) {
+    Type *RegEltTy = Ty->getScalarType();
+    if (RegEltTy->isDoubleTy()) {
+      Function *makeDouble = OP->GetOpFunc(DXIL::OpCode::MakeDouble, RegEltTy);
+      Value *makeDoubleOpArg =
+          Builder.getInt32((unsigned)DXIL::OpCode::MakeDouble);
+      NumComponents /= 2; // Convert back to number of doubles.
+      for (unsigned i = 0; i < NumComponents; i++) {
+        Value *lo = Elts[2 * i];
+        Value *hi = Elts[2 * i + 1];
+        Elts[i] = Builder.CreateCall(makeDouble, {makeDoubleOpArg, lo, hi});
       }
-    } else {
-      loadArgs.emplace_back(undefI);
-      loadArgs.emplace_back(undefI);
-      loadArgs.emplace_back(undefI);
+      EltTy = RegEltTy;
+    } else if (RegEltTy->isIntegerTy(64)) {
+      NumComponents /= 2; // Convert back to number of int64s.
+      for (unsigned i = 0; i < NumComponents; i++) {
+        Value *lo = Elts[2 * i];
+        Value *hi = Elts[2 * i + 1];
+        lo = Builder.CreateZExt(lo, RegEltTy);
+        hi = Builder.CreateZExt(hi, RegEltTy);
+        hi = Builder.CreateShl(hi, 32);
+        Elts[i] = Builder.CreateOr(lo, hi);
+      }
+      EltTy = RegEltTy;
     }
   }
 
-  // Offset 1
-  if (RK == DxilResource::Kind::TypedBuffer) {
-    loadArgs.emplace_back(undefI);
-  }
-
-  Value *ResRet =
-      Builder.CreateCall(F, loadArgs, OP->GetOpCodeName(opcode));
-  dxilutil::MigrateDebugValue(helper.retVal, ResRet);
-
+  // Package elements into a vector as needed.
   Value *retValNew = nullptr;
-  if (!is64 || !isTyped) {
-    retValNew = ScalarizeResRet(Ty, ResRet, Builder);
+  // Scalar or native vector loads need not construct vectors from elements.
+  if (!Ty->isVectorTy() || opcode == OP::OpCode::RawBufferVectorLoad) {
+    retValNew = Elts[0];
   } else {
-    unsigned size = numComponents;
-    DXASSERT(size <= 2, "typed buffer only allow 4 dwords");
-    EltTy = Ty->getScalarType();
-    Value *Elts[2];
-
-    Make64bitResultForLoad(Ty->getScalarType(),
-                           {
-                               Builder.CreateExtractValue(ResRet, 0),
-                               Builder.CreateExtractValue(ResRet, 1),
-                               Builder.CreateExtractValue(ResRet, 2),
-                               Builder.CreateExtractValue(ResRet, 3),
-                           },
-                           size, Elts, OP, Builder);
-
-    retValNew = ScalarizeElements(Ty, Elts, Builder);
+    retValNew = UndefValue::get(VectorType::get(EltTy, NumComponents));
+    for (unsigned i = 0; i < NumComponents; i++)
+      retValNew = Builder.CreateInsertElement(retValNew, Elts[i], i);
   }
 
-  if (isBool) {
-    // Convert result back to register representation.
-    retValNew = Builder.CreateICmpNE(retValNew, Constant::getNullValue(retValNew->getType()));
+  // Convert loaded int32 bool results to i1 register representation.
+  if (isBool)
+    retValNew = Builder.CreateICmpNE(
+        retValNew, Constant::getNullValue(retValNew->getType()));
+
+  // DXIL loads min precision as 32-bit; narrow back to original IR type.
+  if (isMinPrec) {
+    if (OrigEltTy->isIntegerTy())
+      retValNew = Builder.CreateTrunc(retValNew, Ty);
+    else
+      retValNew = Builder.CreateFPTrunc(retValNew, Ty);
   }
 
-  // replace
   helper.retVal->replaceAllUsesWith(retValNew);
-  // Save new ret val.
   helper.retVal = retValNew;
-  // get status
-  UpdateStatus(ResRet, helper.status, Builder, OP);
+
+  return FirstLd;
 }
 
 Value *TranslateResourceLoad(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                             HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                             HLOperationLowerHelper &helper,
+                             HLObjectOperationLowerHelper *pObjHelper,
+                             bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
+  DataLayout &DL = helper.dataLayout;
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+
   IRBuilder<> Builder(CI);
 
   DXIL::ResourceClass RC = pObjHelper->GetRC(handle);
   DXIL::ResourceKind RK = pObjHelper->GetRK(handle);
 
-  ResLoadHelper loadHelper(CI, RK, RC, handle, IOP);
-  TranslateLoad(loadHelper, RK, Builder, hlslOP, helper.dataLayout);
-  // CI is replaced in TranslateLoad.
+  ResLoadHelper ldHelper(CI, RK, RC, handle, IOP);
+  Type *Ty = CI->getType();
+  Value *Ld = nullptr;
+  if (Ty->isPointerTy()) {
+    DXASSERT(!DxilResource::IsAnyTexture(RK),
+             "Textures should not be treated as structured buffers.");
+    TranslateStructBufSubscript(cast<CallInst>(ldHelper.retVal), handle,
+                                ldHelper.status, hlslOP, RK, DL);
+  } else {
+    Ld = TranslateBufLoad(ldHelper, RK, Builder, hlslOP, DL);
+    dxilutil::MigrateDebugValue(CI, Ld);
+  }
+  // CI is replaced by above translation calls..
   return nullptr;
 }
 
@@ -3807,18 +4567,20 @@ void Split64bitValForStore(Type *EltTy, ArrayRef<Value *> vals, unsigned size,
 }
 
 void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
-                    Value *offset, IRBuilder<> &Builder, hlsl::OP *OP) {
+                    Value *Idx, Value *offset, IRBuilder<> &Builder,
+                    hlsl::OP *OP, Value *sampIdx = nullptr) {
   Type *Ty = val->getType();
-
-  // This function is no longer used for lowering stores to a
-  // structured buffer.
-  DXASSERT_NOMSG(RK != DxilResource::Kind::StructuredBuffer);
-
   OP::OpCode opcode = OP::OpCode::NumOpCodes;
+  bool IsTyped = true;
   switch (RK) {
   case DxilResource::Kind::RawBuffer:
   case DxilResource::Kind::StructuredBuffer:
+    IsTyped = false;
     opcode = OP::OpCode::RawBufferStore;
+    // Where shader model and type allows, use vector store intrinsic.
+    if (OP->GetModule()->GetHLModule().GetShaderModel()->IsSM69Plus() &&
+        Ty->isVectorTy() && Ty->getVectorNumElements() > 1)
+      opcode = OP::OpCode::RawBufferVectorStore;
     break;
   case DxilResource::Kind::TypedBuffer:
     opcode = OP::OpCode::BufferStore;
@@ -3826,24 +4588,47 @@ void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
   case DxilResource::Kind::Invalid:
     DXASSERT(0, "invalid resource kind");
     break;
+  case DxilResource::Kind::Texture2DMS:
+  case DxilResource::Kind::Texture2DMSArray:
+    opcode = OP::OpCode::TextureStoreSample;
+    break;
   default:
     opcode = OP::OpCode::TextureStore;
     break;
   }
-
-  bool isTyped = opcode == OP::OpCode::TextureStore ||
-                 RK == DxilResource::Kind::TypedBuffer;
 
   Type *i32Ty = Builder.getInt32Ty();
   Type *i64Ty = Builder.getInt64Ty();
   Type *doubleTy = Builder.getDoubleTy();
   Type *EltTy = Ty->getScalarType();
   if (EltTy->isIntegerTy(1)) {
-    // Since we're going to memory, convert bools to their memory representation.
+    // Since we're going to memory, convert bools to their memory
+    // representation.
     EltTy = i32Ty;
-    if (Ty->isVectorTy()) Ty = VectorType::get(EltTy, Ty->getVectorNumElements());
-    else Ty = EltTy;
+    if (Ty->isVectorTy())
+      Ty = VectorType::get(EltTy, Ty->getVectorNumElements());
+    else
+      Ty = EltTy;
     val = Builder.CreateZExt(val, Ty);
+  }
+
+  // Min precision alloc size is 32-bit; widen to match store intrinsic.
+  // Scalar RawBufferStore widening is handled by TranslateMinPrecisionRawBuffer
+  // in DxilGenerationPass, which has signedness info from struct annotations.
+  if (opcode == OP::OpCode::RawBufferVectorStore) {
+    const DataLayout &DL =
+        OP->GetModule()->GetHLModule().GetModule()->getDataLayout();
+    Type *WideTy = widenMinPrecisionType(Ty, Builder.getContext(), DL);
+    if (WideTy != Ty) {
+      if (EltTy->isFloatingPointTy())
+        val = Builder.CreateFPExt(val, WideTy);
+      else
+        // TODO(#8314): Signedness info is lost by this point; SExt is wrong
+        // for min16uint. Front-end should widen during Clang CodeGen instead.
+        val = Builder.CreateSExt(val, WideTy);
+      EltTy = WideTy->getScalarType();
+      Ty = WideTy;
+    }
   }
 
   // If RawBuffer store of 64-bit value, don't set alignment to 8,
@@ -3853,11 +4638,10 @@ void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
     alignValue = 4;
   Constant *Alignment = OP->GetI32Const(alignValue);
   bool is64 = EltTy == i64Ty || EltTy == doubleTy;
-  if (is64 && isTyped) {
+  if (is64 && IsTyped) {
     EltTy = i32Ty;
   }
 
-  Function *F = OP->GetOpFunc(opcode, EltTy);
   llvm::Constant *opArg = OP->GetU32Const((unsigned)opcode);
 
   llvm::Value *undefI =
@@ -3869,107 +4653,118 @@ void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
   storeArgs.emplace_back(opArg);  // opcode
   storeArgs.emplace_back(handle); // resource handle
 
-  unsigned offset0Idx = 0;
-  if (RK == DxilResource::Kind::RawBuffer ||
-      RK == DxilResource::Kind::TypedBuffer) {
-    // Offset 0
-    if (offset->getType()->isVectorTy()) {
-      Value *scalarOffset = Builder.CreateExtractElement(offset, (uint64_t)0);
-      storeArgs.emplace_back(scalarOffset); // offset
+  unsigned OffsetIdx = 0;
+  if (opcode == OP::OpCode::RawBufferStore ||
+      opcode == OP::OpCode::RawBufferVectorStore ||
+      opcode == OP::OpCode::BufferStore) {
+    // Append Coord0 (Index) value.
+    if (Idx->getType()->isVectorTy()) {
+      Value *ScalarIdx = Builder.CreateExtractElement(Idx, (uint64_t)0);
+      storeArgs.emplace_back(ScalarIdx); // Coord0 (Index).
     } else {
-      storeArgs.emplace_back(offset); // offset
+      storeArgs.emplace_back(Idx); // Coord0 (Index).
     }
 
-    // Store offset0 for later use
-    offset0Idx = storeArgs.size() - 1;
+    // Store OffsetIdx representing the argument that may need to be incremented
+    // later to load additional chunks of data.
+    // Only structured buffers can use the offset parameter.
+    // Others must increment the index.
+    if (RK == DxilResource::Kind::StructuredBuffer)
+      OffsetIdx = storeArgs.size();
+    else
+      OffsetIdx = storeArgs.size() - 1;
 
-    // Offset 1
-    storeArgs.emplace_back(undefI);
+    // Coord1 (Offset).
+    storeArgs.emplace_back(offset);
   } else {
     // texture store
     unsigned coordSize = DxilResource::GetNumCoords(RK);
 
     // Set x first.
-    if (offset->getType()->isVectorTy())
-      storeArgs.emplace_back(Builder.CreateExtractElement(offset, (uint64_t)0));
+    if (Idx->getType()->isVectorTy())
+      storeArgs.emplace_back(Builder.CreateExtractElement(Idx, (uint64_t)0));
     else
-      storeArgs.emplace_back(offset);
-
-    // Store offset0 for later use
-    offset0Idx = storeArgs.size() - 1;
+      storeArgs.emplace_back(Idx);
 
     for (unsigned i = 1; i < 3; i++) {
       if (i < coordSize)
-        storeArgs.emplace_back(Builder.CreateExtractElement(offset, i));
+        storeArgs.emplace_back(Builder.CreateExtractElement(Idx, i));
       else
         storeArgs.emplace_back(undefI);
     }
     // TODO: support mip for texture ST
   }
 
+  // RawBufferVectorStore only takes a single value and alignment arguments.
+  if (opcode == DXIL::OpCode::RawBufferVectorStore) {
+    storeArgs.emplace_back(val);
+    storeArgs.emplace_back(Alignment);
+    Function *F = OP->GetOpFunc(DXIL::OpCode::RawBufferVectorStore, Ty);
+    Builder.CreateCall(F, storeArgs);
+    return;
+  }
+  Function *F = OP->GetOpFunc(opcode, EltTy);
+
   constexpr unsigned MaxStoreElemCount = 4;
   const unsigned CompCount = Ty->isVectorTy() ? Ty->getVectorNumElements() : 1;
-  const unsigned StoreInstCount = (CompCount / MaxStoreElemCount) + (CompCount % MaxStoreElemCount != 0);
+  const unsigned StoreInstCount =
+      (CompCount / MaxStoreElemCount) + (CompCount % MaxStoreElemCount != 0);
   SmallVector<decltype(storeArgs), 4> storeArgsList;
 
   // Max number of element to store should be 16 (for a 4x4 matrix)
   DXASSERT_NOMSG(StoreInstCount >= 1 && StoreInstCount <= 4);
-  
+
   // If number of elements to store exceeds the maximum number of elements
-  // that can be stored in a single store call,  make sure to generate enough 
+  // that can be stored in a single store call,  make sure to generate enough
   // store calls to store all elements
   for (unsigned j = 0; j < StoreInstCount; j++) {
     decltype(storeArgs) newStoreArgs;
-    for (Value* storeArg : storeArgs)
+    for (Value *storeArg : storeArgs)
       newStoreArgs.emplace_back(storeArg);
     storeArgsList.emplace_back(newStoreArgs);
   }
 
   for (unsigned j = 0; j < storeArgsList.size(); j++) {
-
-    // For second and subsequent store calls, increment the offset0 (i.e. store index)
+    // For second and subsequent store calls, increment the resource-appropriate
+    // index or offset parameter.
     if (j > 0) {
-      // Greater than four-components store is not allowed for
-      // TypedBuffer and Textures. So greater than four elements
-      // scenario should only get hit here for RawBuffer.
-      DXASSERT_NOMSG(RK == DxilResource::Kind::RawBuffer);
       unsigned EltSize = OP->GetAllocSizeForType(EltTy);
-      unsigned newOffset = EltSize * MaxStoreElemCount * j;
-      Value* newOffsetVal = ConstantInt::get(Builder.getInt32Ty(), newOffset);
-      newOffsetVal = Builder.CreateAdd(storeArgsList[0][offset0Idx], newOffsetVal);
-      storeArgsList[j][offset0Idx] = newOffsetVal;
+      unsigned NewCoord = EltSize * MaxStoreElemCount * j;
+      Value *NewCoordVal = ConstantInt::get(Builder.getInt32Ty(), NewCoord);
+      NewCoordVal = Builder.CreateAdd(storeArgsList[0][OffsetIdx], NewCoordVal);
+      storeArgsList[j][OffsetIdx] = NewCoordVal;
     }
 
-    // values
+    // Set value parameters.
     uint8_t mask = 0;
     if (Ty->isVectorTy()) {
-      unsigned vecSize = std::min((j + 1) * MaxStoreElemCount, Ty->getVectorNumElements()) - (j * MaxStoreElemCount);
-      Value* emptyVal = undefVal;
-      if (isTyped) {
+      unsigned vecSize =
+          std::min((j + 1) * MaxStoreElemCount, Ty->getVectorNumElements()) -
+          (j * MaxStoreElemCount);
+      Value *emptyVal = undefVal;
+      if (IsTyped) {
         mask = DXIL::kCompMask_All;
         emptyVal = Builder.CreateExtractElement(val, (uint64_t)0);
       }
 
       for (unsigned i = 0; i < MaxStoreElemCount; i++) {
         if (i < vecSize) {
-          storeArgsList[j].emplace_back(Builder.CreateExtractElement(val, (j * MaxStoreElemCount) + i));
+          storeArgsList[j].emplace_back(
+              Builder.CreateExtractElement(val, (j * MaxStoreElemCount) + i));
           mask |= (1 << i);
-        }
-        else {
+        } else {
           storeArgsList[j].emplace_back(emptyVal);
         }
       }
 
-    }
-    else {
-      if (isTyped) {
+    } else {
+      if (IsTyped) {
         mask = DXIL::kCompMask_All;
         storeArgsList[j].emplace_back(val);
         storeArgsList[j].emplace_back(val);
         storeArgsList[j].emplace_back(val);
         storeArgsList[j].emplace_back(val);
-      }
-      else {
+      } else {
         storeArgsList[j].emplace_back(val);
         storeArgsList[j].emplace_back(undefVal);
         storeArgsList[j].emplace_back(undefVal);
@@ -3978,21 +4773,24 @@ void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
       }
     }
 
-    if (is64 && isTyped) {
+    if (is64 && IsTyped) {
       unsigned size = 1;
       if (Ty->isVectorTy()) {
-        size = std::min((j + 1) * MaxStoreElemCount, Ty->getVectorNumElements()) - (j * MaxStoreElemCount);
+        size =
+            std::min((j + 1) * MaxStoreElemCount, Ty->getVectorNumElements()) -
+            (j * MaxStoreElemCount);
       }
       DXASSERT(size <= 2, "raw/typed buffer only allow 4 dwords");
-      unsigned val0OpIdx = opcode == DXIL::OpCode::TextureStore
-        ? DXIL::OperandIndex::kTextureStoreVal0OpIdx
-        : DXIL::OperandIndex::kBufferStoreVal0OpIdx;
-      Value* V0 = storeArgsList[j][val0OpIdx];
-      Value* V1 = storeArgsList[j][val0OpIdx + 1];
+      unsigned val0OpIdx = opcode == DXIL::OpCode::TextureStore ||
+                                   opcode == DXIL::OpCode::TextureStoreSample
+                               ? DXIL::OperandIndex::kTextureStoreVal0OpIdx
+                               : DXIL::OperandIndex::kBufferStoreVal0OpIdx;
+      Value *V0 = storeArgsList[j][val0OpIdx];
+      Value *V1 = storeArgsList[j][val0OpIdx + 1];
 
-      Value* vals32[4];
+      Value *vals32[4];
       EltTy = Ty->getScalarType();
-      Split64bitValForStore(EltTy, { V0, V1 }, size, vals32, OP, Builder);
+      Split64bitValForStore(EltTy, {V0, V1}, size, vals32, OP, Builder);
       // Fill the uninit vals.
       if (size == 1) {
         vals32[2] = vals32[0];
@@ -4004,41 +4802,49 @@ void TranslateStore(DxilResource::Kind RK, Value *handle, Value *val,
       }
       // change mask for double
       if (opcode == DXIL::OpCode::RawBufferStore) {
-        mask = size == 1 ?
-          DXIL::kCompMask_X | DXIL::kCompMask_Y : DXIL::kCompMask_All;
+        mask = size == 1 ? DXIL::kCompMask_X | DXIL::kCompMask_Y
+                         : DXIL::kCompMask_All;
       }
     }
 
     storeArgsList[j].emplace_back(OP->GetU8Const(mask)); // mask
     if (opcode == DXIL::OpCode::RawBufferStore)
       storeArgsList[j].emplace_back(Alignment); // alignment only for raw buffer
+    else if (opcode == DXIL::OpCode::TextureStoreSample) {
+      storeArgsList[j].emplace_back(
+          sampIdx ? sampIdx
+                  : Builder.getInt32(0)); // sample idx only for MS textures
+    }
     Builder.CreateCall(F, storeArgsList[j]);
   }
 }
 
 Value *TranslateResourceStore(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                              HLOperationLowerHelper &helper, 
-                              HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                              HLOperationLowerHelper &helper,
+                              HLObjectOperationLowerHelper *pObjHelper,
+                              bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+
   IRBuilder<> Builder(CI);
   DXIL::ResourceKind RK = pObjHelper->GetRK(handle);
 
   Value *val = CI->getArgOperand(HLOperandIndex::kStoreValOpIdx);
   Value *offset = CI->getArgOperand(HLOperandIndex::kStoreOffsetOpIdx);
-  TranslateStore(RK, handle, val, offset, Builder, hlslOP);
+  Value *UndefI = UndefValue::get(Builder.getInt32Ty());
+  TranslateStore(RK, handle, val, offset, UndefI, Builder, hlslOP);
 
   return nullptr;
 }
-}
+} // namespace
 
 // Atomic intrinsics.
 namespace {
 // Atomic intrinsics.
 struct AtomicHelper {
-  AtomicHelper(CallInst *CI, OP::OpCode op, Value *h, Type *opType=nullptr);
+  AtomicHelper(CallInst *CI, OP::OpCode op, Value *h, Type *opType = nullptr);
   AtomicHelper(CallInst *CI, OP::OpCode op, Value *h, Value *bufIdx,
-               Value *baseOffset, Type *opType=nullptr);
+               Value *baseOffset, Type *opType = nullptr);
   OP::OpCode opcode;
   Value *handle;
   Value *addr;
@@ -4076,9 +4882,8 @@ AtomicHelper::AtomicHelper(CallInst *CI, OP::OpCode op, Value *h, Type *opType)
 // For IOP version of Interlocked*.
 AtomicHelper::AtomicHelper(CallInst *CI, OP::OpCode op, Value *h, Value *bufIdx,
                            Value *baseOffset, Type *opType)
-    : opcode(op), handle(h), addr(bufIdx),
-      offset(baseOffset), originalValue(nullptr),
-      operationType(opType) {
+    : opcode(op), handle(h), addr(bufIdx), offset(baseOffset),
+      originalValue(nullptr), operationType(opType) {
   if (op == OP::OpCode::AtomicCompareExchange) {
     compareValue =
         CI->getArgOperand(HLOperandIndex::kInterlockedCmpCompareValueOpIndex);
@@ -4124,7 +4929,7 @@ void TranslateAtomicBinaryOperation(AtomicHelper &helper,
   if (addr->getType()->isVectorTy()) {
     unsigned vectorNumElements = addr->getType()->getVectorNumElements();
     DXASSERT(vectorNumElements <= 3, "up to 3 elements for atomic binary op");
-    _Analysis_assume_(vectorNumElements <= 3);
+    assert(vectorNumElements <= 3);
     for (unsigned i = 0; i < vectorNumElements; i++) {
       Value *Elt = Builder.CreateExtractElement(addr, i);
       args[DXIL::OperandIndex::kAtomicBinOpCoord0OpIdx + i] = Elt;
@@ -4145,9 +4950,10 @@ void TranslateAtomicBinaryOperation(AtomicHelper &helper,
   }
 }
 
-Value *TranslateMopAtomicBinaryOperation(CallInst *CI, IntrinsicOp IOP,
-                                         OP::OpCode opcode,
-                                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateMopAtomicBinaryOperation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
 
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -4173,7 +4979,8 @@ Value *TranslateMopAtomicBinaryOperation(CallInst *CI, IntrinsicOp IOP,
                                    Builder, hlslOP);
   } break;
   case IntrinsicOp::MOP_InterlockedExchangeFloat: {
-    AtomicHelper helper(CI, DXIL::OpCode::AtomicBinOp, handle, Type::getInt32Ty(CI->getContext()));
+    AtomicHelper helper(CI, DXIL::OpCode::AtomicBinOp, handle,
+                        Type::getInt32Ty(CI->getContext()));
     TranslateAtomicBinaryOperation(helper, DXIL::AtomicBinOpCode::Exchange,
                                    Builder, hlslOP);
   } break;
@@ -4208,7 +5015,8 @@ Value *TranslateMopAtomicBinaryOperation(CallInst *CI, IntrinsicOp IOP,
   case IntrinsicOp::MOP_InterlockedXor:
   case IntrinsicOp::MOP_InterlockedXor64:
   default: {
-    DXASSERT(IOP == IntrinsicOp::MOP_InterlockedXor || IOP == IntrinsicOp::MOP_InterlockedXor64,
+    DXASSERT(IOP == IntrinsicOp::MOP_InterlockedXor ||
+                 IOP == IntrinsicOp::MOP_InterlockedXor64,
              "invalid MOP atomic intrinsic");
     AtomicHelper helper(CI, DXIL::OpCode::AtomicBinOp, handle);
     TranslateAtomicBinaryOperation(helper, DXIL::AtomicBinOpCode::Xor, Builder,
@@ -4246,7 +5054,7 @@ void TranslateAtomicCmpXChg(AtomicHelper &helper, IRBuilder<> &Builder,
   if (addr->getType()->isVectorTy()) {
     unsigned vectorNumElements = addr->getType()->getVectorNumElements();
     DXASSERT(vectorNumElements <= 3, "up to 3 elements in atomic op");
-    _Analysis_assume_(vectorNumElements <= 3);
+    assert(vectorNumElements <= 3);
     for (unsigned i = 0; i < vectorNumElements; i++) {
       Value *Elt = Builder.CreateExtractElement(addr, i);
       args[DXIL::OperandIndex::kAtomicCmpExchangeCoord0OpIdx + i] = Elt;
@@ -4268,7 +5076,9 @@ void TranslateAtomicCmpXChg(AtomicHelper &helper, IRBuilder<> &Builder,
 
 Value *TranslateMopAtomicCmpXChg(CallInst *CI, IntrinsicOp IOP,
                                  OP::OpCode opcode,
-                                 HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                 HLOperationLowerHelper &helper,
+                                 HLObjectOperationLowerHelper *pObjHelper,
+                                 bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
 
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -4277,17 +5087,19 @@ Value *TranslateMopAtomicCmpXChg(CallInst *CI, IntrinsicOp IOP,
   if (IOP == IntrinsicOp::MOP_InterlockedCompareStoreFloatBitwise ||
       IOP == IntrinsicOp::MOP_InterlockedCompareExchangeFloatBitwise)
     opType = Type::getInt32Ty(CI->getContext());
-  AtomicHelper atomicHelper(CI, OP::OpCode::AtomicCompareExchange, handle, opType);
+  AtomicHelper atomicHelper(CI, OP::OpCode::AtomicCompareExchange, handle,
+                            opType);
   TranslateAtomicCmpXChg(atomicHelper, Builder, hlslOP);
   return nullptr;
 }
 
-void TranslateSharedMemAtomicBinOp(CallInst *CI, IntrinsicOp IOP, Value *addr) {
+void TranslateSharedMemOrNodeAtomicBinOp(CallInst *CI, IntrinsicOp IOP,
+                                         Value *addr) {
   AtomicRMWInst::BinOp Op;
   IRBuilder<> Builder(CI);
   Value *val = CI->getArgOperand(HLOperandIndex::kInterlockedValueOpIndex);
   PointerType *ptrType = dyn_cast<PointerType>(
-               CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
+      CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
   bool needCast = ptrType && ptrType->getElementType()->isFloatTy();
   switch (IOP) {
   case IntrinsicOp::IOP_InterlockedAdd:
@@ -4299,7 +5111,9 @@ void TranslateSharedMemAtomicBinOp(CallInst *CI, IntrinsicOp IOP, Value *addr) {
   case IntrinsicOp::IOP_InterlockedExchange:
     if (needCast) {
       val = Builder.CreateBitCast(val, Type::getInt32Ty(CI->getContext()));
-      addr = Builder.CreateBitCast(addr, Type::getInt32PtrTy(CI->getContext(), DXIL::kTGSMAddrSpace));
+      addr = Builder.CreateBitCast(
+          addr, Type::getInt32PtrTy(CI->getContext(),
+                                    addr->getType()->getPointerAddressSpace()));
     }
     Op = AtomicRMWInst::BinOp::Xchg;
     break;
@@ -4330,17 +5144,18 @@ void TranslateSharedMemAtomicBinOp(CallInst *CI, IntrinsicOp IOP, Value *addr) {
   if (CI->getNumArgOperands() >
       HLOperandIndex::kInterlockedOriginalValueOpIndex) {
     if (needCast)
-      Result = Builder.CreateBitCast(Result, Type::getFloatTy(CI->getContext()));
+      Result =
+          Builder.CreateBitCast(Result, Type::getFloatTy(CI->getContext()));
     Builder.CreateStore(
         Result,
         CI->getArgOperand(HLOperandIndex::kInterlockedOriginalValueOpIndex));
   }
 }
 
-static Value* SkipAddrSpaceCast(Value* Ptr) {
+static Value *SkipAddrSpaceCast(Value *Ptr) {
   if (AddrSpaceCastInst *CastInst = dyn_cast<AddrSpaceCastInst>(Ptr))
     return CastInst->getOperand(0);
-  else if (ConstantExpr *ConstExpr = dyn_cast<ConstantExpr>(Ptr)) {
+  if (ConstantExpr *ConstExpr = dyn_cast<ConstantExpr>(Ptr)) {
     if (ConstExpr->getOpcode() == Instruction::AddrSpaceCast) {
       return ConstExpr->getOperand(0);
     }
@@ -4348,38 +5163,138 @@ static Value* SkipAddrSpaceCast(Value* Ptr) {
   return Ptr;
 }
 
-Value *TranslateIopAtomicBinaryOperation(CallInst *CI, IntrinsicOp IOP,
-                                         DXIL::OpCode opcode,
-                                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *
+TranslateNodeIncrementOutputCount(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                                  HLOperationLowerHelper &helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool isPerThread, bool &Translated) {
+
+  hlsl::OP *OP = &helper.hlslOP;
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  Value *count =
+      CI->getArgOperand(HLOperandIndex::kIncrementOutputCountCountIdx);
+  Function *dxilFunc = OP->GetOpFunc(op, CI->getType());
+  Value *opArg = OP->GetU32Const((unsigned)op);
+  Value *perThread = OP->GetI1Const(isPerThread);
+
+  Value *args[] = {opArg, handle, count, perThread};
+
+  IRBuilder<> Builder(CI);
+  Builder.CreateCall(dxilFunc, args);
+  return nullptr;
+}
+
+/*
+HLSL:
+void EmptyNodeOutput::GroupIncrementOutputCount(uint count)
+DXIL:
+void @dx.op.groupIncrementOutputCount(i32 %Opcode, %dx.types.NodeHandle
+%NodeOutput, i32 count)
+*/
+Value *TranslateNodeGroupIncrementOutputCount(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  return TranslateNodeIncrementOutputCount(CI, IOP, op, helper, pObjHelper,
+                                           /*isPerThread*/ false, Translated);
+}
+
+/*
+HLSL:
+void EmptyNodeOutput::ThreadIncrementOutputCount(uint count)
+DXIL:
+void @dx.op.threadIncrementOutputCount(i32 %Opcode, %dx.types.NodeHandle
+%NodeOutput, i32 count)
+*/
+Value *TranslateNodeThreadIncrementOutputCount(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  return TranslateNodeIncrementOutputCount(CI, IOP, op, helper, pObjHelper,
+                                           /*isPerThread*/ true, Translated);
+}
+
+// For known non-groupshared, verify that the destination param is valid
+void ValidateAtomicDestination(CallInst *CI,
+                               HLObjectOperationLowerHelper *pObjHelper) {
+  Value *dest = CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex);
+  // If we encounter a gep, we may provide a more specific error message
+  bool hasGep = isa<GetElementPtrInst>(dest);
+
+  // Confirm that dest is a properly-used UAV
+
+  // Drill through subscripts and geps, anything else indicates a misuse
+  while (true) {
+    if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(dest)) {
+      dest = gep->getPointerOperand();
+      continue;
+    }
+    if (CallInst *handle = dyn_cast<CallInst>(dest)) {
+      hlsl::HLOpcodeGroup group =
+          hlsl::GetHLOpcodeGroup(handle->getCalledFunction());
+      if (group != HLOpcodeGroup::HLSubscript)
+        break;
+      dest = handle->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx);
+      continue;
+    }
+    break;
+  }
+
+  if (pObjHelper->GetRC(dest) == DXIL::ResourceClass::UAV) {
+    DXIL::ResourceKind RK = pObjHelper->GetRK(dest);
+    if (DXIL::IsStructuredBuffer(RK))
+      return; // no errors
+    if (DXIL::IsTyped(RK)) {
+      if (hasGep)
+        dxilutil::EmitErrorOnInstruction(
+            CI, "Typed resources used in atomic operations must have a scalar "
+                "element type.");
+      return; // error emitted or else no errors
+    }
+  }
+
+  dxilutil::EmitErrorOnInstruction(
+      CI, "Atomic operation targets must be groupshared, Node Record or UAV.");
+}
+
+Value *TranslateIopAtomicBinaryOperation(
+    CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   Value *addr = CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex);
   addr = SkipAddrSpaceCast(addr);
 
   unsigned addressSpace = addr->getType()->getPointerAddressSpace();
-  if (addressSpace == DXIL::kTGSMAddrSpace)
-    TranslateSharedMemAtomicBinOp(CI, IOP, addr);
+  if (addressSpace == DXIL::kTGSMAddrSpace ||
+      addressSpace == DXIL::kNodeRecordAddrSpace)
+    TranslateSharedMemOrNodeAtomicBinOp(CI, IOP, addr);
   else {
-    // buffer atomic translated in TranslateSubscript.
-    // Do nothing here.
-    // Mark not translated.
+    // If not groupshared or node record, we either have an error case or will
+    // translate the atomic op in the process of translating users of the
+    // subscript operator Mark not translated and validate dest param
     Translated = false;
+    ValidateAtomicDestination(CI, pObjHelper);
   }
+
   return nullptr;
 }
 
-void TranslateSharedMemAtomicCmpXChg(CallInst *CI, Value *addr) {
+void TranslateSharedMemOrNodeAtomicCmpXChg(CallInst *CI, Value *addr) {
   Value *val = CI->getArgOperand(HLOperandIndex::kInterlockedCmpValueOpIndex);
   Value *cmpVal =
       CI->getArgOperand(HLOperandIndex::kInterlockedCmpCompareValueOpIndex);
   IRBuilder<> Builder(CI);
 
   PointerType *ptrType = dyn_cast<PointerType>(
-               CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
+      CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
   bool needCast = false;
   if (ptrType && ptrType->getElementType()->isFloatTy()) {
     needCast = true;
     val = Builder.CreateBitCast(val, Type::getInt32Ty(CI->getContext()));
     cmpVal = Builder.CreateBitCast(cmpVal, Type::getInt32Ty(CI->getContext()));
-    addr = Builder.CreateBitCast(addr, Type::getInt32PtrTy(CI->getContext(), DXIL::kTGSMAddrSpace));
+    unsigned addrSpace = cast<PointerType>(addr->getType())->getAddressSpace();
+    addr = Builder.CreateBitCast(
+        addr, Type::getInt32PtrTy(CI->getContext(), addrSpace));
   }
 
   Value *Result = Builder.CreateAtomicCmpXchg(
@@ -4390,7 +5305,8 @@ void TranslateSharedMemAtomicCmpXChg(CallInst *CI, Value *addr) {
       HLOperandIndex::kInterlockedCmpOriginalValueOpIndex) {
     Value *originVal = Builder.CreateExtractValue(Result, 0);
     if (needCast)
-      originVal = Builder.CreateBitCast(originVal, Type::getFloatTy(CI->getContext()));
+      originVal =
+          Builder.CreateBitCast(originVal, Type::getFloatTy(CI->getContext()));
     Builder.CreateStore(
         originVal,
         CI->getArgOperand(HLOperandIndex::kInterlockedCmpOriginalValueOpIndex));
@@ -4399,29 +5315,34 @@ void TranslateSharedMemAtomicCmpXChg(CallInst *CI, Value *addr) {
 
 Value *TranslateIopAtomicCmpXChg(CallInst *CI, IntrinsicOp IOP,
                                  DXIL::OpCode opcode,
-                                 HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                 HLOperationLowerHelper &helper,
+                                 HLObjectOperationLowerHelper *pObjHelper,
+                                 bool &Translated) {
   Value *addr = CI->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex);
   addr = SkipAddrSpaceCast(addr);
 
   unsigned addressSpace = addr->getType()->getPointerAddressSpace();
-  if (addressSpace == DXIL::kTGSMAddrSpace)
-    TranslateSharedMemAtomicCmpXChg(CI, addr);
+  if (addressSpace == DXIL::kTGSMAddrSpace ||
+      addressSpace == DXIL::kNodeRecordAddrSpace)
+    TranslateSharedMemOrNodeAtomicCmpXChg(CI, addr);
   else {
-    // buffer atomic translated in TranslateSubscript.
-    // Do nothing here.
-    // Mark not translated.
+    // If not groupshared, we either have an error case or will translate
+    // the atomic op in the process of translating users of the subscript
+    // operator Mark not translated and validate dest param
     Translated = false;
+    ValidateAtomicDestination(CI, pObjHelper);
   }
 
   return nullptr;
 }
-}
+} // namespace
 
 // Process Tess Factor.
 namespace {
 
 // Clamp to [0.0f..1.0f], NaN->0.0f.
-Value *CleanupTessFactorScale(Value *input, hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+Value *CleanupTessFactorScale(Value *input, hlsl::OP *hlslOP,
+                              IRBuilder<> &Builder) {
   float fMin = 0;
   float fMax = 1;
   Type *f32Ty = input->getType()->getScalarType();
@@ -4430,25 +5351,28 @@ Value *CleanupTessFactorScale(Value *input, hlsl::OP *hlslOP, IRBuilder<> &Build
   Type *Ty = input->getType();
   if (Ty->isVectorTy())
     minFactor = SplatToVector(minFactor, input->getType(), Builder);
-  Value *temp = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor, hlslOP, Builder);
+  Value *temp = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor,
+                                           hlslOP, Builder);
   if (Ty->isVectorTy())
     maxFactor = SplatToVector(maxFactor, input->getType(), Builder);
-  return TrivialDxilBinaryOperation(DXIL::OpCode::FMin, temp, maxFactor, hlslOP, Builder);
+  return TrivialDxilBinaryOperation(DXIL::OpCode::FMin, temp, maxFactor, hlslOP,
+                                    Builder);
 }
 
 // Clamp to [1.0f..Inf], NaN->1.0f.
-Value *CleanupTessFactor(Value *input, hlsl::OP *hlslOP, IRBuilder<> &Builder)
-{
-  float fMin = 1.0;  
+Value *CleanupTessFactor(Value *input, hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+  float fMin = 1.0;
   Type *f32Ty = input->getType()->getScalarType();
   Value *minFactor = ConstantFP::get(f32Ty, fMin);
   minFactor = SplatToVector(minFactor, input->getType(), Builder);
-  return TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor, hlslOP, Builder);
+  return TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor,
+                                    hlslOP, Builder);
 }
 
 // Do partitioning-specific clamping.
-Value *ClampTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMode, 
-    hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+Value *ClampTessFactor(Value *input,
+                       DXIL::TessellatorPartitioning partitionMode,
+                       hlsl::OP *hlslOP, IRBuilder<> &Builder) {
   const unsigned kTESSELLATOR_MAX_EVEN_TESSELLATION_FACTOR = 64;
   const unsigned kTESSELLATOR_MAX_ODD_TESSELLATION_FACTOR = 63;
 
@@ -4475,7 +5399,7 @@ Value *ClampTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMode
   case DXIL::TessellatorPartitioning::FractionalEven:
   default:
     DXASSERT(partitionMode == DXIL::TessellatorPartitioning::FractionalEven,
-        "invalid partition mode");
+             "invalid partition mode");
     fMin = kTESSELLATOR_MIN_EVEN_TESSELLATION_FACTOR;
     fMax = kTESSELLATOR_MAX_EVEN_TESSELLATION_FACTOR;
     break;
@@ -4486,20 +5410,24 @@ Value *ClampTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMode
   Type *Ty = input->getType();
   if (Ty->isVectorTy())
     minFactor = SplatToVector(minFactor, input->getType(), Builder);
-  Value *temp = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor, hlslOP, Builder);
+  Value *temp = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, input, minFactor,
+                                           hlslOP, Builder);
   if (Ty->isVectorTy())
     maxFactor = SplatToVector(maxFactor, input->getType(), Builder);
-  return TrivialDxilBinaryOperation(DXIL::OpCode::FMin, temp, maxFactor, hlslOP, Builder);
+  return TrivialDxilBinaryOperation(DXIL::OpCode::FMin, temp, maxFactor, hlslOP,
+                                    Builder);
 }
 
 // round up for integer/pow2 partitioning
 // note that this code assumes the inputs should be in the range [1, inf),
 // which should be enforced by the clamp above.
-Value *RoundUpTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMode,
-    hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+Value *RoundUpTessFactor(Value *input,
+                         DXIL::TessellatorPartitioning partitionMode,
+                         hlsl::OP *hlslOP, IRBuilder<> &Builder) {
   switch (partitionMode) {
   case DXIL::TessellatorPartitioning::Integer:
-    return TrivialDxilUnaryOperation(DXIL::OpCode::Round_pi, input, hlslOP, Builder);
+    return TrivialDxilUnaryOperation(DXIL::OpCode::Round_pi, input, hlslOP,
+                                     Builder);
   case DXIL::TessellatorPartitioning::Pow2: {
     const unsigned kExponentMask = 0x7f800000;
     const unsigned kExponentLSB = 0x00800000;
@@ -4511,21 +5439,23 @@ Value *RoundUpTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMo
     Type *uintTy = Type::getInt32Ty(Ty->getContext());
     if (Ty->isVectorTy())
       uintTy = VectorType::get(uintTy, Ty->getVectorNumElements());
-    Value *uintVal = Builder.CreateCast(Instruction::CastOps::FPToUI, input, uintTy);
+    Value *uintVal =
+        Builder.CreateCast(Instruction::CastOps::FPToUI, input, uintTy);
 
     Value *mantMask = ConstantInt::get(uintTy->getScalarType(), kMantissaMask);
     mantMask = SplatToVector(mantMask, uintTy, Builder);
     Value *manVal = Builder.CreateAnd(uintVal, mantMask);
-    
+
     Value *expMask = ConstantInt::get(uintTy->getScalarType(), kExponentMask);
     expMask = SplatToVector(expMask, uintTy, Builder);
     Value *expVal = Builder.CreateAnd(uintVal, expMask);
-    
+
     Value *expLSB = ConstantInt::get(uintTy->getScalarType(), kExponentLSB);
     expLSB = SplatToVector(expLSB, uintTy, Builder);
     Value *newExpVal = Builder.CreateAdd(expVal, expLSB);
 
-    Value *manValNotZero = Builder.CreateICmpEQ(manVal, ConstantAggregateZero::get(uintTy));
+    Value *manValNotZero =
+        Builder.CreateICmpEQ(manVal, ConstantAggregateZero::get(uintTy));
     Value *factors = Builder.CreateSelect(manValNotZero, newExpVal, expVal);
     return Builder.CreateUIToFP(factors, Ty);
   } break;
@@ -4538,21 +5468,28 @@ Value *RoundUpTessFactor(Value *input, DXIL::TessellatorPartitioning partitionMo
   }
 }
 
-Value *TranslateProcessIsolineTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                              HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateProcessIsolineTessFactors(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
-  // Get partition mode 
+  // Get partition mode
   DXASSERT_NOMSG(helper.functionProps);
-  DXASSERT(helper.functionProps->shaderKind == ShaderModel::Kind::Hull, "must be hull shader");
-  DXIL::TessellatorPartitioning partition = helper.functionProps->ShaderProps.HS.partition;
-  
+  DXASSERT(helper.functionProps->shaderKind == ShaderModel::Kind::Hull,
+           "must be hull shader");
+  DXIL::TessellatorPartitioning partition =
+      helper.functionProps->ShaderProps.HS.partition;
+
   IRBuilder<> Builder(CI);
 
-  Value *rawDetailFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawDetailFactor);
+  Value *rawDetailFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawDetailFactor);
   rawDetailFactor = Builder.CreateExtractElement(rawDetailFactor, (uint64_t)0);
 
-  Value *rawDensityFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawDensityFactor);
-  rawDensityFactor = Builder.CreateExtractElement(rawDensityFactor, (uint64_t)0);
+  Value *rawDensityFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawDensityFactor);
+  rawDensityFactor =
+      Builder.CreateExtractElement(rawDensityFactor, (uint64_t)0);
 
   Value *init = UndefValue::get(VectorType::get(helper.f32Ty, 2));
   init = Builder.CreateInsertElement(init, rawDetailFactor, (uint64_t)0);
@@ -4561,13 +5498,15 @@ Value *TranslateProcessIsolineTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpC
   Value *clamped = ClampTessFactor(init, partition, hlslOP, Builder);
   Value *rounded = RoundUpTessFactor(clamped, partition, hlslOP, Builder);
 
-  Value *roundedDetailFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedDetailFactor);
+  Value *roundedDetailFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedDetailFactor);
   Value *temp = UndefValue::get(VectorType::get(helper.f32Ty, 1));
   Value *roundedX = Builder.CreateExtractElement(rounded, (uint64_t)0);
   temp = Builder.CreateInsertElement(temp, roundedX, (uint64_t)0);
   Builder.CreateStore(temp, roundedDetailFactor);
 
-  Value *roundedDensityFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedDensityFactor);
+  Value *roundedDensityFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedDensityFactor);
   Value *roundedY = Builder.CreateExtractElement(rounded, 1);
   temp = Builder.CreateInsertElement(temp, roundedY, (uint64_t)0);
   Builder.CreateStore(temp, roundedDensityFactor);
@@ -4587,14 +5526,14 @@ Value *ApplyTriTessFactorOp(Value *input, DXIL::OpCode opcode, hlsl::OP *hlslOP,
     Value *combined =
         TrivialDxilBinaryOperation(opcode, temp, input2, hlslOP, Builder);
     return combined;
-  } else {
-    // Avg.
-    Value *temp = Builder.CreateFAdd(input0, input1);
-    Value *combined = Builder.CreateFAdd(temp, input2);
-    Value *rcp = ConstantFP::get(input0->getType(), 1.0 / 3.0);
-    combined = Builder.CreateFMul(combined, rcp);
-    return combined;
   }
+
+  // Avg.
+  Value *temp = Builder.CreateFAdd(input0, input1);
+  Value *combined = Builder.CreateFAdd(temp, input2);
+  Value *rcp = ConstantFP::get(input0->getType(), 1.0 / 3.0);
+  combined = Builder.CreateFMul(combined, rcp);
+  return combined;
 }
 
 // 4 inputs, 1 result
@@ -4613,15 +5552,15 @@ Value *ApplyQuadTessFactorOp(Value *input, DXIL::OpCode opcode,
     Value *combined =
         TrivialDxilBinaryOperation(opcode, temp0, temp1, hlslOP, Builder);
     return combined;
-  } else {
-    // Avg.
-    Value *temp0 = Builder.CreateFAdd(input0, input1);
-    Value *temp1 = Builder.CreateFAdd(input2, input3);
-    Value *combined = Builder.CreateFAdd(temp0, temp1);
-    Value *rcp = ConstantFP::get(input0->getType(), 0.25);
-    combined = Builder.CreateFMul(combined, rcp);
-    return combined;
   }
+
+  // Avg.
+  Value *temp0 = Builder.CreateFAdd(input0, input1);
+  Value *temp1 = Builder.CreateFAdd(input2, input3);
+  Value *combined = Builder.CreateFAdd(temp0, temp1);
+  Value *rcp = ConstantFP::get(input0->getType(), 0.25);
+  combined = Builder.CreateFMul(combined, rcp);
+  return combined;
 }
 
 // 4 inputs, 2 result
@@ -4641,37 +5580,45 @@ Value *Apply2DQuadTessFactorOp(Value *input, DXIL::OpCode opcode,
     combined = Builder.CreateInsertElement(combined, temp0, (uint64_t)0);
     combined = Builder.CreateInsertElement(combined, temp1, 1);
     return combined;
-  } else {
-    // Avg.
-    Value *temp0 = Builder.CreateFAdd(input0, input1);
-    Value *temp1 = Builder.CreateFAdd(input2, input3);
-    Value *combined = UndefValue::get(VectorType::get(input0->getType(), 2));
-    combined = Builder.CreateInsertElement(combined, temp0, (uint64_t)0);
-    combined = Builder.CreateInsertElement(combined, temp1, 1);
-    Constant *rcp = ConstantFP::get(input0->getType(), 0.5);
-    rcp = ConstantVector::getSplat(2, rcp);
-    combined = Builder.CreateFMul(combined, rcp);
-    return combined;
   }
+
+  // Avg.
+  Value *temp0 = Builder.CreateFAdd(input0, input1);
+  Value *temp1 = Builder.CreateFAdd(input2, input3);
+  Value *combined = UndefValue::get(VectorType::get(input0->getType(), 2));
+  combined = Builder.CreateInsertElement(combined, temp0, (uint64_t)0);
+  combined = Builder.CreateInsertElement(combined, temp1, 1);
+  Constant *rcp = ConstantFP::get(input0->getType(), 0.5);
+  rcp = ConstantVector::getSplat(2, rcp);
+  combined = Builder.CreateFMul(combined, rcp);
+  return combined;
 }
 
-Value *ResolveSmallValue(Value  **pClampedResult, Value *rounded, Value *averageUnscaled,
-    float cutoffVal, DXIL::TessellatorPartitioning partitionMode, hlsl::OP *hlslOP, IRBuilder<> &Builder) {
-  Value  *clampedResult = *pClampedResult;
+Value *ResolveSmallValue(Value **pClampedResult, Value *rounded,
+                         Value *averageUnscaled, float cutoffVal,
+                         DXIL::TessellatorPartitioning partitionMode,
+                         hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+  Value *clampedResult = *pClampedResult;
   Value *clampedVal = clampedResult;
   Value *roundedVal = rounded;
   // Do partitioning-specific clamping.
-  Value *clampedAvg = ClampTessFactor(averageUnscaled, partitionMode, hlslOP, Builder);
-  Constant *cutoffVals = ConstantFP::get(Type::getFloatTy(rounded->getContext()), cutoffVal);
+  Value *clampedAvg =
+      ClampTessFactor(averageUnscaled, partitionMode, hlslOP, Builder);
+  Constant *cutoffVals =
+      ConstantFP::get(Type::getFloatTy(rounded->getContext()), cutoffVal);
   if (clampedAvg->getType()->isVectorTy())
-    cutoffVals = ConstantVector::getSplat(clampedAvg->getType()->getVectorNumElements(), cutoffVals);
+    cutoffVals = ConstantVector::getSplat(
+        clampedAvg->getType()->getVectorNumElements(), cutoffVals);
   // Limit the value.
-  clampedAvg = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, clampedAvg, cutoffVals, hlslOP, Builder);
+  clampedAvg = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, clampedAvg,
+                                          cutoffVals, hlslOP, Builder);
   // Round up for integer/pow2 partitioning.
-  Value *roundedAvg = RoundUpTessFactor(clampedAvg, partitionMode, hlslOP, Builder);
+  Value *roundedAvg =
+      RoundUpTessFactor(clampedAvg, partitionMode, hlslOP, Builder);
 
   if (rounded->getType() != cutoffVals->getType())
-    cutoffVals = ConstantVector::getSplat(rounded->getType()->getVectorNumElements(), cutoffVals);
+    cutoffVals = ConstantVector::getSplat(
+        rounded->getType()->getVectorNumElements(), cutoffVals);
   // If the scaled value is less than three, then take the unscaled average.
   Value *lt = Builder.CreateFCmpOLT(rounded, cutoffVals);
   if (clampedAvg->getType() != clampedVal->getType())
@@ -4684,9 +5631,11 @@ Value *ResolveSmallValue(Value  **pClampedResult, Value *rounded, Value *average
   return result;
 }
 
-void ResolveQuadAxes( Value  **pFinalResult, Value **pClampedResult,
-    float cutoffVal, DXIL::TessellatorPartitioning partitionMode, hlsl::OP *hlslOP, IRBuilder<> &Builder) {
-  Value  *finalResult = *pFinalResult;
+void ResolveQuadAxes(Value **pFinalResult, Value **pClampedResult,
+                     float cutoffVal,
+                     DXIL::TessellatorPartitioning partitionMode,
+                     hlsl::OP *hlslOP, IRBuilder<> &Builder) {
+  Value *finalResult = *pFinalResult;
   Value *clampedResult = *pClampedResult;
 
   Value *clampR = clampedResult;
@@ -4695,19 +5644,24 @@ void ResolveQuadAxes( Value  **pFinalResult, Value **pClampedResult,
   Constant *cutoffVals = ConstantFP::get(f32Ty, cutoffVal);
 
   Value *minValsX = cutoffVals;
-  Value *minValsY = RoundUpTessFactor(cutoffVals, partitionMode, hlslOP, Builder);
+  Value *minValsY =
+      RoundUpTessFactor(cutoffVals, partitionMode, hlslOP, Builder);
 
   Value *clampRX = Builder.CreateExtractElement(clampR, (uint64_t)0);
   Value *clampRY = Builder.CreateExtractElement(clampR, 1);
-  Value *maxValsX = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, clampRX, clampRY, hlslOP, Builder);
+  Value *maxValsX = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, clampRX,
+                                               clampRY, hlslOP, Builder);
 
   Value *finalRX = Builder.CreateExtractElement(finalR, (uint64_t)0);
   Value *finalRY = Builder.CreateExtractElement(finalR, 1);
-  Value *maxValsY = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, finalRX, finalRY, hlslOP, Builder);
+  Value *maxValsY = TrivialDxilBinaryOperation(DXIL::OpCode::FMax, finalRX,
+                                               finalRY, hlslOP, Builder);
 
   // Don't go over our threshold ("final" one is rounded).
-  Value * optionX = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, maxValsX, minValsX, hlslOP, Builder);
-  Value * optionY = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, maxValsY, minValsY, hlslOP, Builder);
+  Value *optionX = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, maxValsX,
+                                              minValsX, hlslOP, Builder);
+  Value *optionY = TrivialDxilBinaryOperation(DXIL::OpCode::FMin, maxValsY,
+                                              minValsY, hlslOP, Builder);
 
   Value *clampL = SplatToVector(optionX, clampR->getType(), Builder);
   Value *finalL = SplatToVector(optionY, finalR->getType(), Builder);
@@ -4718,14 +5672,19 @@ void ResolveQuadAxes( Value  **pFinalResult, Value **pClampedResult,
   *pFinalResult = Builder.CreateSelect(lt, finalL, finalR);
 }
 
-Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                              HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP,
+                                   OP::OpCode opcode,
+                                   HLOperationLowerHelper &helper,
+                                   HLObjectOperationLowerHelper *pObjHelper,
+                                   bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
-  // Get partition mode 
+  // Get partition mode
   DXASSERT_NOMSG(helper.functionProps);
-  DXASSERT(helper.functionProps->shaderKind == ShaderModel::Kind::Hull, "must be hull shader");
-  DXIL::TessellatorPartitioning partition = helper.functionProps->ShaderProps.HS.partition;
-  
+  DXASSERT(helper.functionProps->shaderKind == ShaderModel::Kind::Hull,
+           "must be hull shader");
+  DXIL::TessellatorPartitioning partition =
+      helper.functionProps->ShaderProps.HS.partition;
+
   IRBuilder<> Builder(CI);
 
   DXIL::OpCode tessFactorOp = DXIL::OpCode::NumOpCodes;
@@ -4739,15 +5698,17 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
   case IntrinsicOp::IOP_ProcessQuadTessFactorsMin:
   case IntrinsicOp::IOP_ProcessTriTessFactorsMin:
     tessFactorOp = DXIL::OpCode::FMin;
-    break;  
+    break;
   default:
     // Default is Avg.
     break;
   }
 
-  Value *rawEdgeFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawEdgeFactor);
+  Value *rawEdgeFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRawEdgeFactor);
 
-  Value *insideScale = CI->getArgOperand(HLOperandIndex::kProcessTessFactorInsideScale);
+  Value *insideScale =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorInsideScale);
   // Clamp to [0.0f..1.0f], NaN->0.0f.
   Value *scales = CleanupTessFactorScale(insideScale, hlslOP, Builder);
   // Do partitioning-specific clamping.
@@ -4755,7 +5716,8 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
   // Round up for integer/pow2 partitioning.
   Value *rounded = RoundUpTessFactor(clamped, partition, hlslOP, Builder);
   // Store the output.
-  Value *roundedEdgeFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedEdgeFactor);
+  Value *roundedEdgeFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedEdgeFactor);
   Builder.CreateStore(rounded, roundedEdgeFactor);
 
   // Clamp to [1.0f..Inf], NaN->1.0f.
@@ -4794,7 +5756,7 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
 
   // Do partitioning-specific clamping.
   Value *clampedI = ClampTessFactor(scaledI, partition, hlslOP, Builder);
-  
+
   // Round up for integer/pow2 partitioning.
   Value *roundedI = RoundUpTessFactor(clampedI, partition, hlslOP, Builder);
 
@@ -4811,7 +5773,8 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
     case IntrinsicOp::IOP_Process2DQuadTessFactorsAvg:
     case IntrinsicOp::IOP_Process2DQuadTessFactorsMax:
     case IntrinsicOp::IOP_Process2DQuadTessFactorsMin:
-      avgFactorsI = Apply2DQuadTessFactorOp(clean, tessFactorOp, hlslOP, Builder);
+      avgFactorsI =
+          Apply2DQuadTessFactorOp(clean, tessFactorOp, hlslOP, Builder);
       b2D = true;
       break;
     case IntrinsicOp::IOP_ProcessQuadTessFactorsAvg:
@@ -4829,15 +5792,16 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
       break;
     }
 
-    finalI =
-        ResolveSmallValue(/*inout*/&clampedI, roundedI, avgFactorsI, /*cufoff*/ 3.0,
-                          partition, hlslOP, Builder);
+    finalI = ResolveSmallValue(/*inout*/ &clampedI, roundedI, avgFactorsI,
+                               /*cufoff*/ 3.0, partition, hlslOP, Builder);
 
     if (b2D)
-      ResolveQuadAxes(/*inout*/&finalI, /*inout*/&clampedI, /*cutoff*/3.0, partition, hlslOP, Builder);
+      ResolveQuadAxes(/*inout*/ &finalI, /*inout*/ &clampedI, /*cutoff*/ 3.0,
+                      partition, hlslOP, Builder);
   }
 
-  Value *unroundedInsideFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorUnRoundedInsideFactor);
+  Value *unroundedInsideFactor = CI->getArgOperand(
+      HLOperandIndex::kProcessTessFactorUnRoundedInsideFactor);
   Type *outFactorTy = unroundedInsideFactor->getType()->getPointerElementType();
   if (outFactorTy != clampedI->getType()) {
     DXASSERT(isQuad, "quad only write one channel of out factor");
@@ -4848,7 +5812,8 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
   }
   Builder.CreateStore(clampedI, unroundedInsideFactor);
 
-  Value *roundedInsideFactor = CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedInsideFactor);  
+  Value *roundedInsideFactor =
+      CI->getArgOperand(HLOperandIndex::kProcessTessFactorRoundedInsideFactor);
   if (outFactorTy != finalI->getType()) {
     DXASSERT(isQuad, "quad only write one channel of out factor");
     finalI = Builder.CreateExtractElement(finalI, (uint64_t)0);
@@ -4859,8 +5824,7 @@ Value *TranslateProcessTessFactors(CallInst *CI, IntrinsicOp IOP, OP::OpCode opc
   return nullptr;
 }
 
-
-}
+} // namespace
 
 // Ray Tracing.
 namespace {
@@ -4882,11 +5846,10 @@ Value *TranslateReportIntersection(CallInst *CI, IntrinsicOp IOP,
   return Builder.CreateCall(F, {opArg, THit, HitKind, Attr});
 }
 
-Value *TranslateCallShader(CallInst *CI, IntrinsicOp IOP,
-                                   OP::OpCode opcode,
-                                   HLOperationLowerHelper &helper,
-                                   HLObjectOperationLowerHelper *pObjHelper,
-                                   bool &Translated) {
+Value *TranslateCallShader(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                           HLOperationLowerHelper &helper,
+                           HLObjectOperationLowerHelper *pObjHelper,
+                           bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *ShaderIndex = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
   Value *Parameter = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
@@ -4899,120 +5862,113 @@ Value *TranslateCallShader(CallInst *CI, IntrinsicOp IOP,
   return Builder.CreateCall(F, {opArg, ShaderIndex, Parameter});
 }
 
-Value *TranslateTraceRay(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
+static void TransferRayDescArgs(Value **Args, hlsl::OP *OP,
+                                IRBuilder<> &Builder, CallInst *CI,
+                                unsigned &Index, unsigned &HLIndex) {
+  // Extract elements from flattened ray desc arguments in HL op.
+  // float3 Origin;
+  Value *origin = CI->getArgOperand(HLIndex++);
+  Args[Index++] = Builder.CreateExtractElement(origin, (uint64_t)0);
+  Args[Index++] = Builder.CreateExtractElement(origin, 1);
+  Args[Index++] = Builder.CreateExtractElement(origin, 2);
+  // float  TMin;
+  Args[Index++] = CI->getArgOperand(HLIndex++);
+  // float3 Direction;
+  Value *direction = CI->getArgOperand(HLIndex++);
+  Args[Index++] = Builder.CreateExtractElement(direction, (uint64_t)0);
+  Args[Index++] = Builder.CreateExtractElement(direction, 1);
+  Args[Index++] = Builder.CreateExtractElement(direction, 2);
+  // float  TMax;
+  Args[Index++] = CI->getArgOperand(HLIndex++);
+}
+
+Value *TranslateTraceRay(CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+                         HLOperationLowerHelper &Helper,
                          HLObjectOperationLowerHelper *pObjHelper,
                          bool &Translated) {
-  hlsl::OP *hlslOP = &helper.hlslOP;
-
-  Value *rayDesc = CI->getArgOperand(HLOperandIndex::kTraceRayRayDescOpIdx);
-  Value *payLoad = CI->getArgOperand(HLOperandIndex::kTraceRayPayLoadOpIdx);
-
-  Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
+  hlsl::OP *OP = &Helper.hlslOP;
 
   Value *Args[DXIL::OperandIndex::kTraceRayNumOp];
-  Args[0] = opArg;
-  for (unsigned i = 1; i < HLOperandIndex::kTraceRayRayDescOpIdx; i++) {
-    Args[i] = CI->getArgOperand(i);
-  }
+  Args[0] = OP->GetU32Const(static_cast<unsigned>(OpCode));
+  unsigned Index = 1, HLIndex = 1;
+  while (HLIndex < HLOperandIndex::kTraceRayRayDescOpIdx)
+    Args[Index++] = CI->getArgOperand(HLIndex++);
+
   IRBuilder<> Builder(CI);
-  // struct RayDesc
-  //{
-  //    float3 Origin;
-  //    float  TMin;
-  //    float3 Direction;
-  //    float  TMax;
-  //};
-  Value *zeroIdx = hlslOP->GetU32Const(0);
-  Value *origin = Builder.CreateGEP(rayDesc, {zeroIdx, zeroIdx});
-  origin = Builder.CreateLoad(origin);
-  unsigned index = DXIL::OperandIndex::kTraceRayRayDescOpIdx;
-  Args[index++] = Builder.CreateExtractElement(origin, (uint64_t)0);
-  Args[index++] = Builder.CreateExtractElement(origin, 1);
-  Args[index++] = Builder.CreateExtractElement(origin, 2);
+  TransferRayDescArgs(Args, OP, Builder, CI, Index, HLIndex);
+  DXASSERT_NOMSG(HLIndex == CI->getNumArgOperands() - 1);
+  DXASSERT_NOMSG(Index == DXIL::OperandIndex::kTraceRayPayloadOpIdx);
 
-  Value *tmin = Builder.CreateGEP(rayDesc, {zeroIdx, hlslOP->GetU32Const(1)});
-  tmin = Builder.CreateLoad(tmin);
-  Args[index++] = tmin;
+  Value *Payload = CI->getArgOperand(HLIndex++);
+  Args[Index++] = Payload;
 
-  Value *direction = Builder.CreateGEP(rayDesc, {zeroIdx, hlslOP->GetU32Const(2)});
-  direction = Builder.CreateLoad(direction);
+  DXASSERT_NOMSG(HLIndex == CI->getNumArgOperands());
+  DXASSERT_NOMSG(Index == DXIL::OperandIndex::kTraceRayNumOp);
 
-  Args[index++] = Builder.CreateExtractElement(direction, (uint64_t)0);
-  Args[index++] = Builder.CreateExtractElement(direction, 1);
-  Args[index++] = Builder.CreateExtractElement(direction, 2);
-
-  Value *tmax = Builder.CreateGEP(rayDesc, {zeroIdx, hlslOP->GetU32Const(3)});
-  tmax = Builder.CreateLoad(tmax);
-  Args[index++] = tmax;
-
-  Args[DXIL::OperandIndex::kTraceRayPayloadOpIdx] = payLoad;
-
-  Type *Ty = payLoad->getType();
-  Function *F = hlslOP->GetOpFunc(opcode, Ty);
-
+  Type *Ty = Payload->getType();
+  Function *F = OP->GetOpFunc(OpCode, Ty);
 
   return Builder.CreateCall(F, Args);
 }
 
 // RayQuery methods
 
-Value *TranslateAllocateRayQuery(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+Value *TranslateAllocateRayQuery(CallInst *CI, IntrinsicOp IOP,
+                                 OP::OpCode opcode,
                                  HLOperationLowerHelper &helper,
                                  HLObjectOperationLowerHelper *pObjHelper,
                                  bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
-  Value *refArgs[] = {nullptr, CI->getOperand(1)};
+  // upgrade to allocateRayQuery2 if there is a non-zero 2nd template arg
+  DXASSERT(CI->getNumArgOperands() == 3,
+           "hlopcode for allocaterayquery always expects 3 arguments");
+
+  llvm::Value *Arg =
+      CI->getArgOperand(HLOperandIndex::kAllocateRayQueryRayQueryFlagsIdx);
+  llvm::ConstantInt *ConstVal = llvm::dyn_cast<llvm::ConstantInt>(Arg);
+  DXASSERT(ConstVal,
+           "2nd argument to allocaterayquery must always be a constant value");
+  if (ConstVal->getValue().getZExtValue() != 0) {
+    Value *refArgs[3] = {
+        nullptr, CI->getOperand(HLOperandIndex::kAllocateRayQueryRayFlagsIdx),
+        CI->getOperand(HLOperandIndex::kAllocateRayQueryRayQueryFlagsIdx)};
+    opcode = OP::OpCode::AllocateRayQuery2;
+    return TrivialDxilOperation(opcode, refArgs, helper.voidTy, CI, hlslOP);
+  }
+  Value *refArgs[2] = {
+      nullptr, CI->getOperand(HLOperandIndex::kAllocateRayQueryRayFlagsIdx)};
   return TrivialDxilOperation(opcode, refArgs, helper.voidTy, CI, hlslOP);
 }
 
 Value *TranslateTraceRayInline(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+                               HLOperationLowerHelper &helper,
+                               HLObjectOperationLowerHelper *pObjHelper,
+                               bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
-
   Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
 
   Value *Args[DXIL::OperandIndex::kTraceRayInlineNumOp];
   Args[0] = opArg;
-  for (unsigned i = 1; i < HLOperandIndex::kTraceRayInlineRayDescOpIdx; i++) {
-    Args[i] = CI->getArgOperand(i);
-  }
+  unsigned Index = 1, HLIndex = 1;
+  while (HLIndex < HLOperandIndex::kTraceRayInlineRayDescOpIdx)
+    Args[Index++] = CI->getArgOperand(HLIndex++);
 
   IRBuilder<> Builder(CI);
-  unsigned hlIndex = HLOperandIndex::kTraceRayInlineRayDescOpIdx;
-  unsigned index = DXIL::OperandIndex::kTraceRayInlineRayDescOpIdx;
-
-  // struct RayDesc
-  //{
-  //    float3 Origin;
-  Value *origin = CI->getArgOperand(hlIndex++);
-  Args[index++] = Builder.CreateExtractElement(origin, (uint64_t)0);
-  Args[index++] = Builder.CreateExtractElement(origin, 1);
-  Args[index++] = Builder.CreateExtractElement(origin, 2);
-  //    float  TMin;
-  Args[index++] = CI->getArgOperand(hlIndex++);
-  //    float3 Direction;
-  Value *direction = CI->getArgOperand(hlIndex++);
-  Args[index++] = Builder.CreateExtractElement(direction, (uint64_t)0);
-  Args[index++] = Builder.CreateExtractElement(direction, 1);
-  Args[index++] = Builder.CreateExtractElement(direction, 2);
-  //    float  TMax;
-  Args[index++] = CI->getArgOperand(hlIndex++);
-  //};
-
-  DXASSERT_NOMSG(index == DXIL::OperandIndex::kTraceRayInlineNumOp);
+  DXASSERT_NOMSG(HLIndex == HLOperandIndex::kTraceRayInlineRayDescOpIdx);
+  DXASSERT_NOMSG(Index == DXIL::OperandIndex::kTraceRayInlineRayDescOpIdx);
+  TransferRayDescArgs(Args, hlslOP, Builder, CI, Index, HLIndex);
+  DXASSERT_NOMSG(HLIndex == CI->getNumArgOperands());
+  DXASSERT_NOMSG(Index == DXIL::OperandIndex::kTraceRayInlineNumOp);
 
   Function *F = hlslOP->GetOpFunc(opcode, Builder.getVoidTy());
 
   return Builder.CreateCall(F, Args);
 }
 
-Value *TranslateCommitProceduralPrimitiveHit(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateCommitProceduralPrimitiveHit(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   Value *THit = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
   Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
@@ -5026,10 +5982,11 @@ Value *TranslateCommitProceduralPrimitiveHit(CallInst *CI, IntrinsicOp IOP, OP::
   return Builder.CreateCall(F, Args);
 }
 
-Value *TranslateGenericRayQueryMethod(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateGenericRayQueryMethod(CallInst *CI, IntrinsicOp IOP,
+                                      OP::OpCode opcode,
+                                      HLOperationLowerHelper &helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
 
   Value *opArg = hlslOP->GetU32Const(static_cast<unsigned>(opcode));
@@ -5041,10 +5998,10 @@ Value *TranslateGenericRayQueryMethod(CallInst *CI, IntrinsicOp IOP, OP::OpCode 
   return Builder.CreateCall(F, {opArg, handle});
 }
 
-Value *TranslateRayQueryMatrix3x4Operation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateRayQueryMatrix3x4Operation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   VectorType *Ty = cast<VectorType>(CI->getType());
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -5052,31 +6009,32 @@ Value *TranslateRayQueryMatrix3x4Operation(CallInst *CI, IntrinsicOp IOP, OP::Op
   Constant *rows = ConstantDataVector::get(CI->getContext(), rVals);
   uint8_t cVals[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
   Constant *cols = ConstantDataVector::get(CI->getContext(), cVals);
-  Value *retVal =
-      TrivialDxilOperation(opcode, {nullptr, handle, rows, cols}, Ty, CI, hlslOP);
+  Value *retVal = TrivialDxilOperation(opcode, {nullptr, handle, rows, cols},
+                                       Ty, CI, hlslOP);
   return retVal;
 }
 
-Value *TranslateRayQueryTransposedMatrix3x4Operation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                                                  HLOperationLowerHelper &helper,
-                                                  HLObjectOperationLowerHelper *pObjHelper,
-                                                  bool &Translated) {
-  hlsl::OP *hlslOP = &helper.hlslOP; 
+Value *TranslateRayQueryTransposedMatrix3x4Operation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
   VectorType *Ty = cast<VectorType>(CI->getType());
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
-  uint32_t rVals[] = { 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2 };
+  uint32_t rVals[] = {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2};
   Constant *rows = ConstantDataVector::get(CI->getContext(), rVals);
-  uint8_t cVals[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3 };
+  uint8_t cVals[] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3};
   Constant *cols = ConstantDataVector::get(CI->getContext(), cVals);
-  Value *retVal =
-      TrivialDxilOperation(opcode, {nullptr, handle, rows, cols}, Ty, CI, hlslOP);
+  Value *retVal = TrivialDxilOperation(opcode, {nullptr, handle, rows, cols},
+                                       Ty, CI, hlslOP);
   return retVal;
 }
 
-Value *TranslateRayQueryFloat2Getter(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateRayQueryFloat2Getter(CallInst *CI, IntrinsicOp IOP,
+                                     OP::OpCode opcode,
+                                     HLOperationLowerHelper &helper,
+                                     HLObjectOperationLowerHelper *pObjHelper,
+                                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   VectorType *Ty = cast<VectorType>(CI->getType());
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -5087,10 +6045,11 @@ Value *TranslateRayQueryFloat2Getter(CallInst *CI, IntrinsicOp IOP, OP::OpCode o
   return retVal;
 }
 
-Value *TranslateRayQueryFloat3Getter(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateRayQueryFloat3Getter(CallInst *CI, IntrinsicOp IOP,
+                                     OP::OpCode opcode,
+                                     HLOperationLowerHelper &helper,
+                                     HLObjectOperationLowerHelper *pObjHelper,
+                                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   VectorType *Ty = cast<VectorType>(CI->getType());
   Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
@@ -5101,55 +6060,191 @@ Value *TranslateRayQueryFloat3Getter(CallInst *CI, IntrinsicOp IOP, OP::OpCode o
   return retVal;
 }
 
-Value *TranslateNoArgVectorOperation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
+Value *TranslateNoArgVectorOperation(CallInst *CI, IntrinsicOp IOP,
+                                     OP::OpCode opcode,
+                                     HLOperationLowerHelper &helper,
+                                     HLObjectOperationLowerHelper *pObjHelper,
+                                     bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
   VectorType *Ty = cast<VectorType>(CI->getType());
-  uint8_t vals[] = {0,1,2,3};
+  uint8_t vals[] = {0, 1, 2, 3};
   Constant *src = ConstantDataVector::get(CI->getContext(), vals);
   Value *retVal = TrivialDxilOperation(opcode, {nullptr, src}, Ty, CI, hlslOP);
   return retVal;
 }
 
-Value *TranslateNoArgMatrix3x4Operation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                         HLOperationLowerHelper &helper,
-                         HLObjectOperationLowerHelper *pObjHelper,
-                         bool &Translated) {
-  hlsl::OP *hlslOP = &helper.hlslOP;
-  VectorType *Ty = cast<VectorType>(CI->getType());
-  uint32_t rVals[] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2};
-  Constant *rows = ConstantDataVector::get(CI->getContext(), rVals);
-  uint8_t cVals[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
-  Constant *cols = ConstantDataVector::get(CI->getContext(), cVals);
-  Value *retVal =
-      TrivialDxilOperation(opcode, {nullptr, rows, cols}, Ty, CI, hlslOP);
-  return retVal;
+static Value *ConstructBuiltInTrianglePositionsFromFloat9(
+    Value *float9Vec, StructType *hlslStructTy, IRBuilder<> &Builder) {
+  Type *f32Ty = Type::getFloatTy(Builder.getContext());
+  Type *float3Ty = VectorType::get(f32Ty, 3);
+  Value *result = UndefValue::get(hlslStructTy);
+
+  // Build p0, p1, p2 from vector elements 0-2, 3-5, 6-8
+  for (unsigned field = 0; field < 3; field++) {
+    Value *float3 = UndefValue::get(float3Ty);
+    for (unsigned i = 0; i < 3; i++) {
+      Value *elem = Builder.CreateExtractElement(float9Vec, field * 3 + i);
+      float3 = Builder.CreateInsertElement(float3, elem, i);
+    }
+    result = Builder.CreateInsertValue(result, float3, field);
+  }
+
+  return result;
 }
 
-Value *TranslateNoArgTransposedMatrix3x4Operation(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                                                  HLOperationLowerHelper &helper,
-                                                  HLObjectOperationLowerHelper *pObjHelper,
-                                                  bool &Translated) {
+Value *TranslateTriangleObjectPositions(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
-  VectorType *Ty = cast<VectorType>(CI->getType());
-  uint32_t rVals[] = { 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2 };
-  Constant *rows = ConstantDataVector::get(CI->getContext(), rVals);
-  uint8_t cVals[] = { 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3 };
-  Constant *cols = ConstantDataVector::get(CI->getContext(), cVals);
-  Value *retVal =
-    TrivialDxilOperation(opcode, { nullptr, rows, cols }, Ty, CI, hlslOP);
-  return retVal;
+  IRBuilder<> Builder(CI);
+
+  Value *outputPtr = CI->getArgOperand(HLOperandIndex::kIOP_SRetOpIdx);
+  StructType *hlslStructTy =
+      cast<StructType>(outputPtr->getType()->getPointerElementType());
+
+  Type *f32Ty = Type::getFloatTy(CI->getContext());
+  Function *dxilFunc = hlslOP->GetOpFunc(opcode, f32Ty);
+  Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
+
+  Value *dxilCall = Builder.CreateCall(dxilFunc, {opArg});
+
+  Value *structValue = ConstructBuiltInTrianglePositionsFromFloat9(
+      dxilCall, hlslStructTy, Builder);
+  Builder.CreateStore(structValue, outputPtr);
+
+  return nullptr;
 }
 
-Value *TranslateNoArgNoReturnPreserveOutput(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-  HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+Value *TranslateRayQueryTriangleObjectPositions(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  StructType *hlslStructTy =
+      cast<StructType>(CI->getType()->getPointerElementType());
+
+  Function *F = CI->getParent()->getParent();
+  IRBuilder<> AllocaBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+  AllocaInst *resultAlloca = AllocaBuilder.CreateAlloca(hlslStructTy);
+
+  IRBuilder<> Builder(CI);
+
+  Type *f32Ty = Type::getFloatTy(CI->getContext());
+  Function *dxilFunc = hlslOP->GetOpFunc(opcode, f32Ty);
+  Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
+
+  Value *dxilCall = Builder.CreateCall(dxilFunc, {opArg, handle});
+
+  Value *structValue = ConstructBuiltInTrianglePositionsFromFloat9(
+      dxilCall, hlslStructTy, Builder);
+  Builder.CreateStore(structValue, resultAlloca);
+
+  return resultAlloca;
+}
+
+Value *TranslateHitObjectTriangleObjectPositions(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+
+  Value *hitObjectPtr = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  StructType *hlslStructTy =
+      cast<StructType>(CI->getType()->getPointerElementType());
+
+  Function *F = CI->getParent()->getParent();
+  IRBuilder<> AllocaBuilder(&F->getEntryBlock(), F->getEntryBlock().begin());
+  AllocaInst *resultAlloca = AllocaBuilder.CreateAlloca(hlslStructTy);
+
+  IRBuilder<> Builder(CI);
+  Value *hitObject = Builder.CreateLoad(hitObjectPtr);
+
+  Type *f32Ty = Type::getFloatTy(CI->getContext());
+  Function *dxilFunc = hlslOP->GetOpFunc(opcode, f32Ty);
+  Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
+
+  Value *dxilCall = Builder.CreateCall(dxilFunc, {opArg, hitObject});
+
+  Value *structValue = ConstructBuiltInTrianglePositionsFromFloat9(
+      dxilCall, hlslStructTy, Builder);
+  Builder.CreateStore(structValue, resultAlloca);
+
+  return resultAlloca;
+}
+
+template <typename ColElemTy>
+static void GetMatrixIndices(Constant *&Rows, Constant *&Cols, bool Is3x4,
+                             LLVMContext &Ctx) {
+  if (Is3x4) {
+    uint32_t RVals[] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2};
+    Rows = ConstantDataVector::get(Ctx, RVals);
+    ColElemTy CVals[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    Cols = ConstantDataVector::get(Ctx, CVals);
+    return;
+  }
+  uint32_t RVals[] = {0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2};
+  Rows = ConstantDataVector::get(Ctx, RVals);
+  ColElemTy CVals[] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3};
+  Cols = ConstantDataVector::get(Ctx, CVals);
+}
+
+Value *TranslateNoArgMatrix3x4Operation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+  VectorType *Ty = cast<VectorType>(CI->getType());
+  Constant *Rows, *Cols;
+  GetMatrixIndices<uint8_t>(Rows, Cols, true, CI->getContext());
+  return TrivialDxilOperation(opcode, {nullptr, Rows, Cols}, Ty, CI, hlslOP);
+}
+
+Value *TranslateNoArgTransposedMatrix3x4Operation(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *hlslOP = &helper.hlslOP;
+  VectorType *Ty = cast<VectorType>(CI->getType());
+  Constant *Rows, *Cols;
+  GetMatrixIndices<uint8_t>(Rows, Cols, false, CI->getContext());
+  return TrivialDxilOperation(opcode, {nullptr, Rows, Cols}, Ty, CI, hlslOP);
+}
+
+/*
+HLSL:
+void ThreadNodeOutputRecords<recordType>::OutputComplete();
+void GroupNodeOutputRecords<recordType>::OutputComplete();
+DXIL:
+void @dx.op.outputComplete(i32 %Opcode, %dx.types.NodeRecordHandle
+%RecordHandle)
+*/
+Value *TranslateNodeOutputComplete(CallInst *CI, IntrinsicOp IOP, OP::OpCode op,
+                                   HLOperationLowerHelper &helper,
+                                   HLObjectOperationLowerHelper *pObjHelper,
+                                   bool &Translated) {
+  hlsl::OP *OP = &helper.hlslOP;
+
+  Value *handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  DXASSERT_NOMSG(handle->getType() == OP->GetNodeRecordHandleType());
+  Function *dxilFunc = OP->GetOpFunc(op, CI->getType());
+  Value *opArg = OP->GetU32Const((unsigned)op);
+
+  IRBuilder<> Builder(CI);
+  return Builder.CreateCall(dxilFunc, {opArg, handle});
+}
+
+Value *TranslateNoArgNoReturnPreserveOutput(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+    HLOperationLowerHelper &helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
   Instruction *pResult = cast<Instruction>(
-    TrivialNoArgOperation(CI, IOP, opcode, helper, pObjHelper, Translated));
+      TrivialNoArgOperation(CI, IOP, opcode, helper, pObjHelper, Translated));
   // HL intrinsic must have had a return injected just after the call.
-  // SROA_Parameter_HLSL will copy from alloca to output just before each return.
-  // Now move call after the copy and just before the return.
+  // SROA_Parameter_HLSL will copy from alloca to output just before each
+  // return. Now move call after the copy and just before the return.
   if (isa<ReturnInst>(pResult->getNextNode()))
     return pResult;
   ReturnInst *RetI = cast<ReturnInst>(pResult->getParent()->getTerminator());
@@ -5203,20 +6298,22 @@ Value *TranslateDot4AddPacked(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
       !src0->getType()->isVectorTy() && src0->getType()->isIntegerTy(32),
       "otherwise, unexpected vector support in high level intrinsic template");
   Value *src1 = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
-  DXASSERT(src0->getType() == src1->getType(), "otherwise, mismatched argument types");
+  DXASSERT(src0->getType() == src1->getType(),
+           "otherwise, mismatched argument types");
   Value *accArg = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc2Idx);
   Type *accTy = accArg->getType();
-  DXASSERT(!accTy->isVectorTy() && accTy->isIntegerTy(32),
-    "otherwise, unexpected vector support in high level intrinsic template");
+  DXASSERT(
+      !accTy->isVectorTy() && accTy->isIntegerTy(32),
+      "otherwise, unexpected vector support in high level intrinsic template");
   IRBuilder<> Builder(CI);
 
   Function *dxilFunc = hlslOP->GetOpFunc(opcode, accTy);
   Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
-  return Builder.CreateCall(dxilFunc, { opArg, accArg, src0, src1 });
+  return Builder.CreateCall(dxilFunc, {opArg, accArg, src0, src1});
 }
 
 Value *TranslatePack(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper, 
+                     HLOperationLowerHelper &helper,
                      HLObjectOperationLowerHelper *pObjHelper,
                      bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
@@ -5225,25 +6322,27 @@ Value *TranslatePack(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   Type *valTy = val->getType();
   Type *eltTy = valTy->getScalarType();
 
-  DXASSERT(valTy->isVectorTy() && valTy->getVectorNumElements() == 4 && eltTy->isIntegerTy() &&
-    (eltTy->getIntegerBitWidth() == 32 || eltTy->getIntegerBitWidth() == 16),
-    "otherwise, unexpected input dimension or component type");
+  DXASSERT(valTy->isVectorTy() && valTy->getVectorNumElements() == 4 &&
+               eltTy->isIntegerTy() &&
+               (eltTy->getIntegerBitWidth() == 32 ||
+                eltTy->getIntegerBitWidth() == 16),
+           "otherwise, unexpected input dimension or component type");
 
   DXIL::PackMode packMode = DXIL::PackMode::Trunc;
   switch (IOP) {
-    case hlsl::IntrinsicOp::IOP_pack_clamp_s8: 
-      packMode = DXIL::PackMode::SClamp;
-      break;
-    case hlsl::IntrinsicOp::IOP_pack_clamp_u8:
-      packMode = DXIL::PackMode::UClamp;
-      break;
-    case hlsl::IntrinsicOp::IOP_pack_s8:
-    case hlsl::IntrinsicOp::IOP_pack_u8:
-      packMode = DXIL::PackMode::Trunc;
-      break;
-    default:
-      DXASSERT(false, "unexpected opcode");
-      break;
+  case hlsl::IntrinsicOp::IOP_pack_clamp_s8:
+    packMode = DXIL::PackMode::SClamp;
+    break;
+  case hlsl::IntrinsicOp::IOP_pack_clamp_u8:
+    packMode = DXIL::PackMode::UClamp;
+    break;
+  case hlsl::IntrinsicOp::IOP_pack_s8:
+  case hlsl::IntrinsicOp::IOP_pack_u8:
+    packMode = DXIL::PackMode::Trunc;
+    break;
+  default:
+    DXASSERT(false, "unexpected opcode");
+    break;
   }
 
   IRBuilder<> Builder(CI);
@@ -5255,48 +6354,51 @@ Value *TranslatePack(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   Value *elt1 = Builder.CreateExtractElement(val, (uint64_t)1);
   Value *elt2 = Builder.CreateExtractElement(val, (uint64_t)2);
   Value *elt3 = Builder.CreateExtractElement(val, (uint64_t)3);
-  return Builder.CreateCall(dxilFunc, { opArg, packModeArg, elt0, elt1, elt2, elt3 });
+  return Builder.CreateCall(dxilFunc,
+                            {opArg, packModeArg, elt0, elt1, elt2, elt3});
 }
 
 Value *TranslateUnpack(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
-                     HLOperationLowerHelper &helper, 
-                     HLObjectOperationLowerHelper *pObjHelper,
-                     bool &Translated) {
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
   hlsl::OP *hlslOP = &helper.hlslOP;
 
   Value *packedVal = CI->getArgOperand(HLOperandIndex::kUnaryOpSrc0Idx);
-  DXASSERT(!packedVal->getType()->isVectorTy() && packedVal->getType()->isIntegerTy(32),
-    "otherwise, unexpected vector support in high level intrinsic template");
+  DXASSERT(
+      !packedVal->getType()->isVectorTy() &&
+          packedVal->getType()->isIntegerTy(32),
+      "otherwise, unexpected vector support in high level intrinsic template");
 
   Type *overloadType = nullptr;
   DXIL::UnpackMode unpackMode = DXIL::UnpackMode::Unsigned;
   switch (IOP) {
-    case hlsl::IntrinsicOp::IOP_unpack_s8s32:
-      unpackMode = DXIL::UnpackMode::Signed;
-      overloadType = helper.i32Ty;
-      break;
-    case hlsl::IntrinsicOp::IOP_unpack_u8u32:
-      unpackMode = DXIL::UnpackMode::Unsigned;
-      overloadType = helper.i32Ty;
-      break;
-    case hlsl::IntrinsicOp::IOP_unpack_s8s16:
-      unpackMode = DXIL::UnpackMode::Signed;
-      overloadType = helper.i16Ty;
-      break;
-    case hlsl::IntrinsicOp::IOP_unpack_u8u16:
-      unpackMode = DXIL::UnpackMode::Unsigned;
-      overloadType = helper.i16Ty;
-      break;
-    default:
-      DXASSERT(false, "unexpected opcode");
-      break;
+  case hlsl::IntrinsicOp::IOP_unpack_s8s32:
+    unpackMode = DXIL::UnpackMode::Signed;
+    overloadType = helper.i32Ty;
+    break;
+  case hlsl::IntrinsicOp::IOP_unpack_u8u32:
+    unpackMode = DXIL::UnpackMode::Unsigned;
+    overloadType = helper.i32Ty;
+    break;
+  case hlsl::IntrinsicOp::IOP_unpack_s8s16:
+    unpackMode = DXIL::UnpackMode::Signed;
+    overloadType = helper.i16Ty;
+    break;
+  case hlsl::IntrinsicOp::IOP_unpack_u8u16:
+    unpackMode = DXIL::UnpackMode::Unsigned;
+    overloadType = helper.i16Ty;
+    break;
+  default:
+    DXASSERT(false, "unexpected opcode");
+    break;
   }
-  
+
   IRBuilder<> Builder(CI);
   Function *dxilFunc = hlslOP->GetOpFunc(opcode, overloadType);
   Constant *opArg = hlslOP->GetU32Const((unsigned)opcode);
   Constant *unpackModeArg = hlslOP->GetU8Const((unsigned)unpackMode);
-  Value *Res = Builder.CreateCall(dxilFunc, { opArg, unpackModeArg , packedVal });
+  Value *Res = Builder.CreateCall(dxilFunc, {opArg, unpackModeArg, packedVal});
 
   // Convert the final aggregate into a vector to make the types match
   const unsigned vecSize = 4;
@@ -5306,6 +6408,314 @@ Value *TranslateUnpack(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
     ResVec = Builder.CreateInsertElement(ResVec, Elt, i);
   }
   return ResVec;
+}
+
+} // namespace
+
+// Shader Execution Reordering.
+namespace {
+Value *TranslateHitObjectMakeNop(CallInst *CI, IntrinsicOp IOP,
+                                 OP::OpCode Opcode,
+                                 HLOperationLowerHelper &Helper,
+                                 HLObjectOperationLowerHelper *ObjHelper,
+                                 bool &Translated) {
+  hlsl::OP *HlslOP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  Value *HitObject = TrivialDxilOperation(
+      Opcode, {nullptr}, Type::getVoidTy(CI->getContext()), CI, HlslOP);
+  Builder.CreateStore(HitObject, HitObjectPtr);
+  DXASSERT(
+      CI->use_empty(),
+      "Default ctor return type is a Clang artifact. Value must not be used");
+  return nullptr;
+}
+
+Value *TranslateHitObjectMakeMiss(CallInst *CI, IntrinsicOp IOP,
+                                  OP::OpCode Opcode,
+                                  HLOperationLowerHelper &Helper,
+                                  HLObjectOperationLowerHelper *ObjHelper,
+                                  bool &Translated) {
+  DXASSERT_NOMSG(CI->getNumArgOperands() ==
+                 HLOperandIndex::kHitObjectMakeMiss_NumOp);
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+  Value *Args[DXIL::OperandIndex::kHitObjectMakeMiss_NumOp];
+  Args[0] = nullptr; // Filled in by TrivialDxilOperation
+
+  unsigned DestIdx = 1, SrcIdx = 1;
+  Value *HitObjectPtr = CI->getArgOperand(SrcIdx++);
+  Args[DestIdx++] = CI->getArgOperand(SrcIdx++); // RayFlags
+  Args[DestIdx++] = CI->getArgOperand(SrcIdx++); // MissShaderIdx
+
+  DXASSERT_NOMSG(SrcIdx == HLOperandIndex::kHitObjectMakeMiss_RayDescOpIdx);
+  DXASSERT_NOMSG(DestIdx ==
+                 DXIL::OperandIndex::kHitObjectMakeMiss_RayDescOpIdx);
+  TransferRayDescArgs(Args, OP, Builder, CI, DestIdx, SrcIdx);
+  DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands());
+  DXASSERT_NOMSG(DestIdx == DXIL::OperandIndex::kHitObjectMakeMiss_NumOp);
+
+  Value *OutHitObject =
+      TrivialDxilOperation(Opcode, Args, Helper.voidTy, CI, OP);
+  Builder.CreateStore(OutHitObject, HitObjectPtr);
+  return nullptr;
+}
+
+Value *TranslateMaybeReorderThread(CallInst *CI, IntrinsicOp IOP,
+                                   OP::OpCode OpCode,
+                                   HLOperationLowerHelper &Helper,
+                                   HLObjectOperationLowerHelper *pObjHelper,
+                                   bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+
+  // clang-format off
+  // Match MaybeReorderThread overload variants:
+  // void MaybeReorderThread(<Op>,
+  //                    HitObject Hit);
+  // void MaybeReorderThread(<Op>,
+  //                    uint CoherenceHint,
+  //                    uint NumCoherenceHintBitsFromLSB );
+  // void MaybeReorderThread(<Op>,
+  //                    HitObject Hit,
+  //                    uint CoherenceHint,
+  //                    uint NumCoherenceHintBitsFromLSB);
+  // clang-format on
+  const unsigned NumHLArgs = CI->getNumArgOperands();
+  DXASSERT_NOMSG(NumHLArgs >= 2);
+
+  // Use a NOP HitObject for MaybeReorderThread without HitObject.
+  Value *HitObject = nullptr;
+  unsigned HLIndex = 1;
+  if (3 == NumHLArgs) {
+    HitObject = TrivialDxilOperation(DXIL::OpCode::HitObject_MakeNop, {nullptr},
+                                     Type::getVoidTy(CI->getContext()), CI, OP);
+  } else {
+    Value *FirstParam = CI->getArgOperand(HLIndex);
+    DXASSERT_NOMSG(isa<PointerType>(FirstParam->getType()));
+    IRBuilder<> Builder(CI);
+    HitObject = Builder.CreateLoad(FirstParam);
+    HLIndex++;
+  }
+
+  // If there are trailing parameters, these have to be the two coherence bit
+  // parameters
+  Value *CoherenceHint = nullptr;
+  Value *NumCoherenceHintBits = nullptr;
+  if (2 != NumHLArgs) {
+    DXASSERT_NOMSG(HLIndex + 2 == NumHLArgs);
+    CoherenceHint = CI->getArgOperand(HLIndex++);
+    NumCoherenceHintBits = CI->getArgOperand(HLIndex++);
+    DXASSERT_NOMSG(Helper.i32Ty == CoherenceHint->getType());
+    DXASSERT_NOMSG(Helper.i32Ty == NumCoherenceHintBits->getType());
+  } else {
+    CoherenceHint = UndefValue::get(Helper.i32Ty);
+    NumCoherenceHintBits = OP->GetU32Const(0);
+  }
+
+  TrivialDxilOperation(
+      OpCode, {nullptr, HitObject, CoherenceHint, NumCoherenceHintBits},
+      Type::getVoidTy(CI->getContext()), CI, OP);
+  return nullptr;
+}
+
+Value *TranslateHitObjectFromRayQuery(CallInst *CI, IntrinsicOp IOP,
+                                      OP::OpCode OpCode,
+                                      HLOperationLowerHelper &Helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  unsigned SrcIdx = 1;
+  Value *HitObjectPtr = CI->getArgOperand(SrcIdx++);
+  Value *RayQuery = CI->getArgOperand(SrcIdx++);
+
+  if (CI->getNumArgOperands() ==
+      HLOperandIndex::kHitObjectFromRayQuery_WithAttrs_NumOp) {
+    Value *HitKind = CI->getArgOperand(SrcIdx++);
+    Value *AttribSrc = CI->getArgOperand(SrcIdx++);
+    DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands());
+    OpCode = DXIL::OpCode::HitObject_FromRayQueryWithAttrs;
+    Type *AttrTy = AttribSrc->getType();
+    Value *OutHitObject = TrivialDxilOperation(
+        OpCode, {nullptr, RayQuery, HitKind, AttribSrc}, AttrTy, CI, OP);
+    Builder.CreateStore(OutHitObject, HitObjectPtr);
+    return nullptr;
+  }
+
+  DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands());
+  OpCode = DXIL::OpCode::HitObject_FromRayQuery;
+  Value *OutHitObject =
+      TrivialDxilOperation(OpCode, {nullptr, RayQuery}, Helper.voidTy, CI, OP);
+  Builder.CreateStore(OutHitObject, HitObjectPtr);
+  return nullptr;
+}
+
+Value *TranslateHitObjectTraceRay(CallInst *CI, IntrinsicOp IOP,
+                                  OP::OpCode OpCode,
+                                  HLOperationLowerHelper &Helper,
+                                  HLObjectOperationLowerHelper *pObjHelper,
+                                  bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  DXASSERT_NOMSG(CI->getNumArgOperands() ==
+                 HLOperandIndex::kHitObjectTraceRay_NumOp);
+  Value *Args[DXIL::OperandIndex::kHitObjectTraceRay_NumOp];
+  Value *OpArg = OP->GetU32Const(static_cast<unsigned>(OpCode));
+  Args[0] = OpArg;
+
+  unsigned DestIdx = 1, SrcIdx = 1;
+  Value *HitObjectPtr = CI->getArgOperand(SrcIdx++);
+  Args[DestIdx++] = CI->getArgOperand(SrcIdx++);
+  for (; SrcIdx < HLOperandIndex::kHitObjectTraceRay_RayDescOpIdx;
+       ++SrcIdx, ++DestIdx) {
+    Args[DestIdx] = CI->getArgOperand(SrcIdx);
+  }
+
+  DXASSERT_NOMSG(SrcIdx == HLOperandIndex::kHitObjectTraceRay_RayDescOpIdx);
+  DXASSERT_NOMSG(DestIdx ==
+                 DXIL::OperandIndex::kHitObjectTraceRay_RayDescOpIdx);
+  TransferRayDescArgs(Args, OP, Builder, CI, DestIdx, SrcIdx);
+  DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands() - 1);
+  DXASSERT_NOMSG(DestIdx ==
+                 DXIL::OperandIndex::kHitObjectTraceRay_PayloadOpIdx);
+
+  Value *Payload = CI->getArgOperand(SrcIdx++);
+  Args[DestIdx++] = Payload;
+
+  DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands());
+  DXASSERT_NOMSG(DestIdx == DXIL::OperandIndex::kHitObjectTraceRay_NumOp);
+
+  Function *F = OP->GetOpFunc(OpCode, Payload->getType());
+
+  Value *OutHitObject = Builder.CreateCall(F, Args);
+  Builder.CreateStore(OutHitObject, HitObjectPtr);
+  return nullptr;
+}
+
+Value *TranslateHitObjectInvoke(CallInst *CI, IntrinsicOp IOP,
+                                OP::OpCode OpCode,
+                                HLOperationLowerHelper &Helper,
+                                HLObjectOperationLowerHelper *pObjHelper,
+                                bool &Translated) {
+  unsigned SrcIdx = 1;
+  Value *HitObjectPtr = CI->getArgOperand(SrcIdx++);
+  Value *Payload = CI->getArgOperand(SrcIdx++);
+  DXASSERT_NOMSG(SrcIdx == CI->getNumArgOperands());
+
+  IRBuilder<> Builder(CI);
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+  TrivialDxilOperation(OpCode, {nullptr, HitObject, Payload},
+                       Payload->getType(), CI, &Helper.hlslOP);
+  return nullptr;
+}
+
+Value *TranslateHitObjectGetAttributes(CallInst *CI, IntrinsicOp IOP,
+                                       OP::OpCode OpCode,
+                                       HLOperationLowerHelper &Helper,
+                                       HLObjectOperationLowerHelper *pObjHelper,
+                                       bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+  Value *AttrOutPtr =
+      CI->getArgOperand(HLOperandIndex::kHitObjectGetAttributes_AttributeOpIdx);
+  TrivialDxilOperation(OpCode, {nullptr, HitObject, AttrOutPtr},
+                       AttrOutPtr->getType(), CI, OP);
+  return nullptr;
+}
+
+Value *TranslateHitObjectScalarGetter(CallInst *CI, IntrinsicOp IOP,
+                                      OP::OpCode OpCode,
+                                      HLOperationLowerHelper &Helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  IRBuilder<> Builder(CI);
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+  return TrivialDxilOperation(OpCode, {nullptr, HitObject}, CI->getType(), CI,
+                              OP);
+}
+
+Value *TranslateHitObjectVectorGetter(CallInst *CI, IntrinsicOp IOP,
+                                      OP::OpCode OpCode,
+                                      HLOperationLowerHelper &Helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  IRBuilder<> Builder(CI);
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+  VectorType *Ty = cast<VectorType>(CI->getType());
+  uint32_t Vals[] = {0, 1, 2, 3};
+  Constant *Src = ConstantDataVector::get(CI->getContext(), Vals);
+  return TrivialDxilOperation(OpCode, {nullptr, HitObject, Src}, Ty, CI, OP);
+}
+
+static bool IsHitObject3x4Getter(IntrinsicOp IOP) {
+  switch (IOP) {
+  default:
+    return false;
+  case IntrinsicOp::MOP_DxHitObject_GetObjectToWorld3x4:
+  case IntrinsicOp::MOP_DxHitObject_GetWorldToObject3x4:
+    return true;
+  }
+}
+
+Value *TranslateHitObjectMatrixGetter(CallInst *CI, IntrinsicOp IOP,
+                                      OP::OpCode OpCode,
+                                      HLOperationLowerHelper &Helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  IRBuilder<> Builder(CI);
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+
+  // Create 3x4 matrix indices
+  bool Is3x4 = IsHitObject3x4Getter(IOP);
+  Constant *Rows, *Cols;
+  GetMatrixIndices<uint32_t>(Rows, Cols, Is3x4, CI->getContext());
+
+  VectorType *Ty = cast<VectorType>(CI->getType());
+  return TrivialDxilOperation(OpCode, {nullptr, HitObject, Rows, Cols}, Ty, CI,
+                              OP);
+}
+
+Value *TranslateHitObjectLoadLocalRootTableConstant(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  Value *Offset = CI->getArgOperand(2);
+
+  Value *HitObject = Builder.CreateLoad(HitObjectPtr);
+  return TrivialDxilOperation(OpCode, {nullptr, HitObject, Offset},
+                              Helper.voidTy, CI, OP);
+}
+
+Value *TranslateHitObjectSetShaderTableIndex(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *pObjHelper,
+    bool &Translated) {
+  hlsl::OP *OP = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *HitObjectPtr = CI->getArgOperand(1);
+  Value *ShaderTableIndex = CI->getArgOperand(2);
+
+  Value *InHitObject = Builder.CreateLoad(HitObjectPtr);
+  Value *OutHitObject = TrivialDxilOperation(
+      OpCode, {nullptr, InHitObject, ShaderTableIndex}, Helper.voidTy, CI, OP);
+  Builder.CreateStore(OutHitObject, HitObjectPtr);
+  return nullptr;
 }
 
 } // namespace
@@ -5327,20 +6737,501 @@ Value *TranslateGetHandleFromHeap(CallInst *CI, IntrinsicOp IOP,
                  // TODO: update nonUniformIndex later.
                  Builder.getInt1(false)});
 }
+} // namespace
+
+// Translate and/or/select intrinsics
+namespace {
+Value *TranslateAnd(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                    HLOperationLowerHelper &helper,
+                    HLObjectOperationLowerHelper *pObjHelper,
+                    bool &Translated) {
+  Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
+  Value *y = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
+  IRBuilder<> Builder(CI);
+
+  return Builder.CreateAnd(x, y);
 }
+Value *TranslateOr(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                   HLOperationLowerHelper &helper,
+                   HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+  Value *x = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc0Idx);
+  Value *y = CI->getArgOperand(HLOperandIndex::kBinaryOpSrc1Idx);
+  IRBuilder<> Builder(CI);
+
+  return Builder.CreateOr(x, y);
+}
+Value *TranslateSelect(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
+                       HLOperationLowerHelper &helper,
+                       HLObjectOperationLowerHelper *pObjHelper,
+                       bool &Translated) {
+  Value *cond = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc0Idx);
+  Value *t = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc1Idx);
+  Value *f = CI->getArgOperand(HLOperandIndex::kTrinaryOpSrc2Idx);
+  IRBuilder<> Builder(CI);
+
+  return Builder.CreateSelect(cond, t, f);
+}
+
+Value *TranslateLinAlgFillMatrix(CallInst *CI, IntrinsicOp IOP,
+                                 OP::OpCode OpCode,
+                                 HLOperationLowerHelper &Helper,
+                                 HLObjectOperationLowerHelper *ObjHelper,
+                                 bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixPtr->getType()));
+  Type *MatrixType = MatrixPtr->getType()->getPointerElementType();
+  Value *Scalar = CI->getArgOperand(2);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc =
+      HlslOp->GetOpFunc(OpCode, {MatrixType, Scalar->getType()});
+
+  Value *Matrix = Builder.CreateCall(DxilFunc, {OpArg, Scalar});
+  Builder.CreateStore(Matrix, MatrixPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixAccumStoreToDescriptor(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *Matrix = CI->getArgOperand(1);
+  Value *ResHandle = CI->getArgOperand(2);
+  Value *Offset = CI->getArgOperand(3);
+  Value *Stride = CI->getArgOperand(4);
+  Value *Layout = CI->getArgOperand(5);
+  Value *Align = CI->getArgOperand(6);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, Matrix->getType());
+
+  return Builder.CreateCall(
+      DxilFunc, {OpArg, Matrix, ResHandle, Offset, Stride, Layout, Align});
+}
+
+Value *TranslateLinAlgMatVecMul(CallInst *CI, IntrinsicOp IOP,
+                                OP::OpCode OpCode,
+                                HLOperationLowerHelper &Helper,
+                                HLObjectOperationLowerHelper *ObjHelper,
+                                bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *ReturnVecPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(ReturnVecPtr->getType()));
+  Type *ReturnVecType = ReturnVecPtr->getType()->getPointerElementType();
+
+  Value *Matrix = CI->getArgOperand(2);
+  Value *IsOutputSigned = CI->getArgOperand(3);
+  Value *InputVector = CI->getArgOperand(4);
+  Value *InputVectorInterp = CI->getArgOperand(5);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(
+      OpCode, {ReturnVecType, Matrix->getType(), InputVector->getType()});
+
+  Value *ReturnVec =
+      Builder.CreateCall(DxilFunc, {OpArg, Matrix, IsOutputSigned, InputVector,
+                                    InputVectorInterp});
+  Builder.CreateStore(ReturnVec, ReturnVecPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatVecMulAdd(CallInst *CI, IntrinsicOp IOP,
+                                   OP::OpCode OpCode,
+                                   HLOperationLowerHelper &Helper,
+                                   HLObjectOperationLowerHelper *ObjHelper,
+                                   bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *ReturnVecPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(ReturnVecPtr->getType()));
+  Type *ReturnVecType = ReturnVecPtr->getType()->getPointerElementType();
+
+  Value *Matrix = CI->getArgOperand(2);
+  Value *IsOutputSigned = CI->getArgOperand(3);
+  Value *InputVector = CI->getArgOperand(4);
+  Value *InputVectorInterp = CI->getArgOperand(5);
+  Value *BiasVector = CI->getArgOperand(6);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(
+      OpCode, {ReturnVecType, Matrix->getType(), InputVector->getType(),
+               BiasVector->getType()});
+
+  Value *ReturnVec =
+      Builder.CreateCall(DxilFunc, {OpArg, Matrix, IsOutputSigned, InputVector,
+                                    InputVectorInterp, BiasVector});
+  Builder.CreateStore(ReturnVec, ReturnVecPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixLoadFromDescriptor(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixPtr->getType()));
+  Type *MatrixType = MatrixPtr->getType()->getPointerElementType();
+
+  Value *ResHandle = CI->getArgOperand(2);
+  Value *Offset = CI->getArgOperand(3);
+  Value *Stride = CI->getArgOperand(4);
+  Value *Layout = CI->getArgOperand(5);
+  Value *Align = CI->getArgOperand(6);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, MatrixType);
+
+  Value *Matrix = Builder.CreateCall(
+      DxilFunc, {OpArg, ResHandle, Offset, Stride, Layout, Align});
+  Builder.CreateStore(Matrix, MatrixPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixOuterProduct(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixPtr->getType()));
+  Type *MatrixType = MatrixPtr->getType()->getPointerElementType();
+  Value *VecA = CI->getArgOperand(2);
+  Value *VecB = CI->getArgOperand(3);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc =
+      HlslOp->GetOpFunc(OpCode, {MatrixType, VecA->getType(), VecB->getType()});
+
+  Value *Matrix = Builder.CreateCall(DxilFunc, {OpArg, VecA, VecB});
+  Builder.CreateStore(Matrix, MatrixPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixAccumulate(CallInst *CI, IntrinsicOp IOP,
+                                       OP::OpCode OpCode,
+                                       HLOperationLowerHelper &Helper,
+                                       HLObjectOperationLowerHelper *ObjHelper,
+                                       bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixCPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixCPtr->getType()));
+  Type *MatrixCType = MatrixCPtr->getType()->getPointerElementType();
+
+  Value *MatrixLHS = CI->getArgOperand(2);
+  Value *MatrixRHS = CI->getArgOperand(3);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(
+      OpCode, {MatrixCType, MatrixLHS->getType(), MatrixRHS->getType()});
+
+  Value *MatrixC = Builder.CreateCall(DxilFunc, {OpArg, MatrixLHS, MatrixRHS});
+  Builder.CreateStore(MatrixC, MatrixCPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixGetCoordinate(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *Matrix = CI->getArgOperand(1);
+  Value *Index = CI->getArgOperand(2);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, Matrix->getType());
+
+  return Builder.CreateCall(DxilFunc, {OpArg, Matrix, Index});
+}
+
+Value *TranslateLinAlgMatrixGetElement(CallInst *CI, IntrinsicOp IOP,
+                                       OP::OpCode OpCode,
+                                       HLOperationLowerHelper &Helper,
+                                       HLObjectOperationLowerHelper *ObjHelper,
+                                       bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *RetElemPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(RetElemPtr->getType()));
+  Type *RetTy = RetElemPtr->getType()->getPointerElementType();
+
+  Value *Matrix = CI->getArgOperand(2);
+  Value *Index = CI->getArgOperand(3);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, {RetTy, Matrix->getType()});
+
+  Value *RetElem = Builder.CreateCall(DxilFunc, {OpArg, Matrix, Index});
+  Builder.CreateStore(RetElem, RetElemPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixSetElement(CallInst *CI, IntrinsicOp IOP,
+                                       OP::OpCode OpCode,
+                                       HLOperationLowerHelper &Helper,
+                                       HLObjectOperationLowerHelper *ObjHelper,
+                                       bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *RetMatrixPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(RetMatrixPtr->getType()));
+  Type *RetMatrixTy = RetMatrixPtr->getType()->getPointerElementType();
+
+  Value *InMatrix = CI->getArgOperand(2);
+  Value *Index = CI->getArgOperand(3);
+  Value *NewVal = CI->getArgOperand(4);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(
+      OpCode, {RetMatrixTy, InMatrix->getType(), NewVal->getType()});
+
+  Value *RetMatrix =
+      Builder.CreateCall(DxilFunc, {OpArg, InMatrix, Index, NewVal});
+  Builder.CreateStore(RetMatrix, RetMatrixPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixMatrixMultiply(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixCPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixCPtr->getType()));
+  Type *MatrixCTy = MatrixCPtr->getType()->getPointerElementType();
+
+  Value *MatrixA = CI->getArgOperand(2);
+  Value *MatrixB = CI->getArgOperand(3);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(
+      OpCode, {MatrixCTy, MatrixA->getType(), MatrixB->getType()});
+
+  Value *MatrixC = Builder.CreateCall(DxilFunc, {OpArg, MatrixA, MatrixB});
+  Builder.CreateStore(MatrixC, MatrixCPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixMatrixMultiplyAccumulate(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixRPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixRPtr->getType()));
+  Type *MatrixRTy = MatrixRPtr->getType()->getPointerElementType();
+
+  Value *MatrixA = CI->getArgOperand(2);
+  Value *MatrixB = CI->getArgOperand(3);
+  Value *MatrixC = CI->getArgOperand(4);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc =
+      HlslOp->GetOpFunc(OpCode, {MatrixRTy, MatrixA->getType(),
+                                 MatrixB->getType(), MatrixC->getType()});
+
+  Value *MatrixR =
+      Builder.CreateCall(DxilFunc, {OpArg, MatrixA, MatrixB, MatrixC});
+  Builder.CreateStore(MatrixR, MatrixRPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgCopyConvertMatrix(CallInst *CI, IntrinsicOp IOP,
+                                        OP::OpCode OpCode,
+                                        HLOperationLowerHelper &Helper,
+                                        HLObjectOperationLowerHelper *ObjHelper,
+                                        bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixRPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixRPtr->getType()));
+  Type *MatrixRTy = MatrixRPtr->getType()->getPointerElementType();
+
+  Value *MatrixSrc = CI->getArgOperand(2);
+  Value *Transpose = CI->getArgOperand(3);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc =
+      HlslOp->GetOpFunc(OpCode, {MatrixRTy, MatrixSrc->getType()});
+
+  Value *MatrixR = Builder.CreateCall(DxilFunc, {OpArg, MatrixSrc, Transpose});
+  Builder.CreateStore(MatrixR, MatrixRPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixLoadFromMemory(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *MatrixPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(MatrixPtr->getType()));
+  Type *MatrixType = MatrixPtr->getType()->getPointerElementType();
+
+  Value *Arr = CI->getArgOperand(2);
+  Value *Offset = CI->getArgOperand(3);
+  Value *Stride = CI->getArgOperand(4);
+  Value *Layout = CI->getArgOperand(5);
+
+  Value *Zero = Builder.getInt32(0);
+  Value *ArrPtr = Builder.CreateGEP(Arr, {Zero, Zero});
+  Type *ArrEltTy = ArrPtr->getType()->getPointerElementType();
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, {MatrixType, ArrEltTy});
+
+  Value *Matrix =
+      Builder.CreateCall(DxilFunc, {OpArg, ArrPtr, Offset, Stride, Layout});
+  Builder.CreateStore(Matrix, MatrixPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgMatrixStoreToMemory(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *Matrix = CI->getArgOperand(1);
+  Value *Arr = CI->getArgOperand(2);
+  Value *Offset = CI->getArgOperand(3);
+  Value *Stride = CI->getArgOperand(4);
+  Value *Layout = CI->getArgOperand(5);
+
+  Value *Zero = Builder.getInt32(0);
+  Value *ArrPtr = Builder.CreateGEP(Arr, {Zero, Zero});
+  Type *ArrEltTy = ArrPtr->getType()->getPointerElementType();
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, {Matrix->getType(), ArrEltTy});
+
+  return Builder.CreateCall(DxilFunc,
+                            {OpArg, Matrix, ArrPtr, Offset, Stride, Layout});
+}
+
+Value *TranslateLinAlgMatrixAccumToMemory(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *Matrix = CI->getArgOperand(1);
+  Value *Arr = CI->getArgOperand(2);
+  Value *Offset = CI->getArgOperand(3);
+  Value *Stride = CI->getArgOperand(4);
+  Value *Layout = CI->getArgOperand(5);
+
+  Value *Zero = Builder.getInt32(0);
+  Value *ArrPtr = Builder.CreateGEP(Arr, {Zero, Zero});
+  Type *ArrEltTy = ArrPtr->getType()->getPointerElementType();
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, {Matrix->getType(), ArrEltTy});
+
+  return Builder.CreateCall(DxilFunc,
+                            {OpArg, Matrix, ArrPtr, Offset, Stride, Layout});
+}
+
+Value *TranslateLinAlgConvert(CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+                              HLOperationLowerHelper &Helper,
+                              HLObjectOperationLowerHelper *ObjHelper,
+                              bool &Translated) {
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Value *OutVecPtr = CI->getArgOperand(1);
+  DXASSERT_NOMSG(isa<PointerType>(OutVecPtr->getType()));
+  Type *OutVecTy = OutVecPtr->getType()->getPointerElementType();
+  Value *InVec = CI->getArgOperand(2);
+  Value *InInterp = CI->getArgOperand(3);
+  Value *OutInterp = CI->getArgOperand(4);
+
+  Constant *OpArg = HlslOp->GetU32Const((unsigned)OpCode);
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, {OutVecTy, InVec->getType()});
+
+  Value *OutVec =
+      Builder.CreateCall(DxilFunc, {OpArg, InVec, InInterp, OutInterp});
+  Builder.CreateStore(OutVec, OutVecPtr);
+
+  return nullptr;
+}
+
+Value *TranslateLinAlgVectorAccumulateToDescriptor(
+    CallInst *CI, IntrinsicOp IOP, OP::OpCode OpCode,
+    HLOperationLowerHelper &Helper, HLObjectOperationLowerHelper *ObjHelper,
+    bool &Translated) {
+
+  hlsl::OP *HlslOp = &Helper.hlslOP;
+  IRBuilder<> Builder(CI);
+
+  Constant *OpArg = HlslOp->GetU32Const(static_cast<unsigned>(OpCode));
+
+  Value *ResHandle = CI->getArgOperand(1);
+  Value *Offset = CI->getArgOperand(2);
+  Value *Align = CI->getArgOperand(3);
+  Value *Vector = CI->getArgOperand(4);
+
+  // Get the DXIL function for the operation
+  Function *DxilFunc = HlslOp->GetOpFunc(OpCode, Vector->getType());
+
+  return Builder.CreateCall(DxilFunc,
+                            {OpArg, ResHandle, Offset, Align, Vector});
+}
+
+} // namespace
 
 // Lower table.
 namespace {
 
 Value *EmptyLower(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
-                  HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                  HLOperationLowerHelper &helper,
+                  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
   Translated = false;
   dxilutil::EmitErrorOnInstruction(CI, "Unsupported intrinsic.");
   return nullptr;
 }
 
 // SPIRV change starts
-#ifdef ENABLE_SPIRV_CODEGEN
 Value *UnsupportedVulkanIntrinsic(CallInst *CI, IntrinsicOp IOP,
                                   DXIL::OpCode opcode,
                                   HLOperationLowerHelper &helper,
@@ -5350,11 +7241,12 @@ Value *UnsupportedVulkanIntrinsic(CallInst *CI, IntrinsicOp IOP,
   dxilutil::EmitErrorOnInstruction(CI, "Unsupported Vulkan intrinsic.");
   return nullptr;
 }
-#endif // ENABLE_SPIRV_CODEGEN
 // SPIRV change ends
 
 Value *StreamOutputLower(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
-                         HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                         HLOperationLowerHelper &helper,
+                         HLObjectOperationLowerHelper *pObjHelper,
+                         bool &Translated) {
   // Translated in DxilGenerationPass::GenerateStreamOutputOperation.
   // Do nothing here.
   // Mark not translated.
@@ -5363,109 +7255,209 @@ Value *StreamOutputLower(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,
 }
 
 // This table has to match IntrinsicOp orders
-IntrinsicLower gLowerTable[] = {
-    {IntrinsicOp::IOP_AcceptHitAndEndSearch, TranslateNoArgNoReturnPreserveOutput, DXIL::OpCode::AcceptHitAndEndSearch},
-    {IntrinsicOp::IOP_AddUint64,  TranslateAddUint64,  DXIL::OpCode::UAddc},
+constexpr IntrinsicLower gLowerTable[] = {
+    {IntrinsicOp::IOP_AcceptHitAndEndSearch,
+     TranslateNoArgNoReturnPreserveOutput, DXIL::OpCode::AcceptHitAndEndSearch},
+    {IntrinsicOp::IOP_AddUint64, TranslateAddUint64, DXIL::OpCode::UAddc},
     {IntrinsicOp::IOP_AllMemoryBarrier, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_AllMemoryBarrierWithGroupSync, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_AllocateRayQuery, TranslateAllocateRayQuery, DXIL::OpCode::AllocateRayQuery},
-    {IntrinsicOp::IOP_CallShader, TranslateCallShader, DXIL::OpCode::CallShader},
-    {IntrinsicOp::IOP_CheckAccessFullyMapped, TranslateCheckAccess, DXIL::OpCode::CheckAccessFullyMapped},
-    {IntrinsicOp::IOP_CreateResourceFromHeap, TranslateGetHandleFromHeap, DXIL::OpCode::CreateHandleFromHeap},
-    {IntrinsicOp::IOP_D3DCOLORtoUBYTE4, TranslateD3DColorToUByte4, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_DeviceMemoryBarrier, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_DeviceMemoryBarrierWithGroupSync, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_DispatchMesh, TrivialDispatchMesh, DXIL::OpCode::DispatchMesh },
-    {IntrinsicOp::IOP_DispatchRaysDimensions, TranslateNoArgVectorOperation, DXIL::OpCode::DispatchRaysDimensions},
-    {IntrinsicOp::IOP_DispatchRaysIndex, TranslateNoArgVectorOperation, DXIL::OpCode::DispatchRaysIndex},
-    {IntrinsicOp::IOP_EvaluateAttributeAtSample, TranslateEvalSample, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_EvaluateAttributeCentroid, TranslateEvalCentroid, DXIL::OpCode::EvalCentroid},
-    {IntrinsicOp::IOP_EvaluateAttributeSnapped, TranslateEvalSnapped, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_GeometryIndex, TrivialNoArgWithRetOperation, DXIL::OpCode::GeometryIndex},
-    {IntrinsicOp::IOP_GetAttributeAtVertex, TranslateGetAttributeAtVertex, DXIL::OpCode::AttributeAtVertex},
-    {IntrinsicOp::IOP_GetRenderTargetSampleCount, TrivialNoArgOperation, DXIL::OpCode::RenderTargetGetSampleCount},
-    {IntrinsicOp::IOP_GetRenderTargetSamplePosition, TranslateGetRTSamplePos, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_GroupMemoryBarrier, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_GroupMemoryBarrierWithGroupSync, TrivialBarrier, DXIL::OpCode::Barrier},
-    {IntrinsicOp::IOP_HitKind, TrivialNoArgWithRetOperation, DXIL::OpCode::HitKind},
-    {IntrinsicOp::IOP_IgnoreHit, TranslateNoArgNoReturnPreserveOutput, DXIL::OpCode::IgnoreHit},
-    {IntrinsicOp::IOP_InstanceID, TrivialNoArgWithRetOperation, DXIL::OpCode::InstanceID},
-    {IntrinsicOp::IOP_InstanceIndex, TrivialNoArgWithRetOperation, DXIL::OpCode::InstanceIndex},
-    {IntrinsicOp::IOP_InterlockedAdd, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedAnd, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedCompareExchange, TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedCompareExchangeFloatBitwise, TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedCompareStore, TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedCompareStoreFloatBitwise, TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedExchange, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedMax, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedMin, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedOr, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_InterlockedXor, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_IsHelperLane, TrivialNoArgWithRetOperation, DXIL::OpCode::IsHelperLane},
-    {IntrinsicOp::IOP_NonUniformResourceIndex, TranslateNonUniformResourceIndex, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ObjectRayDirection, TranslateNoArgVectorOperation, DXIL::OpCode::ObjectRayDirection},
-    {IntrinsicOp::IOP_ObjectRayOrigin, TranslateNoArgVectorOperation, DXIL::OpCode::ObjectRayOrigin},
-    {IntrinsicOp::IOP_ObjectToWorld, TranslateNoArgMatrix3x4Operation, DXIL::OpCode::ObjectToWorld},
-    {IntrinsicOp::IOP_ObjectToWorld3x4, TranslateNoArgMatrix3x4Operation, DXIL::OpCode::ObjectToWorld},
-    {IntrinsicOp::IOP_ObjectToWorld4x3, TranslateNoArgTransposedMatrix3x4Operation, DXIL::OpCode::ObjectToWorld},
-    {IntrinsicOp::IOP_PrimitiveIndex, TrivialNoArgWithRetOperation, DXIL::OpCode::PrimitiveIndex},
-    {IntrinsicOp::IOP_Process2DQuadTessFactorsAvg, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_Process2DQuadTessFactorsMax, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_Process2DQuadTessFactorsMin, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessIsolineTessFactors, TranslateProcessIsolineTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessQuadTessFactorsAvg, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessQuadTessFactorsMax, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessQuadTessFactorsMin, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessTriTessFactorsAvg, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessTriTessFactorsMax, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_ProcessTriTessFactorsMin, TranslateProcessTessFactors, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_QuadReadAcrossDiagonal, TranslateQuadReadAcross, DXIL::OpCode::QuadOp},
-    {IntrinsicOp::IOP_QuadReadAcrossX, TranslateQuadReadAcross, DXIL::OpCode::QuadOp},
-    {IntrinsicOp::IOP_QuadReadAcrossY, TranslateQuadReadAcross, DXIL::OpCode::QuadOp},
-    {IntrinsicOp::IOP_QuadReadLaneAt,  TranslateQuadReadLaneAt, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_RayFlags, TrivialNoArgWithRetOperation, DXIL::OpCode::RayFlags},
-    {IntrinsicOp::IOP_RayTCurrent, TrivialNoArgWithRetOperation, DXIL::OpCode::RayTCurrent},
-    {IntrinsicOp::IOP_RayTMin, TrivialNoArgWithRetOperation, DXIL::OpCode::RayTMin},
-    {IntrinsicOp::IOP_ReportHit, TranslateReportIntersection, DXIL::OpCode::ReportHit},
-    {IntrinsicOp::IOP_SetMeshOutputCounts, TrivialSetMeshOutputCounts, DXIL::OpCode::SetMeshOutputCounts},
+    {IntrinsicOp::IOP_AllMemoryBarrierWithGroupSync, TrivialBarrier,
+     DXIL::OpCode::Barrier},
+    {IntrinsicOp::IOP_AllocateRayQuery, TranslateAllocateRayQuery,
+     DXIL::OpCode::AllocateRayQuery},
+    {IntrinsicOp::IOP_Barrier, TranslateBarrier, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_CallShader, TranslateCallShader,
+     DXIL::OpCode::CallShader},
+    {IntrinsicOp::IOP_CheckAccessFullyMapped, TranslateCheckAccess,
+     DXIL::OpCode::CheckAccessFullyMapped},
+    {IntrinsicOp::IOP_CreateResourceFromHeap, TranslateGetHandleFromHeap,
+     DXIL::OpCode::CreateHandleFromHeap},
+    {IntrinsicOp::IOP_D3DCOLORtoUBYTE4, TranslateD3DColorToUByte4,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_DeviceMemoryBarrier, TrivialBarrier,
+     DXIL::OpCode::Barrier},
+    {IntrinsicOp::IOP_DeviceMemoryBarrierWithGroupSync, TrivialBarrier,
+     DXIL::OpCode::Barrier},
+    {IntrinsicOp::IOP_DispatchMesh, TrivialDispatchMesh,
+     DXIL::OpCode::DispatchMesh},
+    {IntrinsicOp::IOP_DispatchRaysDimensions, TranslateNoArgVectorOperation,
+     DXIL::OpCode::DispatchRaysDimensions},
+    {IntrinsicOp::IOP_DispatchRaysIndex, TranslateNoArgVectorOperation,
+     DXIL::OpCode::DispatchRaysIndex},
+    {IntrinsicOp::IOP_EvaluateAttributeAtSample, TranslateEvalSample,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_EvaluateAttributeCentroid, TranslateEvalCentroid,
+     DXIL::OpCode::EvalCentroid},
+    {IntrinsicOp::IOP_EvaluateAttributeSnapped, TranslateEvalSnapped,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_GeometryIndex, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::GeometryIndex},
+    {IntrinsicOp::IOP_GetAttributeAtVertex, TranslateGetAttributeAtVertex,
+     DXIL::OpCode::AttributeAtVertex},
+    {IntrinsicOp::IOP_GetRemainingRecursionLevels, TrivialNoArgOperation,
+     DXIL::OpCode::GetRemainingRecursionLevels},
+    {IntrinsicOp::IOP_GetRenderTargetSampleCount, TrivialNoArgOperation,
+     DXIL::OpCode::RenderTargetGetSampleCount},
+    {IntrinsicOp::IOP_GetRenderTargetSamplePosition, TranslateGetRTSamplePos,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_GroupMemoryBarrier, TrivialBarrier,
+     DXIL::OpCode::Barrier},
+    {IntrinsicOp::IOP_GroupMemoryBarrierWithGroupSync, TrivialBarrier,
+     DXIL::OpCode::Barrier},
+    {IntrinsicOp::IOP_HitKind, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::HitKind},
+    {IntrinsicOp::IOP_IgnoreHit, TranslateNoArgNoReturnPreserveOutput,
+     DXIL::OpCode::IgnoreHit},
+    {IntrinsicOp::IOP_InstanceID, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::InstanceID},
+    {IntrinsicOp::IOP_InstanceIndex, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::InstanceIndex},
+    {IntrinsicOp::IOP_InterlockedAdd, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedAnd, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedCompareExchange, TranslateIopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedCompareExchangeFloatBitwise,
+     TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedCompareStore, TranslateIopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedCompareStoreFloatBitwise,
+     TranslateIopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedExchange, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedMax, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedMin, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedOr, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedXor, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_IsHelperLane, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::IsHelperLane},
+    {IntrinsicOp::IOP_NonUniformResourceIndex, TranslateNonUniformResourceIndex,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ObjectRayDirection, TranslateNoArgVectorOperation,
+     DXIL::OpCode::ObjectRayDirection},
+    {IntrinsicOp::IOP_ObjectRayOrigin, TranslateNoArgVectorOperation,
+     DXIL::OpCode::ObjectRayOrigin},
+    {IntrinsicOp::IOP_ObjectToWorld, TranslateNoArgMatrix3x4Operation,
+     DXIL::OpCode::ObjectToWorld},
+    {IntrinsicOp::IOP_ObjectToWorld3x4, TranslateNoArgMatrix3x4Operation,
+     DXIL::OpCode::ObjectToWorld},
+    {IntrinsicOp::IOP_ObjectToWorld4x3,
+     TranslateNoArgTransposedMatrix3x4Operation, DXIL::OpCode::ObjectToWorld},
+    {IntrinsicOp::IOP_PrimitiveIndex, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::PrimitiveIndex},
+    {IntrinsicOp::IOP_Process2DQuadTessFactorsAvg, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_Process2DQuadTessFactorsMax, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_Process2DQuadTessFactorsMin, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessIsolineTessFactors,
+     TranslateProcessIsolineTessFactors, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessQuadTessFactorsAvg, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessQuadTessFactorsMax, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessQuadTessFactorsMin, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessTriTessFactorsAvg, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessTriTessFactorsMax, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ProcessTriTessFactorsMin, TranslateProcessTessFactors,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_QuadAll, TranslateQuadAnyAll, DXIL::OpCode::QuadVote},
+    {IntrinsicOp::IOP_QuadAny, TranslateQuadAnyAll, DXIL::OpCode::QuadVote},
+    {IntrinsicOp::IOP_QuadReadAcrossDiagonal, TranslateQuadReadAcross,
+     DXIL::OpCode::QuadOp},
+    {IntrinsicOp::IOP_QuadReadAcrossX, TranslateQuadReadAcross,
+     DXIL::OpCode::QuadOp},
+    {IntrinsicOp::IOP_QuadReadAcrossY, TranslateQuadReadAcross,
+     DXIL::OpCode::QuadOp},
+    {IntrinsicOp::IOP_QuadReadLaneAt, TranslateQuadReadLaneAt,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_RayFlags, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::RayFlags},
+    {IntrinsicOp::IOP_RayTCurrent, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::RayTCurrent},
+    {IntrinsicOp::IOP_RayTMin, TrivialNoArgWithRetOperation,
+     DXIL::OpCode::RayTMin},
+    {IntrinsicOp::IOP_ReportHit, TranslateReportIntersection,
+     DXIL::OpCode::ReportHit},
+    {IntrinsicOp::IOP_SetMeshOutputCounts, TrivialSetMeshOutputCounts,
+     DXIL::OpCode::SetMeshOutputCounts},
     {IntrinsicOp::IOP_TraceRay, TranslateTraceRay, DXIL::OpCode::TraceRay},
-    {IntrinsicOp::IOP_WaveActiveAllEqual, TranslateWaveAllEqual, DXIL::OpCode::WaveActiveAllEqual},
-    {IntrinsicOp::IOP_WaveActiveAllTrue, TranslateWaveA2B, DXIL::OpCode::WaveAllTrue},
-    {IntrinsicOp::IOP_WaveActiveAnyTrue, TranslateWaveA2B, DXIL::OpCode::WaveAnyTrue},
-    {IntrinsicOp::IOP_WaveActiveBallot, TranslateWaveBallot, DXIL::OpCode::WaveActiveBallot},
-    {IntrinsicOp::IOP_WaveActiveBitAnd, TranslateWaveA2A, DXIL::OpCode::WaveActiveBit},
-    {IntrinsicOp::IOP_WaveActiveBitOr, TranslateWaveA2A, DXIL::OpCode::WaveActiveBit},
-    {IntrinsicOp::IOP_WaveActiveBitXor, TranslateWaveA2A, DXIL::OpCode::WaveActiveBit},
-    {IntrinsicOp::IOP_WaveActiveCountBits, TranslateWaveA2B, DXIL::OpCode::WaveAllBitCount},
-    {IntrinsicOp::IOP_WaveActiveMax, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp},
-    {IntrinsicOp::IOP_WaveActiveMin, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp},
-    {IntrinsicOp::IOP_WaveActiveProduct, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp},
-    {IntrinsicOp::IOP_WaveActiveSum, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp},
-    {IntrinsicOp::IOP_WaveGetLaneCount, TranslateWaveToVal, DXIL::OpCode::WaveGetLaneCount},
-    {IntrinsicOp::IOP_WaveGetLaneIndex, TranslateWaveToVal, DXIL::OpCode::WaveGetLaneIndex},
-    {IntrinsicOp::IOP_WaveIsFirstLane, TranslateWaveToVal, DXIL::OpCode::WaveIsFirstLane},
+    {IntrinsicOp::IOP_WaveActiveAllEqual, TranslateWaveAllEqual,
+     DXIL::OpCode::WaveActiveAllEqual},
+    {IntrinsicOp::IOP_WaveActiveAllTrue, TranslateWaveA2B,
+     DXIL::OpCode::WaveAllTrue},
+    {IntrinsicOp::IOP_WaveActiveAnyTrue, TranslateWaveA2B,
+     DXIL::OpCode::WaveAnyTrue},
+    {IntrinsicOp::IOP_WaveActiveBallot, TranslateWaveBallot,
+     DXIL::OpCode::WaveActiveBallot},
+    {IntrinsicOp::IOP_WaveActiveBitAnd, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveBit},
+    {IntrinsicOp::IOP_WaveActiveBitOr, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveBit},
+    {IntrinsicOp::IOP_WaveActiveBitXor, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveBit},
+    {IntrinsicOp::IOP_WaveActiveCountBits, TranslateWaveA2B,
+     DXIL::OpCode::WaveAllBitCount},
+    {IntrinsicOp::IOP_WaveActiveMax, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveMin, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveProduct, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveSum, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveGetLaneCount, TranslateWaveToVal,
+     DXIL::OpCode::WaveGetLaneCount},
+    {IntrinsicOp::IOP_WaveGetLaneIndex, TranslateWaveToVal,
+     DXIL::OpCode::WaveGetLaneIndex},
+    {IntrinsicOp::IOP_WaveIsFirstLane, TranslateWaveToVal,
+     DXIL::OpCode::WaveIsFirstLane},
     {IntrinsicOp::IOP_WaveMatch, TranslateWaveMatch, DXIL::OpCode::WaveMatch},
-    {IntrinsicOp::IOP_WaveMultiPrefixBitAnd, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp},
-    {IntrinsicOp::IOP_WaveMultiPrefixBitOr, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp},
-    {IntrinsicOp::IOP_WaveMultiPrefixBitXor, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp},
-    {IntrinsicOp::IOP_WaveMultiPrefixCountBits, TranslateWaveMultiPrefixBitCount, DXIL::OpCode::WaveMultiPrefixBitCount},
-    {IntrinsicOp::IOP_WaveMultiPrefixProduct, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp},
-    {IntrinsicOp::IOP_WaveMultiPrefixSum, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp},
-    {IntrinsicOp::IOP_WavePrefixCountBits, TranslateWaveA2B, DXIL::OpCode::WavePrefixBitCount},
-    {IntrinsicOp::IOP_WavePrefixProduct, TranslateWaveA2A, DXIL::OpCode::WavePrefixOp},
-    {IntrinsicOp::IOP_WavePrefixSum, TranslateWaveA2A, DXIL::OpCode::WavePrefixOp},
-    {IntrinsicOp::IOP_WaveReadLaneAt, TranslateWaveReadLaneAt, DXIL::OpCode::WaveReadLaneAt},
-    {IntrinsicOp::IOP_WaveReadLaneFirst, TranslateWaveReadLaneFirst, DXIL::OpCode::WaveReadLaneFirst},
-    {IntrinsicOp::IOP_WorldRayDirection, TranslateNoArgVectorOperation, DXIL::OpCode::WorldRayDirection},
-    {IntrinsicOp::IOP_WorldRayOrigin, TranslateNoArgVectorOperation, DXIL::OpCode::WorldRayOrigin},
-    {IntrinsicOp::IOP_WorldToObject, TranslateNoArgMatrix3x4Operation, DXIL::OpCode::WorldToObject},
-    {IntrinsicOp::IOP_WorldToObject3x4, TranslateNoArgMatrix3x4Operation, DXIL::OpCode::WorldToObject},
-    {IntrinsicOp::IOP_WorldToObject4x3, TranslateNoArgTransposedMatrix3x4Operation, DXIL::OpCode::WorldToObject},
+    {IntrinsicOp::IOP_WaveMultiPrefixBitAnd, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixBitOr, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixBitXor, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixCountBits,
+     TranslateWaveMultiPrefixBitCount, DXIL::OpCode::WaveMultiPrefixBitCount},
+    {IntrinsicOp::IOP_WaveMultiPrefixProduct, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixSum, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WavePrefixCountBits, TranslateWaveA2B,
+     DXIL::OpCode::WavePrefixBitCount},
+    {IntrinsicOp::IOP_WavePrefixProduct, TranslateWaveA2A,
+     DXIL::OpCode::WavePrefixOp},
+    {IntrinsicOp::IOP_WavePrefixSum, TranslateWaveA2A,
+     DXIL::OpCode::WavePrefixOp},
+    {IntrinsicOp::IOP_WaveReadLaneAt, TranslateWaveReadLaneAt,
+     DXIL::OpCode::WaveReadLaneAt},
+    {IntrinsicOp::IOP_WaveReadLaneFirst, TranslateWaveReadLaneFirst,
+     DXIL::OpCode::WaveReadLaneFirst},
+    {IntrinsicOp::IOP_WorldRayDirection, TranslateNoArgVectorOperation,
+     DXIL::OpCode::WorldRayDirection},
+    {IntrinsicOp::IOP_WorldRayOrigin, TranslateNoArgVectorOperation,
+     DXIL::OpCode::WorldRayOrigin},
+    {IntrinsicOp::IOP_WorldToObject, TranslateNoArgMatrix3x4Operation,
+     DXIL::OpCode::WorldToObject},
+    {IntrinsicOp::IOP_WorldToObject3x4, TranslateNoArgMatrix3x4Operation,
+     DXIL::OpCode::WorldToObject},
+    {IntrinsicOp::IOP_WorldToObject4x3,
+     TranslateNoArgTransposedMatrix3x4Operation, DXIL::OpCode::WorldToObject},
     {IntrinsicOp::IOP_abort, EmptyLower, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_abs, TranslateAbs, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_acos, TrivialUnaryOperation, DXIL::OpCode::Acos},
     {IntrinsicOp::IOP_all, TranslateAll, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_and, TranslateAnd, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_any, TranslateAny, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_asdouble, TranslateAsDouble, DXIL::OpCode::MakeDouble},
     {IntrinsicOp::IOP_asfloat, TranslateBitcast, DXIL::OpCode::NumOpCodes},
@@ -5482,29 +7474,41 @@ IntrinsicLower gLowerTable[] = {
     {IntrinsicOp::IOP_clip, TranslateClip, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_cos, TrivialUnaryOperation, DXIL::OpCode::Cos},
     {IntrinsicOp::IOP_cosh, TrivialUnaryOperation, DXIL::OpCode::Hcos},
-    {IntrinsicOp::IOP_countbits, TrivialUnaryOperation, DXIL::OpCode::Countbits},
+    {IntrinsicOp::IOP_countbits, TrivialUnaryOperationRet,
+     DXIL::OpCode::Countbits},
     {IntrinsicOp::IOP_cross, TranslateCross, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_ddx, TrivialUnaryOperation, DXIL::OpCode::DerivCoarseX},
-    {IntrinsicOp::IOP_ddx_coarse, TrivialUnaryOperation, DXIL::OpCode::DerivCoarseX},
-    {IntrinsicOp::IOP_ddx_fine, TrivialUnaryOperation, DXIL::OpCode::DerivFineX},
+    {IntrinsicOp::IOP_ddx_coarse, TrivialUnaryOperation,
+     DXIL::OpCode::DerivCoarseX},
+    {IntrinsicOp::IOP_ddx_fine, TrivialUnaryOperation,
+     DXIL::OpCode::DerivFineX},
     {IntrinsicOp::IOP_ddy, TrivialUnaryOperation, DXIL::OpCode::DerivCoarseY},
-    {IntrinsicOp::IOP_ddy_coarse, TrivialUnaryOperation, DXIL::OpCode::DerivCoarseY},
-    {IntrinsicOp::IOP_ddy_fine, TrivialUnaryOperation, DXIL::OpCode::DerivFineY},
+    {IntrinsicOp::IOP_ddy_coarse, TrivialUnaryOperation,
+     DXIL::OpCode::DerivCoarseY},
+    {IntrinsicOp::IOP_ddy_fine, TrivialUnaryOperation,
+     DXIL::OpCode::DerivFineY},
     {IntrinsicOp::IOP_degrees, TranslateDegrees, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_determinant, EmptyLower, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_distance, TranslateDistance, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_dot, TranslateDot, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_dot2add, TranslateDot2Add, DXIL::OpCode::Dot2AddHalf},
-    {IntrinsicOp::IOP_dot4add_i8packed, TranslateDot4AddPacked, DXIL::OpCode::Dot4AddI8Packed},
-    {IntrinsicOp::IOP_dot4add_u8packed, TranslateDot4AddPacked, DXIL::OpCode::Dot4AddU8Packed},
+    {IntrinsicOp::IOP_dot4add_i8packed, TranslateDot4AddPacked,
+     DXIL::OpCode::Dot4AddI8Packed},
+    {IntrinsicOp::IOP_dot4add_u8packed, TranslateDot4AddPacked,
+     DXIL::OpCode::Dot4AddU8Packed},
     {IntrinsicOp::IOP_dst, TranslateDst, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_exp, TranslateExp, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_exp2, TrivialUnaryOperation, DXIL::OpCode::Exp},
-    {IntrinsicOp::IOP_f16tof32, TranslateF16ToF32, DXIL::OpCode::LegacyF16ToF32},
-    {IntrinsicOp::IOP_f32tof16, TranslateF32ToF16, DXIL::OpCode::LegacyF32ToF16},
-    {IntrinsicOp::IOP_faceforward, TranslateFaceforward, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_firstbithigh, TranslateFirstbitHi, DXIL::OpCode::FirstbitSHi},
-    {IntrinsicOp::IOP_firstbitlow, TranslateFirstbitLo, DXIL::OpCode::FirstbitLo},
+    {IntrinsicOp::IOP_f16tof32, TranslateF16ToF32,
+     DXIL::OpCode::LegacyF16ToF32},
+    {IntrinsicOp::IOP_f32tof16, TranslateF32ToF16,
+     DXIL::OpCode::LegacyF32ToF16},
+    {IntrinsicOp::IOP_faceforward, TranslateFaceforward,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_firstbithigh, TranslateFirstbitHi,
+     DXIL::OpCode::FirstbitSHi},
+    {IntrinsicOp::IOP_firstbitlow, TranslateFirstbitLo,
+     DXIL::OpCode::FirstbitLo},
     {IntrinsicOp::IOP_floor, TrivialUnaryOperation, DXIL::OpCode::Round_ni},
     {IntrinsicOp::IOP_fma, TrivialTrinaryOperation, DXIL::OpCode::Fma},
     {IntrinsicOp::IOP_fmod, TranslateFMod, DXIL::OpCode::NumOpCodes},
@@ -5528,10 +7532,11 @@ IntrinsicLower gLowerTable[] = {
     {IntrinsicOp::IOP_msad4, TranslateMSad4, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_mul, TranslateMul, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_normalize, TranslateNormalize, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::IOP_pack_clamp_s8, TranslatePack, DXIL::OpCode::Pack4x8 },
-    {IntrinsicOp::IOP_pack_clamp_u8, TranslatePack, DXIL::OpCode::Pack4x8 },
-    {IntrinsicOp::IOP_pack_s8, TranslatePack, DXIL::OpCode::Pack4x8 },
-    {IntrinsicOp::IOP_pack_u8, TranslatePack, DXIL::OpCode::Pack4x8 },
+    {IntrinsicOp::IOP_or, TranslateOr, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_pack_clamp_s8, TranslatePack, DXIL::OpCode::Pack4x8},
+    {IntrinsicOp::IOP_pack_clamp_u8, TranslatePack, DXIL::OpCode::Pack4x8},
+    {IntrinsicOp::IOP_pack_s8, TranslatePack, DXIL::OpCode::Pack4x8},
+    {IntrinsicOp::IOP_pack_u8, TranslatePack, DXIL::OpCode::Pack4x8},
     {IntrinsicOp::IOP_pow, TranslatePow, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_printf, TranslatePrintf, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_radians, TranslateRadians, DXIL::OpCode::NumOpCodes},
@@ -5542,11 +7547,13 @@ IntrinsicLower gLowerTable[] = {
     {IntrinsicOp::IOP_round, TrivialUnaryOperation, DXIL::OpCode::Round_ne},
     {IntrinsicOp::IOP_rsqrt, TrivialUnaryOperation, DXIL::OpCode::Rsqrt},
     {IntrinsicOp::IOP_saturate, TrivialUnaryOperation, DXIL::OpCode::Saturate},
+    {IntrinsicOp::IOP_select, TranslateSelect, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_sign, TranslateSign, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_sin, TrivialUnaryOperation, DXIL::OpCode::Sin},
     {IntrinsicOp::IOP_sincos, EmptyLower, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_sinh, TrivialUnaryOperation, DXIL::OpCode::Hsin},
-    {IntrinsicOp::IOP_smoothstep, TranslateSmoothStep, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_smoothstep, TranslateSmoothStep,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_source_mark, EmptyLower, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::IOP_sqrt, TrivialUnaryOperation, DXIL::OpCode::Sqrt},
     {IntrinsicOp::IOP_step, TranslateStep, DXIL::OpCode::NumOpCodes},
@@ -5578,147 +7585,479 @@ IntrinsicLower gLowerTable[] = {
     {IntrinsicOp::IOP_unpack_s8s32, TranslateUnpack, DXIL::OpCode::Unpack4x8},
     {IntrinsicOp::IOP_unpack_u8u16, TranslateUnpack, DXIL::OpCode::Unpack4x8},
     {IntrinsicOp::IOP_unpack_u8u32, TranslateUnpack, DXIL::OpCode::Unpack4x8},
-#ifdef ENABLE_SPIRV_CODEGEN
-    { IntrinsicOp::IOP_VkReadClock, UnsupportedVulkanIntrinsic, DXIL::OpCode::NumOpCodes },
-#endif // ENABLE_SPIRV_CODEGEN
+    {IntrinsicOp::IOP_VkRawBufferLoad, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_VkRawBufferStore, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_VkReadClock, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_Vkext_execution_mode, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_Vkext_execution_mode_id, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Append, StreamOutputLower, DXIL::OpCode::EmitStream},
     {IntrinsicOp::MOP_RestartStrip, StreamOutputLower, DXIL::OpCode::CutStream},
-    {IntrinsicOp::MOP_CalculateLevelOfDetail, TranslateCalculateLOD, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_CalculateLevelOfDetailUnclamped, TranslateCalculateLOD, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_GetDimensions, TranslateGetDimensions, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_CalculateLevelOfDetail, TranslateCalculateLOD,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_CalculateLevelOfDetailUnclamped, TranslateCalculateLOD,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_GetDimensions, TranslateGetDimensions,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Load, TranslateResourceLoad, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Sample, TranslateSample, DXIL::OpCode::Sample},
     {IntrinsicOp::MOP_SampleBias, TranslateSample, DXIL::OpCode::SampleBias},
     {IntrinsicOp::MOP_SampleCmp, TranslateSample, DXIL::OpCode::SampleCmp},
-    {IntrinsicOp::MOP_SampleCmpLevelZero, TranslateSample, DXIL::OpCode::SampleCmpLevelZero},
+    {IntrinsicOp::MOP_SampleCmpBias, TranslateSample,
+     DXIL::OpCode::SampleCmpBias},
+    {IntrinsicOp::MOP_SampleCmpGrad, TranslateSample,
+     DXIL::OpCode::SampleCmpGrad},
+    {IntrinsicOp::MOP_SampleCmpLevel, TranslateSample,
+     DXIL::OpCode::SampleCmpLevel},
+    {IntrinsicOp::MOP_SampleCmpLevelZero, TranslateSample,
+     DXIL::OpCode::SampleCmpLevelZero},
     {IntrinsicOp::MOP_SampleGrad, TranslateSample, DXIL::OpCode::SampleGrad},
     {IntrinsicOp::MOP_SampleLevel, TranslateSample, DXIL::OpCode::SampleLevel},
     {IntrinsicOp::MOP_Gather, TranslateGather, DXIL::OpCode::TextureGather},
-    {IntrinsicOp::MOP_GatherAlpha, TranslateGather, DXIL::OpCode::TextureGather},
+    {IntrinsicOp::MOP_GatherAlpha, TranslateGather,
+     DXIL::OpCode::TextureGather},
     {IntrinsicOp::MOP_GatherBlue, TranslateGather, DXIL::OpCode::TextureGather},
-    {IntrinsicOp::MOP_GatherCmp, TranslateGather, DXIL::OpCode::TextureGatherCmp},
-    {IntrinsicOp::MOP_GatherCmpAlpha, TranslateGather, DXIL::OpCode::TextureGatherCmp},
-    {IntrinsicOp::MOP_GatherCmpBlue, TranslateGather, DXIL::OpCode::TextureGatherCmp},
-    {IntrinsicOp::MOP_GatherCmpGreen, TranslateGather, DXIL::OpCode::TextureGatherCmp},
-    {IntrinsicOp::MOP_GatherCmpRed, TranslateGather, DXIL::OpCode::TextureGatherCmp},
-    {IntrinsicOp::MOP_GatherGreen, TranslateGather, DXIL::OpCode::TextureGather},
+    {IntrinsicOp::MOP_GatherCmp, TranslateGather,
+     DXIL::OpCode::TextureGatherCmp},
+    {IntrinsicOp::MOP_GatherCmpAlpha, TranslateGather,
+     DXIL::OpCode::TextureGatherCmp},
+    {IntrinsicOp::MOP_GatherCmpBlue, TranslateGather,
+     DXIL::OpCode::TextureGatherCmp},
+    {IntrinsicOp::MOP_GatherCmpGreen, TranslateGather,
+     DXIL::OpCode::TextureGatherCmp},
+    {IntrinsicOp::MOP_GatherCmpRed, TranslateGather,
+     DXIL::OpCode::TextureGatherCmp},
+    {IntrinsicOp::MOP_GatherGreen, TranslateGather,
+     DXIL::OpCode::TextureGather},
+    {IntrinsicOp::MOP_GatherRaw, TranslateGather,
+     DXIL::OpCode::TextureGatherRaw},
     {IntrinsicOp::MOP_GatherRed, TranslateGather, DXIL::OpCode::TextureGather},
-    {IntrinsicOp::MOP_GetSamplePosition, TranslateGetSamplePosition, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_GetSamplePosition, TranslateGetSamplePosition,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Load2, TranslateResourceLoad, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Load3, TranslateResourceLoad, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Load4, TranslateResourceLoad, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedAdd, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedAdd64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedAnd, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedAnd64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareExchange, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareExchange64, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareExchangeFloatBitwise, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareStore, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareStore64, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedCompareStoreFloatBitwise, TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedExchange, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedExchange64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedExchangeFloat, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedMax, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedMax64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedMin, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedMin64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedOr, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedOr64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedXor, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_InterlockedXor64, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedAdd, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedAdd64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedAnd, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedAnd64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareExchange, TranslateMopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareExchange64, TranslateMopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareExchangeFloatBitwise,
+     TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareStore, TranslateMopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareStore64, TranslateMopAtomicCmpXChg,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedCompareStoreFloatBitwise,
+     TranslateMopAtomicCmpXChg, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedExchange, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedExchange64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedExchangeFloat,
+     TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedMax, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedMax64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedMin, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedMin64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedOr, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedOr64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedXor, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedXor64, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Store, TranslateResourceStore, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Store2, TranslateResourceStore, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Store3, TranslateResourceStore, DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Store4, TranslateResourceStore, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_DecrementCounter, GenerateUpdateCounter, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_IncrementCounter, GenerateUpdateCounter, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_DecrementCounter, GenerateUpdateCounter,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_IncrementCounter, GenerateUpdateCounter,
+     DXIL::OpCode::NumOpCodes},
     {IntrinsicOp::MOP_Consume, EmptyLower, DXIL::OpCode::NumOpCodes},
-    {IntrinsicOp::MOP_WriteSamplerFeedback, TranslateWriteSamplerFeedback, DXIL::OpCode::WriteSamplerFeedback},
-    {IntrinsicOp::MOP_WriteSamplerFeedbackBias, TranslateWriteSamplerFeedback, DXIL::OpCode::WriteSamplerFeedbackBias},
-    {IntrinsicOp::MOP_WriteSamplerFeedbackGrad, TranslateWriteSamplerFeedback, DXIL::OpCode::WriteSamplerFeedbackGrad},
-    {IntrinsicOp::MOP_WriteSamplerFeedbackLevel, TranslateWriteSamplerFeedback, DXIL::OpCode::WriteSamplerFeedbackLevel},
+    {IntrinsicOp::MOP_WriteSamplerFeedback, TranslateWriteSamplerFeedback,
+     DXIL::OpCode::WriteSamplerFeedback},
+    {IntrinsicOp::MOP_WriteSamplerFeedbackBias, TranslateWriteSamplerFeedback,
+     DXIL::OpCode::WriteSamplerFeedbackBias},
+    {IntrinsicOp::MOP_WriteSamplerFeedbackGrad, TranslateWriteSamplerFeedback,
+     DXIL::OpCode::WriteSamplerFeedbackGrad},
+    {IntrinsicOp::MOP_WriteSamplerFeedbackLevel, TranslateWriteSamplerFeedback,
+     DXIL::OpCode::WriteSamplerFeedbackLevel},
 
-    {IntrinsicOp::MOP_Abort, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_Abort},
-    {IntrinsicOp::MOP_CandidateGeometryIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateGeometryIndex},
-    {IntrinsicOp::MOP_CandidateInstanceContributionToHitGroupIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateInstanceContributionToHitGroupIndex},
-    {IntrinsicOp::MOP_CandidateInstanceID, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateInstanceID},
-    {IntrinsicOp::MOP_CandidateInstanceIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateInstanceIndex},
-    {IntrinsicOp::MOP_CandidateObjectRayDirection, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_CandidateObjectRayDirection},
-    {IntrinsicOp::MOP_CandidateObjectRayOrigin, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_CandidateObjectRayOrigin},
-    {IntrinsicOp::MOP_CandidateObjectToWorld3x4, TranslateRayQueryMatrix3x4Operation, DXIL::OpCode::RayQuery_CandidateObjectToWorld3x4},
-    {IntrinsicOp::MOP_CandidateObjectToWorld4x3, TranslateRayQueryTransposedMatrix3x4Operation, DXIL::OpCode::RayQuery_CandidateObjectToWorld3x4},
-    {IntrinsicOp::MOP_CandidatePrimitiveIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidatePrimitiveIndex},
-    {IntrinsicOp::MOP_CandidateProceduralPrimitiveNonOpaque, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateProceduralPrimitiveNonOpaque},
-    {IntrinsicOp::MOP_CandidateTriangleBarycentrics, TranslateRayQueryFloat2Getter, DXIL::OpCode::RayQuery_CandidateTriangleBarycentrics},
-    {IntrinsicOp::MOP_CandidateTriangleFrontFace, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateTriangleFrontFace},
-    {IntrinsicOp::MOP_CandidateTriangleRayT, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateTriangleRayT},
-    {IntrinsicOp::MOP_CandidateType, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CandidateType},
-    {IntrinsicOp::MOP_CandidateWorldToObject3x4, TranslateRayQueryMatrix3x4Operation, DXIL::OpCode::RayQuery_CandidateWorldToObject3x4},
-    {IntrinsicOp::MOP_CandidateWorldToObject4x3, TranslateRayQueryTransposedMatrix3x4Operation, DXIL::OpCode::RayQuery_CandidateWorldToObject3x4},
-    {IntrinsicOp::MOP_CommitNonOpaqueTriangleHit, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommitNonOpaqueTriangleHit},
-    {IntrinsicOp::MOP_CommitProceduralPrimitiveHit, TranslateCommitProceduralPrimitiveHit, DXIL::OpCode::RayQuery_CommitProceduralPrimitiveHit},
-    {IntrinsicOp::MOP_CommittedGeometryIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedGeometryIndex},
-    {IntrinsicOp::MOP_CommittedInstanceContributionToHitGroupIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedInstanceContributionToHitGroupIndex},
-    {IntrinsicOp::MOP_CommittedInstanceID, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedInstanceID},
-    {IntrinsicOp::MOP_CommittedInstanceIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedInstanceIndex},
-    {IntrinsicOp::MOP_CommittedObjectRayDirection, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_CommittedObjectRayDirection},
-    {IntrinsicOp::MOP_CommittedObjectRayOrigin, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_CommittedObjectRayOrigin},
-    {IntrinsicOp::MOP_CommittedObjectToWorld3x4, TranslateRayQueryMatrix3x4Operation, DXIL::OpCode::RayQuery_CommittedObjectToWorld3x4},
-    {IntrinsicOp::MOP_CommittedObjectToWorld4x3, TranslateRayQueryTransposedMatrix3x4Operation, DXIL::OpCode::RayQuery_CommittedObjectToWorld3x4},
-    {IntrinsicOp::MOP_CommittedPrimitiveIndex, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedPrimitiveIndex},
-    {IntrinsicOp::MOP_CommittedRayT, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedRayT},
-    {IntrinsicOp::MOP_CommittedStatus, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedStatus},
-    {IntrinsicOp::MOP_CommittedTriangleBarycentrics, TranslateRayQueryFloat2Getter, DXIL::OpCode::RayQuery_CommittedTriangleBarycentrics},
-    {IntrinsicOp::MOP_CommittedTriangleFrontFace, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_CommittedTriangleFrontFace},
-    {IntrinsicOp::MOP_CommittedWorldToObject3x4, TranslateRayQueryMatrix3x4Operation, DXIL::OpCode::RayQuery_CommittedWorldToObject3x4},
-    {IntrinsicOp::MOP_CommittedWorldToObject4x3, TranslateRayQueryTransposedMatrix3x4Operation, DXIL::OpCode::RayQuery_CommittedWorldToObject3x4},
-    {IntrinsicOp::MOP_Proceed, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_Proceed},
-    {IntrinsicOp::MOP_RayFlags, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_RayFlags},
-    {IntrinsicOp::MOP_RayTMin, TranslateGenericRayQueryMethod, DXIL::OpCode::RayQuery_RayTMin},
-    {IntrinsicOp::MOP_TraceRayInline,  TranslateTraceRayInline,  DXIL::OpCode::RayQuery_TraceRayInline},
-    {IntrinsicOp::MOP_WorldRayDirection, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_WorldRayDirection},
-    {IntrinsicOp::MOP_WorldRayOrigin, TranslateRayQueryFloat3Getter, DXIL::OpCode::RayQuery_WorldRayOrigin},
+    {IntrinsicOp::MOP_Abort, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_Abort},
+    {IntrinsicOp::MOP_CandidateGeometryIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateGeometryIndex},
+    {IntrinsicOp::MOP_CandidateInstanceContributionToHitGroupIndex,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateInstanceContributionToHitGroupIndex},
+    {IntrinsicOp::MOP_CandidateInstanceID, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateInstanceID},
+    {IntrinsicOp::MOP_CandidateInstanceIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateInstanceIndex},
+    {IntrinsicOp::MOP_CandidateObjectRayDirection,
+     TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_CandidateObjectRayDirection},
+    {IntrinsicOp::MOP_CandidateObjectRayOrigin, TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_CandidateObjectRayOrigin},
+    {IntrinsicOp::MOP_CandidateObjectToWorld3x4,
+     TranslateRayQueryMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CandidateObjectToWorld3x4},
+    {IntrinsicOp::MOP_CandidateObjectToWorld4x3,
+     TranslateRayQueryTransposedMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CandidateObjectToWorld3x4},
+    {IntrinsicOp::MOP_CandidatePrimitiveIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidatePrimitiveIndex},
+    {IntrinsicOp::MOP_CandidateProceduralPrimitiveNonOpaque,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateProceduralPrimitiveNonOpaque},
+    {IntrinsicOp::MOP_CandidateTriangleBarycentrics,
+     TranslateRayQueryFloat2Getter,
+     DXIL::OpCode::RayQuery_CandidateTriangleBarycentrics},
+    {IntrinsicOp::MOP_CandidateTriangleFrontFace,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateTriangleFrontFace},
+    {IntrinsicOp::MOP_CandidateTriangleRayT, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateTriangleRayT},
+    {IntrinsicOp::MOP_CandidateType, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateType},
+    {IntrinsicOp::MOP_CandidateWorldToObject3x4,
+     TranslateRayQueryMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CandidateWorldToObject3x4},
+    {IntrinsicOp::MOP_CandidateWorldToObject4x3,
+     TranslateRayQueryTransposedMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CandidateWorldToObject3x4},
+    {IntrinsicOp::MOP_CommitNonOpaqueTriangleHit,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommitNonOpaqueTriangleHit},
+    {IntrinsicOp::MOP_CommitProceduralPrimitiveHit,
+     TranslateCommitProceduralPrimitiveHit,
+     DXIL::OpCode::RayQuery_CommitProceduralPrimitiveHit},
+    {IntrinsicOp::MOP_CommittedGeometryIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedGeometryIndex},
+    {IntrinsicOp::MOP_CommittedInstanceContributionToHitGroupIndex,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedInstanceContributionToHitGroupIndex},
+    {IntrinsicOp::MOP_CommittedInstanceID, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedInstanceID},
+    {IntrinsicOp::MOP_CommittedInstanceIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedInstanceIndex},
+    {IntrinsicOp::MOP_CommittedObjectRayDirection,
+     TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_CommittedObjectRayDirection},
+    {IntrinsicOp::MOP_CommittedObjectRayOrigin, TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_CommittedObjectRayOrigin},
+    {IntrinsicOp::MOP_CommittedObjectToWorld3x4,
+     TranslateRayQueryMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CommittedObjectToWorld3x4},
+    {IntrinsicOp::MOP_CommittedObjectToWorld4x3,
+     TranslateRayQueryTransposedMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CommittedObjectToWorld3x4},
+    {IntrinsicOp::MOP_CommittedPrimitiveIndex, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedPrimitiveIndex},
+    {IntrinsicOp::MOP_CommittedRayT, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedRayT},
+    {IntrinsicOp::MOP_CommittedStatus, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedStatus},
+    {IntrinsicOp::MOP_CommittedTriangleBarycentrics,
+     TranslateRayQueryFloat2Getter,
+     DXIL::OpCode::RayQuery_CommittedTriangleBarycentrics},
+    {IntrinsicOp::MOP_CommittedTriangleFrontFace,
+     TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedTriangleFrontFace},
+    {IntrinsicOp::MOP_CommittedWorldToObject3x4,
+     TranslateRayQueryMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CommittedWorldToObject3x4},
+    {IntrinsicOp::MOP_CommittedWorldToObject4x3,
+     TranslateRayQueryTransposedMatrix3x4Operation,
+     DXIL::OpCode::RayQuery_CommittedWorldToObject3x4},
+    {IntrinsicOp::MOP_Proceed, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_Proceed},
+    {IntrinsicOp::MOP_RayFlags, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_RayFlags},
+    {IntrinsicOp::MOP_RayTMin, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_RayTMin},
+    {IntrinsicOp::MOP_TraceRayInline, TranslateTraceRayInline,
+     DXIL::OpCode::RayQuery_TraceRayInline},
+    {IntrinsicOp::MOP_WorldRayDirection, TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_WorldRayDirection},
+    {IntrinsicOp::MOP_WorldRayOrigin, TranslateRayQueryFloat3Getter,
+     DXIL::OpCode::RayQuery_WorldRayOrigin},
+    {IntrinsicOp::MOP_Count, TranslateNodeGetInputRecordCount,
+     DXIL::OpCode::GetInputRecordCount},
+    {IntrinsicOp::MOP_FinishedCrossGroupSharing,
+     TranslateNodeFinishedCrossGroupSharing,
+     DXIL::OpCode::FinishedCrossGroupSharing},
+    {IntrinsicOp::MOP_GetGroupNodeOutputRecords,
+     TranslateGetGroupNodeOutputRecords,
+     DXIL::OpCode::AllocateNodeOutputRecords},
+    {IntrinsicOp::MOP_GetThreadNodeOutputRecords,
+     TranslateGetThreadNodeOutputRecords,
+     DXIL::OpCode::AllocateNodeOutputRecords},
+    {IntrinsicOp::MOP_IsValid, TranslateNodeOutputIsValid,
+     DXIL::OpCode::NodeOutputIsValid},
+    {IntrinsicOp::MOP_GroupIncrementOutputCount,
+     TranslateNodeGroupIncrementOutputCount,
+     DXIL::OpCode::IncrementOutputCount},
+    {IntrinsicOp::MOP_ThreadIncrementOutputCount,
+     TranslateNodeThreadIncrementOutputCount,
+     DXIL::OpCode::IncrementOutputCount},
+    {IntrinsicOp::MOP_OutputComplete, TranslateNodeOutputComplete,
+     DXIL::OpCode::OutputComplete},
 
     // SPIRV change starts
-#ifdef ENABLE_SPIRV_CODEGEN
-    {IntrinsicOp::MOP_SubpassLoad, UnsupportedVulkanIntrinsic, DXIL::OpCode::NumOpCodes},
-#endif // ENABLE_SPIRV_CODEGEN
+    {IntrinsicOp::MOP_SubpassLoad, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
     // SPIRV change ends
 
-    // Manully added part.
-    { IntrinsicOp::IOP_InterlockedUMax, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes },
-    { IntrinsicOp::IOP_InterlockedUMin, TranslateIopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes },
-    { IntrinsicOp::IOP_WaveActiveUMax, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp },
-    { IntrinsicOp::IOP_WaveActiveUMin, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp },
-    { IntrinsicOp::IOP_WaveActiveUProduct, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp },
-    { IntrinsicOp::IOP_WaveActiveUSum, TranslateWaveA2A, DXIL::OpCode::WaveActiveOp },
-    { IntrinsicOp::IOP_WaveMultiPrefixUProduct, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp },
-    { IntrinsicOp::IOP_WaveMultiPrefixUSum, TranslateWaveMultiPrefix, DXIL::OpCode::WaveMultiPrefixOp },
-    { IntrinsicOp::IOP_WavePrefixUProduct, TranslateWaveA2A, DXIL::OpCode::WavePrefixOp },
-    { IntrinsicOp::IOP_WavePrefixUSum, TranslateWaveA2A, DXIL::OpCode::WavePrefixOp },
-    { IntrinsicOp::IOP_uabs, TranslateUAbs, DXIL::OpCode::NumOpCodes },
-    { IntrinsicOp::IOP_uclamp, TranslateClamp, DXIL::OpCode::NumOpCodes },
-    { IntrinsicOp::IOP_ufirstbithigh, TranslateFirstbitHi, DXIL::OpCode::FirstbitHi },
-    { IntrinsicOp::IOP_umad, TranslateFUITrinary, DXIL::OpCode::UMad},
-    { IntrinsicOp::IOP_umax, TranslateFUIBinary, DXIL::OpCode::UMax},
-    { IntrinsicOp::IOP_umin, TranslateFUIBinary, DXIL::OpCode::UMin },
-    { IntrinsicOp::IOP_umul, TranslateMul, DXIL::OpCode::UMul },
-    { IntrinsicOp::IOP_usign, TranslateUSign, DXIL::OpCode::UMax },
-    { IntrinsicOp::MOP_InterlockedUMax, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes },
-    { IntrinsicOp::MOP_InterlockedUMin, TranslateMopAtomicBinaryOperation, DXIL::OpCode::NumOpCodes },
+    // Manually added part.
+    {IntrinsicOp::IOP_InterlockedUMax, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_InterlockedUMin, TranslateIopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_WaveActiveUMax, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveUMin, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveUProduct, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveActiveUSum, TranslateWaveA2A,
+     DXIL::OpCode::WaveActiveOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixUProduct, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WaveMultiPrefixUSum, TranslateWaveMultiPrefix,
+     DXIL::OpCode::WaveMultiPrefixOp},
+    {IntrinsicOp::IOP_WavePrefixUProduct, TranslateWaveA2A,
+     DXIL::OpCode::WavePrefixOp},
+    {IntrinsicOp::IOP_WavePrefixUSum, TranslateWaveA2A,
+     DXIL::OpCode::WavePrefixOp},
+    {IntrinsicOp::IOP_uabs, TranslateUAbs, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_uclamp, TranslateClamp, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_udot, TranslateDot, DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_ufirstbithigh, TranslateFirstbitHi,
+     DXIL::OpCode::FirstbitHi},
+    {IntrinsicOp::IOP_umad, TranslateFUITrinary, DXIL::OpCode::UMad},
+    {IntrinsicOp::IOP_umax, TranslateFUIBinary, DXIL::OpCode::UMax},
+    {IntrinsicOp::IOP_umin, TranslateFUIBinary, DXIL::OpCode::UMin},
+    {IntrinsicOp::IOP_umul, TranslateMul, DXIL::OpCode::UMul},
+    {IntrinsicOp::IOP_usign, TranslateUSign, DXIL::OpCode::UMax},
+    {IntrinsicOp::MOP_InterlockedUMax, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_InterlockedUMin, TranslateMopAtomicBinaryOperation,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_DxHitObject_MakeNop, TranslateHitObjectMakeNop,
+     DXIL::OpCode::HitObject_MakeNop},
+    {IntrinsicOp::IOP_DxMaybeReorderThread, TranslateMaybeReorderThread,
+     DXIL::OpCode::MaybeReorderThread},
+    {IntrinsicOp::IOP_Vkreinterpret_pointer_cast, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::IOP_Vkstatic_pointer_cast, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_GetBufferContents, UnsupportedVulkanIntrinsic,
+     DXIL::OpCode::NumOpCodes},
+    {IntrinsicOp::MOP_DxHitObject_FromRayQuery, TranslateHitObjectFromRayQuery,
+     DXIL::OpCode::HitObject_FromRayQuery},
+    {IntrinsicOp::MOP_DxHitObject_GetAttributes,
+     TranslateHitObjectGetAttributes, DXIL::OpCode::HitObject_Attributes},
+    {IntrinsicOp::MOP_DxHitObject_GetGeometryIndex,
+     TranslateHitObjectScalarGetter, DXIL::OpCode::HitObject_GeometryIndex},
+    {IntrinsicOp::MOP_DxHitObject_GetHitKind, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_HitKind},
+    {IntrinsicOp::MOP_DxHitObject_GetInstanceID, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_InstanceID},
+    {IntrinsicOp::MOP_DxHitObject_GetInstanceIndex,
+     TranslateHitObjectScalarGetter, DXIL::OpCode::HitObject_InstanceIndex},
+    {IntrinsicOp::MOP_DxHitObject_GetObjectRayDirection,
+     TranslateHitObjectVectorGetter,
+     DXIL::OpCode::HitObject_ObjectRayDirection},
+    {IntrinsicOp::MOP_DxHitObject_GetObjectRayOrigin,
+     TranslateHitObjectVectorGetter, DXIL::OpCode::HitObject_ObjectRayOrigin},
+    {IntrinsicOp::MOP_DxHitObject_GetObjectToWorld3x4,
+     TranslateHitObjectMatrixGetter, DXIL::OpCode::HitObject_ObjectToWorld3x4},
+    {IntrinsicOp::MOP_DxHitObject_GetObjectToWorld4x3,
+     TranslateHitObjectMatrixGetter, DXIL::OpCode::HitObject_ObjectToWorld3x4},
+    {IntrinsicOp::MOP_DxHitObject_GetPrimitiveIndex,
+     TranslateHitObjectScalarGetter, DXIL::OpCode::HitObject_PrimitiveIndex},
+    {IntrinsicOp::MOP_DxHitObject_GetRayFlags, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_RayFlags},
+    {IntrinsicOp::MOP_DxHitObject_GetRayTCurrent,
+     TranslateHitObjectScalarGetter, DXIL::OpCode::HitObject_RayTCurrent},
+    {IntrinsicOp::MOP_DxHitObject_GetRayTMin, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_RayTMin},
+    {IntrinsicOp::MOP_DxHitObject_GetShaderTableIndex,
+     TranslateHitObjectScalarGetter, DXIL::OpCode::HitObject_ShaderTableIndex},
+    {IntrinsicOp::MOP_DxHitObject_GetWorldRayDirection,
+     TranslateHitObjectVectorGetter, DXIL::OpCode::HitObject_WorldRayDirection},
+    {IntrinsicOp::MOP_DxHitObject_GetWorldRayOrigin,
+     TranslateHitObjectVectorGetter, DXIL::OpCode::HitObject_WorldRayOrigin},
+    {IntrinsicOp::MOP_DxHitObject_GetWorldToObject3x4,
+     TranslateHitObjectMatrixGetter, DXIL::OpCode::HitObject_WorldToObject3x4},
+    {IntrinsicOp::MOP_DxHitObject_GetWorldToObject4x3,
+     TranslateHitObjectMatrixGetter, DXIL::OpCode::HitObject_WorldToObject3x4},
+    {IntrinsicOp::MOP_DxHitObject_Invoke, TranslateHitObjectInvoke,
+     DXIL::OpCode::HitObject_Invoke},
+    {IntrinsicOp::MOP_DxHitObject_IsHit, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_IsHit},
+    {IntrinsicOp::MOP_DxHitObject_IsMiss, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_IsMiss},
+    {IntrinsicOp::MOP_DxHitObject_IsNop, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_IsNop},
+    {IntrinsicOp::MOP_DxHitObject_LoadLocalRootTableConstant,
+     TranslateHitObjectLoadLocalRootTableConstant,
+     DXIL::OpCode::HitObject_LoadLocalRootTableConstant},
+    {IntrinsicOp::MOP_DxHitObject_MakeMiss, TranslateHitObjectMakeMiss,
+     DXIL::OpCode::HitObject_MakeMiss},
+    {IntrinsicOp::MOP_DxHitObject_SetShaderTableIndex,
+     TranslateHitObjectSetShaderTableIndex,
+     DXIL::OpCode::HitObject_SetShaderTableIndex},
+    {IntrinsicOp::MOP_DxHitObject_TraceRay, TranslateHitObjectTraceRay,
+     DXIL::OpCode::HitObject_TraceRay},
+
+    {IntrinsicOp::IOP_isnormal, TrivialIsSpecialFloat, DXIL::OpCode::IsNormal},
+
+    {IntrinsicOp::IOP_GetGroupWaveCount, TranslateWaveToVal,
+     DXIL::OpCode::GetGroupWaveCount},
+    {IntrinsicOp::IOP_GetGroupWaveIndex, TranslateWaveToVal,
+     DXIL::OpCode::GetGroupWaveIndex},
+
+    {IntrinsicOp::IOP_ClusterID, TrivialNoArgWithRetNoOverloadOperation,
+     DXIL::OpCode::ClusterID},
+    {IntrinsicOp::MOP_CandidateClusterID, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CandidateClusterID},
+    {IntrinsicOp::MOP_CommittedClusterID, TranslateGenericRayQueryMethod,
+     DXIL::OpCode::RayQuery_CommittedClusterID},
+    {IntrinsicOp::MOP_DxHitObject_GetClusterID, TranslateHitObjectScalarGetter,
+     DXIL::OpCode::HitObject_ClusterID},
+
+    {IntrinsicOp::IOP_TriangleObjectPositions, TranslateTriangleObjectPositions,
+     DXIL::OpCode::TriangleObjectPosition},
+    {IntrinsicOp::MOP_CandidateTriangleObjectPositions,
+     TranslateRayQueryTriangleObjectPositions,
+     DXIL::OpCode::RayQuery_CandidateTriangleObjectPosition},
+    {IntrinsicOp::MOP_CommittedTriangleObjectPositions,
+     TranslateRayQueryTriangleObjectPositions,
+     DXIL::OpCode::RayQuery_CommittedTriangleObjectPosition},
+    {IntrinsicOp::MOP_DxHitObject_TriangleObjectPositions,
+     TranslateHitObjectTriangleObjectPositions,
+     DXIL::OpCode::HitObject_TriangleObjectPosition},
+
+    {IntrinsicOp::IOP___builtin_LinAlg_CopyConvertMatrix,
+     TranslateLinAlgCopyConvertMatrix, DXIL::OpCode::LinAlgCopyConvertMatrix},
+    {IntrinsicOp::IOP___builtin_LinAlg_FillMatrix, TranslateLinAlgFillMatrix,
+     DXIL::OpCode::LinAlgFillMatrix},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixGetCoordinate,
+     TranslateLinAlgMatrixGetCoordinate,
+     DXIL::OpCode::LinAlgMatrixGetCoordinate},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixGetElement,
+     TranslateLinAlgMatrixGetElement, DXIL::OpCode::LinAlgMatrixGetElement},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixLength, TrivialUnaryOperation,
+     DXIL::OpCode::LinAlgMatrixLength},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixLoadFromDescriptor,
+     TranslateLinAlgMatrixLoadFromDescriptor,
+     DXIL::OpCode::LinAlgMatrixLoadFromDescriptor},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixLoadFromMemory,
+     TranslateLinAlgMatrixLoadFromMemory,
+     DXIL::OpCode::LinAlgMatrixLoadFromMemory},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixSetElement,
+     TranslateLinAlgMatrixSetElement, DXIL::OpCode::LinAlgMatrixSetElement},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixStoreToDescriptor,
+     TranslateLinAlgMatrixAccumStoreToDescriptor,
+     DXIL::OpCode::LinAlgMatrixStoreToDescriptor},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixStoreToMemory,
+     TranslateLinAlgMatrixStoreToMemory,
+     DXIL::OpCode::LinAlgMatrixStoreToMemory},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixAccumulate,
+     TranslateLinAlgMatrixAccumulate, DXIL::OpCode::LinAlgMatrixAccumulate},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixMatrixMultiply,
+     TranslateLinAlgMatrixMatrixMultiply, DXIL::OpCode::LinAlgMatrixMultiply},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixMatrixMultiplyAccumulate,
+     TranslateLinAlgMatrixMatrixMultiplyAccumulate,
+     DXIL::OpCode::LinAlgMatrixMultiplyAccumulate},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixQueryAccumulatorLayout,
+     TrivialNoArgOperation, DXIL::OpCode::LinAlgMatrixQueryAccumulatorLayout},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixAccumulateToDescriptor,
+     TranslateLinAlgMatrixAccumStoreToDescriptor,
+     DXIL::OpCode::LinAlgMatrixAccumulateToDescriptor},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixAccumulateToMemory,
+     TranslateLinAlgMatrixAccumToMemory,
+     DXIL::OpCode::LinAlgMatrixAccumulateToMemory},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixOuterProduct,
+     TranslateLinAlgMatrixOuterProduct, DXIL::OpCode::LinAlgMatrixOuterProduct},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixVectorMultiply,
+     TranslateLinAlgMatVecMul, DXIL::OpCode::LinAlgMatVecMul},
+    {IntrinsicOp::IOP___builtin_LinAlg_MatrixVectorMultiplyAdd,
+     TranslateLinAlgMatVecMulAdd, DXIL::OpCode::LinAlgMatVecMulAdd},
+
+    {IntrinsicOp::IOP_DebugBreak, TrivialNoArgOperation,
+     DXIL::OpCode::DebugBreak},
+    {IntrinsicOp::IOP_DxIsDebuggingEnabled, TranslateWaveToVal,
+     DXIL::OpCode::IsDebuggingEnabled},
+
+    {IntrinsicOp::IOP___builtin_LinAlg_Convert, TranslateLinAlgConvert,
+     DXIL::OpCode::LinAlgConvert},
+    {IntrinsicOp::IOP___builtin_LinAlg_VectorAccumulateToDescriptor,
+     TranslateLinAlgVectorAccumulateToDescriptor,
+     DXIL::OpCode::LinAlgVectorAccumulateToDescriptor},
 };
-}
-static_assert(sizeof(gLowerTable) / sizeof(gLowerTable[0]) == static_cast<size_t>(IntrinsicOp::Num_Intrinsics),
-  "Intrinsic lowering table must be updated to account for new intrinsics.");
+constexpr size_t NumLowerTableEntries =
+    sizeof(gLowerTable) / sizeof(gLowerTable[0]);
+static_assert(
+    NumLowerTableEntries == static_cast<size_t>(IntrinsicOp::Num_Intrinsics),
+    "Intrinsic lowering table must be updated to account for new intrinsics.");
+
+// Make table-order failures report the bad index via template instantiation
+// parameter in the diagnostic.
+// On failure, use hlsl_intrinsic_opcodes.json to find the mismatch.
+template <size_t I> struct ValidateLowerTableEntry {
+  // Instantiate a type that fails if the opcode doesn't match the index.
+  static_assert(
+      I == static_cast<size_t>(gLowerTable[I].IntriOpcode),
+      "Intrinsic lowering table is out of order. "
+      "See ValidateLowerTableEntry<I> template instantiation for Index.");
+  static constexpr bool Value =
+      I == static_cast<size_t>(gLowerTable[I].IntriOpcode);
+};
+
+template <size_t I, size_t N> struct ValidateLowerTableImpl {
+  static constexpr bool Value = ValidateLowerTableEntry<I>::Value &&
+                                ValidateLowerTableImpl<I + 1, N>::Value;
+};
+
+template <size_t N> struct ValidateLowerTableImpl<N, N> {
+  static constexpr bool Value = true;
+};
+
+static_assert(ValidateLowerTableImpl<0, NumLowerTableEntries>::Value,
+              "Intrinsic lowering table is out of order.");
+} // namespace
 
 static void TranslateBuiltinIntrinsic(CallInst *CI,
-                                      HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                                      HLOperationLowerHelper &helper,
+                                      HLObjectOperationLowerHelper *pObjHelper,
+                                      bool &Translated) {
   unsigned opcode = hlsl::GetHLOpcode(CI);
   const IntrinsicLower &lower = gLowerTable[opcode];
-  Value *Result =
-      lower.LowerFunc(CI, lower.IntriOpcode, lower.DxilOpcode, helper, pObjHelper, Translated);
+  DXASSERT((unsigned)lower.IntriOpcode == opcode,
+           "Intrinsic lowering table index must match intrinsic opcode.");
+  Value *Result = lower.LowerFunc(CI, lower.IntriOpcode, lower.DxilOpcode,
+                                  helper, pObjHelper, Translated);
   if (Result)
     CI->replaceAllUsesWith(Result);
 }
@@ -5735,15 +8074,17 @@ bool IsLocalVariablePtr(Value *Ptr) {
     Ptr = GEP->getPointerOperand();
   }
   bool isAlloca = isa<AllocaInst>(Ptr);
-  if (isAlloca) return true;
+  if (isAlloca)
+    return true;
 
   GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr);
-  if (!GV) return false;
+  if (!GV)
+    return false;
 
   return GV->getLinkage() == GlobalValue::LinkageTypes::InternalLinkage;
 }
 
-}
+} // namespace
 
 // Constant buffer.
 namespace {
@@ -5754,15 +8095,17 @@ unsigned GetEltTypeByteSizeForConstBuf(Type *EltType, const DataLayout &DL) {
   if (DL.getTypeSizeInBits(EltType) <= 32) {
     // Constant buffer is 4 bytes align.
     return 4;
-  } else
-    return 8;
+  }
+
+  return 8;
 }
 
 Value *GenerateCBLoad(Value *handle, Value *offset, Type *EltTy, OP *hlslOP,
                       IRBuilder<> &Builder) {
   Constant *OpArg = hlslOP->GetU32Const((unsigned)OP::OpCode::CBufferLoad);
 
-  DXASSERT(!EltTy->isIntegerTy(1), "Bools should not be loaded as their register representation.");
+  DXASSERT(!EltTy->isIntegerTy(1),
+           "Bools should not be loaded as their register representation.");
 
   // Align to 8 bytes for now.
   Constant *align = hlslOP->GetU32Const(8);
@@ -5787,7 +8130,7 @@ Value *TranslateConstBufMatLd(Type *matType, Value *handle, Value *offset,
     baseOffset = Builder.CreateAdd(baseOffset, EltByteSize);
   }
 
-  Value* Vec = HLMatrixLower::BuildVector(EltTy, elts, Builder);
+  Value *Vec = HLMatrixLower::BuildVector(EltTy, elts, Builder);
   Vec = MatTy.emitLoweredMemToReg(Vec, Builder);
   return Vec;
 }
@@ -5808,31 +8151,31 @@ Value *GenerateVecEltFromGEP(Value *ldData, GetElementPtrInst *GEP,
   Value *idx = (GEP->idx_begin() + 1)->get();
   if (dyn_cast<ConstantInt>(idx)) {
     return Builder.CreateExtractElement(ldData, idx);
-  } else {
-    // Dynamic indexing.
-    // Copy vec to array.
-    Type *Ty = ldData->getType();
-    Type *EltTy = Ty->getVectorElementType();
-    unsigned vecSize = Ty->getVectorNumElements();
-    ArrayType *AT = ArrayType::get(EltTy, vecSize);
-    IRBuilder<> AllocaBuilder(
-        GEP->getParent()->getParent()->getEntryBlock().getFirstInsertionPt());
-    Value *tempArray = AllocaBuilder.CreateAlloca(AT);
-    Value *zero = Builder.getInt32(0);
-    for (unsigned int i = 0; i < vecSize; i++) {
-      Value *Elt = Builder.CreateExtractElement(ldData, Builder.getInt32(i));
-      Value *Ptr =
-          Builder.CreateInBoundsGEP(tempArray, {zero, Builder.getInt32(i)});
-      Builder.CreateStore(Elt, Ptr);
-    }
-    // Load from temp array.
-    if (bInsertLdNextToGEP) {
-      // Insert the new GEP just before the old and to-be-deleted GEP
-      Builder.SetInsertPoint(GEP);
-    }
-    Value *EltGEP = Builder.CreateInBoundsGEP(tempArray, {zero, idx});
-    return Builder.CreateLoad(EltGEP);
   }
+
+  // Dynamic indexing.
+  // Copy vec to array.
+  Type *Ty = ldData->getType();
+  Type *EltTy = Ty->getVectorElementType();
+  unsigned vecSize = Ty->getVectorNumElements();
+  ArrayType *AT = ArrayType::get(EltTy, vecSize);
+  IRBuilder<> AllocaBuilder(
+      GEP->getParent()->getParent()->getEntryBlock().getFirstInsertionPt());
+  Value *tempArray = AllocaBuilder.CreateAlloca(AT);
+  Value *zero = Builder.getInt32(0);
+  for (unsigned int i = 0; i < vecSize; i++) {
+    Value *Elt = Builder.CreateExtractElement(ldData, Builder.getInt32(i));
+    Value *Ptr =
+        Builder.CreateInBoundsGEP(tempArray, {zero, Builder.getInt32(i)});
+    Builder.CreateStore(Elt, Ptr);
+  }
+  // Load from temp array.
+  if (bInsertLdNextToGEP) {
+    // Insert the new GEP just before the old and to-be-deleted GEP
+    Builder.SetInsertPoint(GEP);
+  }
+  Value *EltGEP = Builder.CreateInBoundsGEP(tempArray, {zero, idx});
+  return Builder.CreateLoad(EltGEP);
 }
 
 void TranslateResourceInCB(LoadInst *LI,
@@ -5882,7 +8225,8 @@ void TranslateCBAddressUser(Instruction *user, Value *handle, Value *baseOffset,
     } else if (group == HLOpcodeGroup::HLSubscript) {
       HLSubscriptOpcode subOp = static_cast<HLSubscriptOpcode>(opcode);
       Value *basePtr = CI->getArgOperand(HLOperandIndex::kMatSubscriptMatOpIdx);
-      HLMatrixType MatTy = HLMatrixType::cast(basePtr->getType()->getPointerElementType());
+      HLMatrixType MatTy =
+          HLMatrixType::cast(basePtr->getType()->getPointerElementType());
       Type *EltTy = MatTy.getElementTypeForReg();
 
       Value *EltByteSize = ConstantInt::get(
@@ -5895,7 +8239,7 @@ void TranslateCBAddressUser(Instruction *user, Value *handle, Value *baseOffset,
       if (resultType->isVectorTy())
         resultSize = resultType->getVectorNumElements();
       DXASSERT(resultSize <= 16, "up to 4x4 elements in vector or matrix");
-      _Analysis_assume_(resultSize <= 16);
+      assert(resultSize <= 16);
       Value *idxList[16];
 
       switch (subOp) {
@@ -5968,8 +8312,9 @@ void TranslateCBAddressUser(Instruction *user, Value *handle, Value *baseOffset,
       CallInst *CI = cast<CallInst>(handle);
       // CI should be annotate handle.
       // Need createHandle here.
-      if (GetHLOpcodeGroup(CI->getCalledFunction()) == HLOpcodeGroup::HLAnnotateHandle)
-        CI = cast<CallInst>(CI->getArgOperand(HLOperandIndex::kAnnotateHandleHandleOpIdx));
+      if (GetHLOpcodeGroup(CI->getCalledFunction()) ==
+          HLOpcodeGroup::HLAnnotateHandle)
+        CI = cast<CallInst>(CI->getArgOperand(HLOperandIndex::kHandleOpIdx));
       GlobalVariable *CbGV = cast<GlobalVariable>(
           CI->getArgOperand(HLOperandIndex::kCreateHandleResourceOpIdx));
       TranslateResourceInCB(ldInst, pObjHelper, CbGV);
@@ -6075,7 +8420,7 @@ void TranslateCBGep(GetElementPtrInst *GEP, Value *handle, Value *baseOffset,
     } else if (GEPIt->isArrayTy()) {
       DXASSERT(fieldAnnotation != nullptr, "must a field");
       unsigned EltSize = dxilutil::GetLegacyCBufferFieldElementSize(
-              *fieldAnnotation, *GEPIt, dxilTypeSys);
+          *fieldAnnotation, *GEPIt, dxilTypeSys);
       // Decide the nested array size.
       unsigned nestedArraySize = 1;
 
@@ -6120,26 +8465,14 @@ void TranslateCBGep(GetElementPtrInst *GEP, Value *handle, Value *baseOffset,
   }
 }
 
-void TranslateCBOperations(Value *handle, Value *ptr, Value *offset, OP *hlslOP,
-                           DxilTypeSystem &dxilTypeSys, const DataLayout &DL,
-                           HLObjectOperationLowerHelper *pObjHelper) {
-  auto User = ptr->user_begin();
-  auto UserE = ptr->user_end();
-  for (; User != UserE;) {
-    // Must be Instruction.
-    Instruction *I = cast<Instruction>(*(User++));
-    TranslateCBAddressUser(I, handle, offset, hlslOP,
-                           /*prevFieldAnnotation*/ nullptr, dxilTypeSys, DL,
-                           pObjHelper);
-  }
-}
-
 Value *GenerateCBLoadLegacy(Value *handle, Value *legacyIdx,
                             unsigned channelOffset, Type *EltTy, OP *hlslOP,
                             IRBuilder<> &Builder) {
-  Constant *OpArg = hlslOP->GetU32Const((unsigned)OP::OpCode::CBufferLoadLegacy);
+  Constant *OpArg =
+      hlslOP->GetU32Const((unsigned)OP::OpCode::CBufferLoadLegacy);
 
-  DXASSERT(!EltTy->isIntegerTy(1), "Bools should not be loaded as their register representation.");
+  DXASSERT(!EltTy->isIntegerTy(1),
+           "Bools should not be loaded as their register representation.");
 
   Type *doubleTy = Type::getDoubleTy(EltTy->getContext());
   Type *halfTy = Type::getHalfTy(EltTy->getContext());
@@ -6149,28 +8482,31 @@ Value *GenerateCBLoadLegacy(Value *handle, Value *legacyIdx,
   bool is64 = (EltTy == doubleTy) | (EltTy == i64Ty);
   bool is16 = (EltTy == halfTy || EltTy == i16Ty) && !hlslOP->UseMinPrecision();
   DXASSERT_LOCALVAR(is16, (is16 && channelOffset < 8) || channelOffset < 4,
-           "legacy cbuffer don't across 16 bytes register.");
+                    "legacy cbuffer don't across 16 bytes register.");
   if (is64) {
     Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
     Value *loadLegacy = Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
-    DXASSERT((channelOffset&1)==0,"channel offset must be even for double");
-    unsigned eltIdx = channelOffset>>1;
+    DXASSERT((channelOffset & 1) == 0,
+             "channel offset must be even for double");
+    unsigned eltIdx = channelOffset >> 1;
     Value *Result = Builder.CreateExtractValue(loadLegacy, eltIdx);
     return Result;
-  } else {
-    Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
-    Value *loadLegacy = Builder.CreateCall(CBLoad, { OpArg, handle, legacyIdx });
-    return Builder.CreateExtractValue(loadLegacy, channelOffset);
   }
+
+  Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
+  Value *loadLegacy = Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
+  return Builder.CreateExtractValue(loadLegacy, channelOffset);
 }
 
 Value *GenerateCBLoadLegacy(Value *handle, Value *legacyIdx,
                             unsigned channelOffset, Type *EltTy,
                             unsigned vecSize, OP *hlslOP,
                             IRBuilder<> &Builder) {
-  Constant *OpArg = hlslOP->GetU32Const((unsigned)OP::OpCode::CBufferLoadLegacy);
+  Constant *OpArg =
+      hlslOP->GetU32Const((unsigned)OP::OpCode::CBufferLoadLegacy);
 
-  DXASSERT(!EltTy->isIntegerTy(1), "Bools should not be loaded as their register representation.");
+  DXASSERT(!EltTy->isIntegerTy(1),
+           "Bools should not be loaded as their register representation.");
 
   Type *doubleTy = Type::getDoubleTy(EltTy->getContext());
   Type *i64Ty = Type::getInt64Ty(EltTy->getContext());
@@ -6178,7 +8514,8 @@ Value *GenerateCBLoadLegacy(Value *handle, Value *legacyIdx,
   Type *shortTy = Type::getInt16Ty(EltTy->getContext());
 
   bool is64 = (EltTy == doubleTy) | (EltTy == i64Ty);
-  bool is16 = (EltTy == shortTy || EltTy == halfTy) && !hlslOP->UseMinPrecision();
+  bool is16 =
+      (EltTy == shortTy || EltTy == halfTy) && !hlslOP->UseMinPrecision();
   DXASSERT((is16 && channelOffset + vecSize <= 8) ||
                (channelOffset + vecSize) <= 4,
            "legacy cbuffer don't across 16 bytes register.");
@@ -6191,38 +8528,40 @@ Value *GenerateCBLoadLegacy(Value *handle, Value *legacyIdx,
       Result = Builder.CreateInsertElement(Result, NewElt, i);
     }
     return Result;
-  } else if (is64) {
+  }
+
+  if (is64) {
     Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
-    Value *loadLegacy = Builder.CreateCall(CBLoad, { OpArg, handle, legacyIdx });
+    Value *loadLegacy = Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
     Value *Result = UndefValue::get(VectorType::get(EltTy, vecSize));
     unsigned smallVecSize = 2;
     if (vecSize < smallVecSize)
       smallVecSize = vecSize;
     for (unsigned i = 0; i < smallVecSize; ++i) {
-      Value *NewElt = Builder.CreateExtractValue(loadLegacy, channelOffset+i);
+      Value *NewElt = Builder.CreateExtractValue(loadLegacy, channelOffset + i);
       Result = Builder.CreateInsertElement(Result, NewElt, i);
     }
     if (vecSize > 2) {
       // Got to next cb register.
       legacyIdx = Builder.CreateAdd(legacyIdx, hlslOP->GetU32Const(1));
-      Value *loadLegacy = Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
+      Value *loadLegacy =
+          Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
       for (unsigned i = 2; i < vecSize; ++i) {
-        Value *NewElt =
-            Builder.CreateExtractValue(loadLegacy, i-2);
+        Value *NewElt = Builder.CreateExtractValue(loadLegacy, i - 2);
         Result = Builder.CreateInsertElement(Result, NewElt, i);
       }
     }
     return Result;
-  } else {
-    Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
-    Value *loadLegacy = Builder.CreateCall(CBLoad, { OpArg, handle, legacyIdx });
-    Value *Result = UndefValue::get(VectorType::get(EltTy, vecSize));
-    for (unsigned i = 0; i < vecSize; ++i) {
-      Value *NewElt = Builder.CreateExtractValue(loadLegacy, channelOffset + i);
-      Result = Builder.CreateInsertElement(Result, NewElt, i);
-    }
-    return Result;
   }
+
+  Function *CBLoad = hlslOP->GetOpFunc(OP::OpCode::CBufferLoadLegacy, EltTy);
+  Value *loadLegacy = Builder.CreateCall(CBLoad, {OpArg, handle, legacyIdx});
+  Value *Result = UndefValue::get(VectorType::get(EltTy, vecSize));
+  for (unsigned i = 0; i < vecSize; ++i) {
+    Value *NewElt = Builder.CreateExtractValue(loadLegacy, channelOffset + i);
+    Result = Builder.CreateInsertElement(Result, NewElt, i);
+  }
+  return Result;
 }
 
 Value *TranslateConstBufMatLdLegacy(HLMatrixType MatTy, Value *handle,
@@ -6252,8 +8591,9 @@ Value *TranslateConstBufMatLdLegacy(HLMatrixType MatTy, Value *handle,
     unsigned rowByteSize = 4 * EltByteSize;
     unsigned rowRegSize = (rowByteSize + 15) >> 4;
     for (unsigned r = 0; r < MatTy.getNumRows(); r++) {
-      Value *row = GenerateCBLoadLegacy(handle, legacyIdx, /*channelOffset*/ 0,
-                                        EltTy, MatTy.getNumColumns(), OP, Builder);
+      Value *row =
+          GenerateCBLoadLegacy(handle, legacyIdx, /*channelOffset*/ 0, EltTy,
+                               MatTy.getNumColumns(), OP, Builder);
       for (unsigned c = 0; c < MatTy.getNumColumns(); c++) {
         unsigned matIdx = MatTy.getRowMajorIndex(r, c);
         elts[matIdx] = Builder.CreateExtractElement(row, c);
@@ -6293,12 +8633,15 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
       DXASSERT(matOp == HLMatLoadStoreOpcode::ColMatLoad ||
                    matOp == HLMatLoadStoreOpcode::RowMatLoad,
                "No store on cbuffer");
-      HLMatrixType MatTy = HLMatrixType::cast(
-        CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx)
-          ->getType()->getPointerElementType());
-      // This will replace a call, so we should use the register representation of elements
+      HLMatrixType MatTy =
+          HLMatrixType::cast(CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx)
+                                 ->getType()
+                                 ->getPointerElementType());
+      // This will replace a call, so we should use the register representation
+      // of elements
       Value *newLd = TranslateConstBufMatLdLegacy(
-        MatTy, handle, legacyIdx, colMajor, hlslOP, /*memElemRepr*/false, DL, Builder);
+          MatTy, handle, legacyIdx, colMajor, hlslOP, /*memElemRepr*/ false, DL,
+          Builder);
       CI->replaceAllUsesWith(newLd);
       dxilutil::TryScatterDebugValueToVectorElements(newLd);
       CI->eraseFromParent();
@@ -6306,7 +8649,8 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
       unsigned opcode = GetHLOpcode(CI);
       HLSubscriptOpcode subOp = static_cast<HLSubscriptOpcode>(opcode);
       Value *basePtr = CI->getArgOperand(HLOperandIndex::kMatSubscriptMatOpIdx);
-      HLMatrixType MatTy = HLMatrixType::cast(basePtr->getType()->getPointerElementType());
+      HLMatrixType MatTy =
+          HLMatrixType::cast(basePtr->getType()->getPointerElementType());
       Type *EltTy = MatTy.getElementTypeForReg();
 
       Value *idx = CI->getArgOperand(HLOperandIndex::kMatSubscriptSubOpIdx);
@@ -6316,7 +8660,7 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
       if (resultType->isVectorTy())
         resultSize = resultType->getVectorNumElements();
       DXASSERT(resultSize <= 16, "up to 4x4 elements in vector or matrix");
-      _Analysis_assume_(resultSize <= 16);
+      assert(resultSize <= 16);
       Value *idxList[16];
       bool colMajor = subOp == HLSubscriptOpcode::ColMatSubscript ||
                       subOp == HLSubscriptOpcode::ColMatElement;
@@ -6326,9 +8670,11 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
 
       Value *ldData = UndefValue::get(resultType);
       if (!dynamicIndexing) {
-        // This will replace a load or GEP, so we should use the memory representation of elements
+        // This will replace a load or GEP, so we should use the memory
+        // representation of elements
         Value *matLd = TranslateConstBufMatLdLegacy(
-          MatTy, handle, legacyIdx, colMajor, hlslOP, /*memElemRepr*/true, DL, Builder);
+            MatTy, handle, legacyIdx, colMajor, hlslOP, /*memElemRepr*/ true,
+            DL, Builder);
         // The matLd is keep original layout, just use the idx calc in
         // EmitHLSLMatrixElement and EmitHLSLMatrixSubscript.
         switch (subOp) {
@@ -6373,7 +8719,7 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
           // row.z = c[2].[idx]
           // row.w = c[3].[idx]
           Value *Elts[4];
-          ArrayType *AT = ArrayType::get(EltTy, MatTy.getNumColumns());
+          ArrayType *AT = ArrayType::get(EltTy, MatTy.getNumRows());
 
           IRBuilder<> AllocaBuilder(user->getParent()
                                         ->getParent()
@@ -6384,9 +8730,9 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
           Value *zero = AllocaBuilder.getInt32(0);
           Value *cbufIdx = legacyIdx;
           for (unsigned int c = 0; c < MatTy.getNumColumns(); c++) {
-            Value *ColVal =
-                GenerateCBLoadLegacy(handle, cbufIdx, /*channelOffset*/ 0,
-                                     EltTy, MatTy.getNumRows(), hlslOP, Builder);
+            Value *ColVal = GenerateCBLoadLegacy(
+                handle, cbufIdx, /*channelOffset*/ 0, EltTy, MatTy.getNumRows(),
+                hlslOP, Builder);
             // Convert ColVal to array for indexing.
             for (unsigned int r = 0; r < MatTy.getNumRows(); r++) {
               Value *Elt =
@@ -6416,7 +8762,7 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
           idx = Builder.CreateAdd(idx, legacyIdx);
           // Just return a row; 'col' is the number of columns in the row.
           ldData = GenerateCBLoadLegacy(handle, idx, /*channelOffset*/ 0, EltTy,
-            MatTy.getNumColumns(), hlslOP, Builder);
+                                        MatTy.getNumColumns(), hlslOP, Builder);
         }
         if (!resultType->isVectorTy()) {
           ldData = Builder.CreateExtractElement(ldData, Builder.getInt32(0));
@@ -6446,8 +8792,8 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
 
       CI->eraseFromParent();
     } else if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(user)) {
-      if( II->getIntrinsicID() == Intrinsic::lifetime_start ||
-          II->getIntrinsicID() == Intrinsic::lifetime_end ) {
+      if (II->getIntrinsicID() == Intrinsic::lifetime_start ||
+          II->getIntrinsicID() == Intrinsic::lifetime_end) {
         DXASSERT(II->use_empty(), "lifetime intrinsic can't have uses");
         II->eraseFromParent();
       } else {
@@ -6464,8 +8810,9 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
       CallInst *CI = cast<CallInst>(handle);
       // CI should be annotate handle.
       // Need createHandle here.
-      if (GetHLOpcodeGroup(CI->getCalledFunction()) == HLOpcodeGroup::HLAnnotateHandle)
-        CI = cast<CallInst>(CI->getArgOperand(HLOperandIndex::kAnnotateHandleHandleOpIdx));
+      if (GetHLOpcodeGroup(CI->getCalledFunction()) ==
+          HLOpcodeGroup::HLAnnotateHandle)
+        CI = cast<CallInst>(CI->getArgOperand(HLOperandIndex::kHandleOpIdx));
 
       GlobalVariable *CbGV = cast<GlobalVariable>(
           CI->getArgOperand(HLOperandIndex::kCreateHandleResourceOpIdx));
@@ -6487,12 +8834,11 @@ void TranslateCBAddressUserLegacy(Instruction *user, Value *handle,
     dxilutil::TryScatterDebugValueToVectorElements(newLd);
     ldInst->eraseFromParent();
   } else if (BitCastInst *BCI = dyn_cast<BitCastInst>(user)) {
-    for (auto it = BCI->user_begin(); it != BCI->user_end(); ) {
+    for (auto it = BCI->user_begin(); it != BCI->user_end();) {
       Instruction *I = cast<Instruction>(*it++);
-      TranslateCBAddressUserLegacy(I,
-                                   handle, legacyIdx, channelOffset, hlslOP,
-                                   prevFieldAnnotation, dxilTypeSys,
-                                   DL, pObjHelper);
+      TranslateCBAddressUserLegacy(I, handle, legacyIdx, channelOffset, hlslOP,
+                                   prevFieldAnnotation, dxilTypeSys, DL,
+                                   pObjHelper);
     }
     BCI->eraseFromParent();
   } else {
@@ -6565,9 +8911,10 @@ void TranslateCBGepLegacy(GetElementPtrInst *GEP, Value *handle,
       if (bImmIdx) {
         unsigned tempOffset = size * immIdx;
         unsigned idxInc = tempOffset >> 4;
-        legacyIndex = Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
+        legacyIndex =
+            Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
       } else {
-        Value *idxInc = Builder.CreateMul(idx, hlslOP->GetU32Const(size>>4));
+        Value *idxInc = Builder.CreateMul(idx, hlslOP->GetU32Const(size >> 4));
         legacyIndex = Builder.CreateAdd(legacyIndex, idxInc);
       }
 
@@ -6586,19 +8933,19 @@ void TranslateCBGepLegacy(GetElementPtrInst *GEP, Value *handle,
         channel += structOffset;
         idxInc = channel >> 3;
         channel = channel & 0x7;
-      }
-      else {
+      } else {
         structOffset = fieldAnnotation->GetCBufferOffset() >> 2;
         channel += structOffset;
         idxInc = channel >> 2;
         channel = channel & 0x3;
       }
-      if (idxInc) 
-        legacyIndex = Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
+      if (idxInc)
+        legacyIndex =
+            Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
     } else if (GEPIt->isArrayTy()) {
       DXASSERT(fieldAnnotation != nullptr, "must a field");
       unsigned EltSize = dxilutil::GetLegacyCBufferFieldElementSize(
-              *fieldAnnotation, *GEPIt, dxilTypeSys);
+          *fieldAnnotation, *GEPIt, dxilTypeSys);
       // Decide the nested array size.
       unsigned nestedArraySize = 1;
 
@@ -6615,56 +8962,70 @@ void TranslateCBGepLegacy(GetElementPtrInst *GEP, Value *handle,
       if (bImmIdx) {
         unsigned tempOffset = size * immIdx;
         unsigned idxInc = tempOffset >> 4;
-        legacyIndex = Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
+        legacyIndex =
+            Builder.CreateAdd(legacyIndex, hlslOP->GetU32Const(idxInc));
       } else {
-        Value *idxInc = Builder.CreateMul(idx, hlslOP->GetU32Const(size>>4));
+        Value *idxInc = Builder.CreateMul(idx, hlslOP->GetU32Const(size >> 4));
         legacyIndex = Builder.CreateAdd(legacyIndex, idxInc);
       }
 
       // Array always start from x channel.
       channel = 0;
     } else if (GEPIt->isVectorTy()) {
-      unsigned size = DL.getTypeAllocSize(GEPIt->getVectorElementType());
       // Indexing on vector.
       if (bImmIdx) {
-        unsigned tempOffset = size * immIdx;
-        if (size == 2) { // 16-bit types
-          unsigned channelInc = tempOffset >> 1;
-          DXASSERT((channel + channelInc) <= 8, "vector should not cross cb register (8x16bit)");
+        if (immIdx < GEPIt->getVectorNumElements()) {
+          const unsigned vectorElmSize =
+              DL.getTypeAllocSize(GEPIt->getVectorElementType());
+          const bool bIs16bitType = vectorElmSize == 2;
+          const unsigned tempOffset = vectorElmSize * immIdx;
+          const unsigned numChannelsPerRow = bIs16bitType ? 8 : 4;
+          const unsigned channelInc =
+              bIs16bitType ? tempOffset >> 1 : tempOffset >> 2;
+
+          DXASSERT((channel + channelInc) < numChannelsPerRow,
+                   "vector should not cross cb register");
           channel += channelInc;
-          if (channel == 8) {
+          if (channel == numChannelsPerRow) {
             // Get to another row.
             // Update index and channel.
             channel = 0;
             legacyIndex = Builder.CreateAdd(legacyIndex, Builder.getInt32(1));
           }
-        }
-        else {
-          unsigned channelInc = tempOffset >> 2;
-          DXASSERT((channel + channelInc) <= 4, "vector should not cross cb register (8x32bit)");
-          channel += channelInc;
-          if (channel == 4) {
-            // Get to another row.
-            // Update index and channel.
-            channel = 0;
-            legacyIndex = Builder.CreateAdd(legacyIndex, Builder.getInt32(1));
+        } else {
+          StringRef resName = "(unknown)";
+          if (DxilResourceBase *Res =
+                  pObjHelper->FindCBufferResourceFromHandle(handle)) {
+            resName = Res->GetGlobalName();
           }
+          legacyIndex = hlsl::CreatePoisonValue(
+              legacyIndex->getType(),
+              Twine("Out of bounds index (") + Twine(immIdx) +
+                  Twine(") in CBuffer '") + Twine(resName) + ("'"),
+              GEP->getDebugLoc(), GEP);
+          channel = 0;
         }
       } else {
         Type *EltTy = GEPIt->getVectorElementType();
         unsigned vecSize = GEPIt->getVectorNumElements();
 
         // Load the whole register.
-        Value *newLd = GenerateCBLoadLegacy(handle, legacyIndex,
-                                     /*channelOffset*/ channel, EltTy,
-                                     /*vecSize*/ vecSize, hlslOP, Builder);
+        Value *newLd =
+            GenerateCBLoadLegacy(handle, legacyIndex,
+                                 /*channelOffset*/ channel, EltTy,
+                                 /*vecSize*/ vecSize, hlslOP, Builder);
         // Copy to array.
-        IRBuilder<> AllocaBuilder(GEP->getParent()->getParent()->getEntryBlock().getFirstInsertionPt());
-        Value *tempArray = AllocaBuilder.CreateAlloca(ArrayType::get(EltTy, vecSize));
+        IRBuilder<> AllocaBuilder(GEP->getParent()
+                                      ->getParent()
+                                      ->getEntryBlock()
+                                      .getFirstInsertionPt());
+        Value *tempArray =
+            AllocaBuilder.CreateAlloca(ArrayType::get(EltTy, vecSize));
         Value *zeroIdx = hlslOP->GetU32Const(0);
         for (unsigned i = 0; i < vecSize; i++) {
           Value *Elt = Builder.CreateExtractElement(newLd, i);
-          Value *EltGEP = Builder.CreateInBoundsGEP(tempArray, {zeroIdx, hlslOP->GetU32Const(i)});
+          Value *EltGEP = Builder.CreateInBoundsGEP(
+              tempArray, {zeroIdx, hlslOP->GetU32Const(i)});
           Builder.CreateStore(Elt, EltGEP);
         }
         // Make sure this is the end of GEP.
@@ -6687,8 +9048,8 @@ void TranslateCBGepLegacy(GetElementPtrInst *GEP, Value *handle,
   for (auto U = GEP->user_begin(); U != GEP->user_end();) {
     Instruction *user = cast<Instruction>(*(U++));
 
-    TranslateCBAddressUserLegacy(user, handle, legacyIndex, channel, hlslOP, fieldAnnotation,
-                           dxilTypeSys, DL, pObjHelper);
+    TranslateCBAddressUserLegacy(user, handle, legacyIndex, channel, hlslOP,
+                                 fieldAnnotation, dxilTypeSys, DL, pObjHelper);
   }
 }
 
@@ -6708,129 +9069,16 @@ void TranslateCBOperationsLegacy(Value *handle, Value *ptr, OP *hlslOP,
   }
 }
 
-}
+} // namespace
 
 // Structured buffer.
 namespace {
-// Calculate offset.
-Value *GEPIdxToOffset(GetElementPtrInst *GEP, IRBuilder<> &Builder,
-                      hlsl::OP *OP, const DataLayout &DL) {
-  SmallVector<Value *, 8> Indices(GEP->idx_begin(), GEP->idx_end());
-  Value *addr = nullptr;
-  // update offset
-  if (GEP->hasAllConstantIndices()) {
-    unsigned gepOffset =
-        DL.getIndexedOffset(GEP->getPointerOperandType(), Indices);
-    addr = OP->GetU32Const(gepOffset);
-  } else {
-    Value *offset = OP->GetU32Const(0);
-    gep_type_iterator GEPIt = gep_type_begin(GEP), E = gep_type_end(GEP);
-    for (; GEPIt != E; GEPIt++) {
-      Value *idx = GEPIt.getOperand();
-      unsigned immIdx = 0;
-      if (llvm::Constant *constIdx = dyn_cast<llvm::Constant>(idx)) {
-        immIdx = constIdx->getUniqueInteger().getLimitedValue();
-        if (immIdx == 0) {
-          continue;
-        }
-      }
-      if (GEPIt->isPointerTy() || GEPIt->isArrayTy() || GEPIt->isVectorTy()) {
-        unsigned size = DL.getTypeAllocSize(GEPIt->getSequentialElementType());
-        if (immIdx) {
-          unsigned tempOffset = size * immIdx;
-          offset = Builder.CreateAdd(offset, OP->GetU32Const(tempOffset));
-        } else {
-          Value *tempOffset = Builder.CreateMul(idx, OP->GetU32Const(size));
-          offset = Builder.CreateAdd(offset, tempOffset);
-        }
-      } else if (GEPIt->isStructTy()) {
-        const StructLayout *Layout = DL.getStructLayout(cast<StructType>(*GEPIt));
-        unsigned structOffset = Layout->getElementOffset(immIdx);
-        offset = Builder.CreateAdd(offset, OP->GetU32Const(structOffset));
-      } else {
-        gep_type_iterator temp = GEPIt;
-        temp++;
-        DXASSERT(temp == E, "scalar type must be the last");
-      }
-    };
-    addr = offset;
-  }
-  // TODO: x4 for byte address
-  return addr;
-}
-
-// Load a value from a typedef buffer with an offset.
-// Typed buffer do not directly support reading at offsets
-// because the whole value (e.g. float4) must be read at once.
-// If we are provided a non-zero offset, we need to simulate it
-// by returning the correct elements.
-using ResRetValueArray = std::array<Value*, 4>;
-static ResRetValueArray GenerateTypedBufferLoad(
-  Value *Handle, Type *BufferElemTy, Value *ElemIdx, Value *StatusPtr,
-  OP* HlslOP, IRBuilder<> &Builder) {
-
-  OP::OpCode OpCode = OP::OpCode::BufferLoad;
-  Value* LoadArgs[] = { HlslOP->GetU32Const((unsigned)OpCode), Handle, ElemIdx, UndefValue::get(Builder.getInt32Ty()) };
-  Function* LoadFunc = HlslOP->GetOpFunc(OpCode, BufferElemTy);
-  Value* Load = Builder.CreateCall(LoadFunc, LoadArgs, OP::GetOpCodeName(OpCode));
-
-  ResRetValueArray ResultValues;
-  for (unsigned i = 0; i < ResultValues.size(); ++i) {
-    ResultValues[i] = cast<ExtractValueInst>(Builder.CreateExtractValue(Load, { i }));
-  }
-
-  UpdateStatus(Load, StatusPtr, Builder, HlslOP);
-  return ResultValues;
-}
-
-static AllocaInst* SpillValuesToArrayAlloca(ArrayRef<Value*> Values, IRBuilder<>& Builder) {
-  DXASSERT_NOMSG(!Values.empty());
-  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Builder.GetInsertPoint()));
-  AllocaInst* ArrayAlloca = AllocaBuilder.CreateAlloca(ArrayType::get(Values[0]->getType(), Values.size()));
-  for (unsigned i = 0; i < Values.size(); ++i) {
-    Value* ArrayElemPtr = Builder.CreateGEP(ArrayAlloca, { Builder.getInt32(0), Builder.getInt32(i) });
-    Builder.CreateStore(Values[i], ArrayElemPtr);
-  }
-  return ArrayAlloca;
-}
-
-static Value* ExtractFromTypedBufferLoad(const ResRetValueArray& ResRet,
-    Type* ResultTy, Value* Offset, IRBuilder<>& Builder) {
-  unsigned ElemCount = ResultTy->isVectorTy() ? ResultTy->getVectorNumElements() : 1;
-  DXASSERT_NOMSG(ElemCount < ResRet.size());
-  unsigned ElemSizeInBytes = ResRet[0]->getType()->getScalarSizeInBits() / 8;
-
-  SmallVector<Value*, 4> Elems;
-  if (ConstantInt *OffsetAsConstantInt = dyn_cast<ConstantInt>(Offset)) {
-    // Get all elements to be returned
-    uint64_t FirstElemOffset = OffsetAsConstantInt->getLimitedValue();
-    DXASSERT_NOMSG(FirstElemOffset % ElemSizeInBytes == 0);
-    uint64_t FirstElemIdx = FirstElemOffset / ElemSizeInBytes;
-    DXASSERT_NOMSG(FirstElemIdx <= ResRet.size() - ElemCount);
-    for (unsigned ElemIdx = 0; ElemIdx < ElemCount; ++ElemIdx) {
-      Elems.emplace_back(ResRet[std::min<size_t>(FirstElemIdx + ElemIdx, ResRet.size() - 1)]);
-    }
-  }
-  else {
-    Value* ArrayAlloca = SpillValuesToArrayAlloca(
-      ArrayRef<Value*>(ResRet.data(), ResRet.size()), Builder);
-
-    // Get all elements to be returned through dynamic indices
-    Value *FirstElemIdx = Builder.CreateUDiv(Offset, Builder.getInt32(ElemSizeInBytes));
-    for (unsigned i = 0; i < ElemCount; ++i) {
-      Value *ElemIdx = Builder.CreateAdd(FirstElemIdx, Builder.getInt32(i));
-      Value* ElemPtr = Builder.CreateGEP(ArrayAlloca, { Builder.getInt32(0), ElemIdx });
-      Elems.emplace_back(Builder.CreateLoad(ElemPtr));
-    }
-  }
-
-  return ScalarizeElements(ResultTy, Elems, Builder);
-}
 
 Value *GenerateRawBufLd(Value *handle, Value *bufIdx, Value *offset,
-                         Value *status, Type *EltTy,
-                         MutableArrayRef<Value *> resultElts, hlsl::OP *OP,
-                         IRBuilder<> &Builder, unsigned NumComponents, Constant *alignment) {
+                        Value *status, Type *EltTy,
+                        MutableArrayRef<Value *> resultElts, hlsl::OP *OP,
+                        IRBuilder<> &Builder, unsigned NumComponents,
+                        Constant *alignment) {
   OP::OpCode opcode = OP::OpCode::RawBufferLoad;
 
   DXASSERT(resultElts.size() <= 4,
@@ -6864,7 +9112,8 @@ Value *GenerateRawBufLd(Value *handle, Value *bufIdx, Value *offset,
 
 void GenerateStructBufSt(Value *handle, Value *bufIdx, Value *offset,
                          Type *EltTy, hlsl::OP *OP, IRBuilder<> &Builder,
-                         ArrayRef<Value *> vals, uint8_t mask, Constant *alignment) {
+                         ArrayRef<Value *> vals, uint8_t mask,
+                         Constant *alignment) {
   OP::OpCode opcode = OP::OpCode::RawBufferStore;
   DXASSERT(vals.size() == 4, "buffer store need 4 values");
 
@@ -6882,106 +9131,35 @@ void GenerateStructBufSt(Value *handle, Value *bufIdx, Value *offset,
   Builder.CreateCall(dxilF, Args);
 }
 
-
-static Value* TranslateRawBufVecLd(Type* VecEltTy, unsigned ElemCount,
-  IRBuilder<>& Builder, Value* handle, hlsl::OP* OP, Value* status,
-  Value* bufIdx, Value* baseOffset, const DataLayout& DL,
-  std::vector<Value*> &bufLds, unsigned baseAlign, bool isScalarTy) {
-
-  unsigned  EltSize = DL.getTypeAllocSize(VecEltTy);
-  unsigned alignment = std::min(baseAlign, EltSize);
-  Constant* alignmentVal = OP->GetI32Const(alignment);
-
-  if (baseOffset == nullptr) {
-    baseOffset = OP->GetU32Const(0);
-  }
-
-  std::vector<Value*> elts(ElemCount);
-  unsigned rest = (ElemCount % 4);
-  for (unsigned i = 0; i < ElemCount - rest; i += 4) {
-    Value* ResultElts[4];
-    Value* bufLd = GenerateRawBufLd(handle, bufIdx, baseOffset, status, VecEltTy, ResultElts, OP, Builder, 4, alignmentVal);
-    bufLds.emplace_back(bufLd);
-    elts[i] = ResultElts[0];
-    elts[i + 1] = ResultElts[1];
-    elts[i + 2] = ResultElts[2];
-    elts[i + 3] = ResultElts[3];
-
-    baseOffset = Builder.CreateAdd(baseOffset, OP->GetU32Const(4 * EltSize));
-  }
-
-  if (rest) {
-    Value* ResultElts[4];
-    Value* bufLd = GenerateRawBufLd(handle, bufIdx, baseOffset, status, VecEltTy, ResultElts, OP, Builder, rest, alignmentVal);
-    bufLds.emplace_back(bufLd);
-    for (unsigned i = 0; i < rest; i++)
-      elts[ElemCount - rest + i] = ResultElts[i];
-  }
-
-  // If the expected return type is scalar then skip building a vector
-  if (isScalarTy) {
-    return elts[0];
-  }
-
-  Value* Vec = HLMatrixLower::BuildVector(VecEltTy, elts, Builder);
-  return Vec;
-}
-
-Value *TranslateStructBufMatLd(Type *matType, IRBuilder<> &Builder,
-                               Value *handle, hlsl::OP *OP, Value *status,
-                               Value *bufIdx, Value *baseOffset,
+Value *TranslateStructBufMatLd(CallInst *CI, IRBuilder<> &Builder,
+                               Value *handle, HLResource::Kind RK, hlsl::OP *OP,
+                               Value *status, Value *bufIdx, Value *baseOffset,
                                const DataLayout &DL) {
+
+  ResLoadHelper helper(CI, RK, handle, bufIdx, baseOffset, status);
+#ifndef NDEBUG
+  Value *ptr = CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx);
+  Type *matType = ptr->getType()->getPointerElementType();
   HLMatrixType MatTy = HLMatrixType::cast(matType);
-  Type *EltTy = MatTy.getElementTypeForMem();
-  unsigned matSize = MatTy.getNumElements();
-  std::vector<Value*> bufLds;
-  Value* Vec = TranslateRawBufVecLd(EltTy, matSize, Builder, handle, OP, status, bufIdx,
-    baseOffset, DL, bufLds, /*baseAlign (in bytes)*/ 8);
-  Vec = MatTy.emitLoweredMemToReg(Vec, Builder);
-  return Vec;
+  DXASSERT(MatTy.getLoweredVectorType(false /*MemRepr*/) ==
+               helper.retVal->getType(),
+           "helper type should match vectorized matrix");
+#endif
+  return TranslateBufLoad(helper, RK, Builder, OP, DL);
 }
 
 void TranslateStructBufMatSt(Type *matType, IRBuilder<> &Builder, Value *handle,
                              hlsl::OP *OP, Value *bufIdx, Value *baseOffset,
                              Value *val, const DataLayout &DL) {
-  HLMatrixType MatTy = HLMatrixType::cast(matType);
-  Type *EltTy = MatTy.getElementTypeForMem();
-
-  val = MatTy.emitLoweredRegToMem(val, Builder);
-
-  unsigned EltSize = DL.getTypeAllocSize(EltTy);
-  Constant *Alignment = OP->GetI32Const(EltSize);
-  Value *offset = baseOffset;
-  if (baseOffset == nullptr)
-    offset = OP->GetU32Const(0);
-
-  unsigned matSize = MatTy.getNumElements();
-  Value *undefElt = UndefValue::get(EltTy);
-
-  unsigned storeSize = matSize;
-  if (matSize % 4) {
-    storeSize = matSize + 4 - (matSize & 3);
-  }
-  std::vector<Value *> elts(storeSize, undefElt);
-  for (unsigned i = 0; i < matSize; i++)
-    elts[i] = Builder.CreateExtractElement(val, i);
-
-  for (unsigned i = 0; i < matSize; i += 4) { 
-    uint8_t mask = 0;
-    for (unsigned j = 0; j < 4 && (i+j) < matSize; j++) {
-      if (elts[i+j] != undefElt)
-        mask |= (1<<j);
-    }
-    GenerateStructBufSt(handle, bufIdx, offset, EltTy, OP, Builder,
-                        {elts[i], elts[i + 1], elts[i + 2], elts[i + 3]}, mask,
-                        Alignment);
-    // Update offset by 4*4bytes.
-    offset = Builder.CreateAdd(offset, OP->GetU32Const(4 * EltSize));
-  }
+  [[maybe_unused]] HLMatrixType MatTy = HLMatrixType::cast(matType);
+  DXASSERT(MatTy.getLoweredVectorType(false /*MemRepr*/) == val->getType(),
+           "helper type should match vectorized matrix");
+  TranslateStore(DxilResource::Kind::StructuredBuffer, handle, val, bufIdx,
+                 baseOffset, Builder, OP);
 }
 
-void TranslateStructBufMatLdSt(CallInst *CI, Value *handle, hlsl::OP *OP,
-                               Value *status, Value *bufIdx,
+void TranslateStructBufMatLdSt(CallInst *CI, Value *handle, HLResource::Kind RK,
+                               hlsl::OP *OP, Value *status, Value *bufIdx,
                                Value *baseOffset, const DataLayout &DL) {
   IRBuilder<> Builder(CI);
   HLOpcodeGroup group = hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction());
@@ -6991,41 +9169,38 @@ void TranslateStructBufMatLdSt(CallInst *CI, Value *handle, hlsl::OP *OP,
   HLMatLoadStoreOpcode matOp = static_cast<HLMatLoadStoreOpcode>(opcode);
   // Due to the current way the initial codegen generates matrix
   // orientation casts, the in-register vector matrix has already been
-  // reordered based on the destination's row or column-major packing orientation.
+  // reordered based on the destination's row or column-major packing
+  // orientation.
   switch (matOp) {
   case HLMatLoadStoreOpcode::RowMatLoad:
-  case HLMatLoadStoreOpcode::ColMatLoad: {
-    Value *ptr = CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx);
-    Value *NewLd = TranslateStructBufMatLd(
-        ptr->getType()->getPointerElementType(), Builder, handle, OP, status,
-        bufIdx, baseOffset, DL);
-    CI->replaceAllUsesWith(NewLd);
-  } break;
+  case HLMatLoadStoreOpcode::ColMatLoad:
+    TranslateStructBufMatLd(CI, Builder, handle, RK, OP, status, bufIdx,
+                            baseOffset, DL);
+    break;
   case HLMatLoadStoreOpcode::RowMatStore:
   case HLMatLoadStoreOpcode::ColMatStore: {
     Value *ptr = CI->getArgOperand(HLOperandIndex::kMatStoreDstPtrOpIdx);
     Value *val = CI->getArgOperand(HLOperandIndex::kMatStoreValOpIdx);
     TranslateStructBufMatSt(ptr->getType()->getPointerElementType(), Builder,
-                            handle, OP, bufIdx, baseOffset, val,
-                            DL);
+                            handle, OP, bufIdx, baseOffset, val, DL);
   } break;
   }
 
   CI->eraseFromParent();
 }
 
-void TranslateStructBufSubscriptUser(Instruction *user,
-  Value *handle, HLResource::Kind ResKind,
-  Value *bufIdx, Value *baseOffset, Value *status, 
-  hlsl::OP *OP, const DataLayout &DL);
+void TranslateStructBufSubscriptUser(Instruction *user, Value *handle,
+                                     HLResource::Kind ResKind, Value *bufIdx,
+                                     Value *baseOffset, Value *status,
+                                     hlsl::OP *OP, const DataLayout &DL);
 
 // For case like mat[i][j].
 // IdxList is [i][0], [i][1], [i][2],[i][3].
 // Idx is j.
 // return [i][j] not mat[i][j] because resource ptr and temp ptr need different
 // code gen.
-static Value *LowerGEPOnMatIndexListToIndex(
-  llvm::GetElementPtrInst *GEP, ArrayRef<Value *> IdxList) {
+static Value *LowerGEPOnMatIndexListToIndex(llvm::GetElementPtrInst *GEP,
+                                            ArrayRef<Value *> IdxList) {
   IRBuilder<> Builder(GEP);
   Value *zero = Builder.getInt32(0);
   DXASSERT(GEP->getNumIndices() == 2, "must have 2 level");
@@ -7036,34 +9211,34 @@ static Value *LowerGEPOnMatIndexListToIndex(
   if (ConstantInt *immIdx = dyn_cast<ConstantInt>(Idx)) {
     return IdxList[immIdx->getSExtValue()];
   }
-  else {
-    IRBuilder<> AllocaBuilder(
-      GEP->getParent()->getParent()->getEntryBlock().getFirstInsertionPt());
-    unsigned size = IdxList.size();
-    // Store idxList to temp array.
-    ArrayType *AT = ArrayType::get(IdxList[0]->getType(), size);
-    Value *tempArray = AllocaBuilder.CreateAlloca(AT);
 
-    for (unsigned i = 0; i < size; i++) {
-      Value *EltPtr = Builder.CreateGEP(tempArray, { zero, Builder.getInt32(i) });
-      Builder.CreateStore(IdxList[i], EltPtr);
-    }
-    // Load the idx.
-    Value *GEPOffset = Builder.CreateGEP(tempArray, { zero, Idx });
-    return Builder.CreateLoad(GEPOffset);
+  IRBuilder<> AllocaBuilder(
+      GEP->getParent()->getParent()->getEntryBlock().getFirstInsertionPt());
+  unsigned size = IdxList.size();
+  // Store idxList to temp array.
+  ArrayType *AT = ArrayType::get(IdxList[0]->getType(), size);
+  Value *tempArray = AllocaBuilder.CreateAlloca(AT);
+
+  for (unsigned i = 0; i < size; i++) {
+    Value *EltPtr = Builder.CreateGEP(tempArray, {zero, Builder.getInt32(i)});
+    Builder.CreateStore(IdxList[i], EltPtr);
   }
+  // Load the idx.
+  Value *GEPOffset = Builder.CreateGEP(tempArray, {zero, Idx});
+  return Builder.CreateLoad(GEPOffset);
 }
 
 // subscript operator for matrix of struct element.
-void TranslateStructBufMatSubscript(CallInst *CI,
-  Value *handle, HLResource::Kind ResKind,
-  Value *bufIdx, Value *baseOffset, Value *status,
-  hlsl::OP* hlslOP, const DataLayout &DL) {
+void TranslateStructBufMatSubscript(CallInst *CI, Value *handle,
+                                    HLResource::Kind ResKind, Value *bufIdx,
+                                    Value *baseOffset, Value *status,
+                                    hlsl::OP *hlslOP, const DataLayout &DL) {
   unsigned opcode = GetHLOpcode(CI);
   IRBuilder<> subBuilder(CI);
   HLSubscriptOpcode subOp = static_cast<HLSubscriptOpcode>(opcode);
   Value *basePtr = CI->getArgOperand(HLOperandIndex::kMatSubscriptMatOpIdx);
-  HLMatrixType MatTy = HLMatrixType::cast(basePtr->getType()->getPointerElementType());
+  HLMatrixType MatTy =
+      HLMatrixType::cast(basePtr->getType()->getPointerElementType());
   Type *EltTy = MatTy.getElementTypeForReg();
   Constant *alignment = hlslOP->GetI32Const(DL.getTypeAllocSize(EltTy));
 
@@ -7077,7 +9252,7 @@ void TranslateStructBufMatSubscript(CallInst *CI,
   if (resultType->isVectorTy())
     resultSize = resultType->getVectorNumElements();
   DXASSERT(resultSize <= 16, "up to 4x4 elements in vector or matrix");
-  _Analysis_assume_(resultSize <= 16);
+  assert(resultSize <= 16);
   std::vector<Value *> idxList(resultSize);
 
   switch (subOp) {
@@ -7109,8 +9284,9 @@ void TranslateStructBufMatSubscript(CallInst *CI,
   for (auto U = CI->user_begin(); U != CI->user_end();) {
     Value *subsUser = *(U++);
     if (resultSize == 1) {
-      TranslateStructBufSubscriptUser(cast<Instruction>(subsUser),
-        handle, ResKind, bufIdx, idxList[0], status, hlslOP, DL);
+      TranslateStructBufSubscriptUser(cast<Instruction>(subsUser), handle,
+                                      ResKind, bufIdx, idxList[0], status,
+                                      hlslOP, DL);
       continue;
     }
     if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(subsUser)) {
@@ -7118,12 +9294,15 @@ void TranslateStructBufMatSubscript(CallInst *CI,
 
       for (auto gepU = GEP->user_begin(); gepU != GEP->user_end();) {
         Instruction *gepUserInst = cast<Instruction>(*(gepU++));
-        TranslateStructBufSubscriptUser(gepUserInst,
-          handle, ResKind, bufIdx, GEPOffset, status, hlslOP, DL);
+        TranslateStructBufSubscriptUser(gepUserInst, handle, ResKind, bufIdx,
+                                        GEPOffset, status, hlslOP, DL);
       }
 
       GEP->eraseFromParent();
     } else if (StoreInst *stUser = dyn_cast<StoreInst>(subsUser)) {
+      // Store elements of matrix in a struct. Needs to be done one scalar at a
+      // time even for vectors in the case that matrix orientation spreads the
+      // indexed scalars throughout the matrix vector.
       IRBuilder<> stBuilder(stUser);
       Value *Val = stUser->getValueOperand();
       if (Val->getType()->isVectorTy()) {
@@ -7147,18 +9326,21 @@ void TranslateStructBufMatSubscript(CallInst *CI,
       LoadInst *ldUser = cast<LoadInst>(subsUser);
       IRBuilder<> ldBuilder(ldUser);
       Value *ldData = UndefValue::get(resultType);
+      // Load elements of matrix in a struct. Needs to be done one scalar at a
+      // time even for vectors in the case that matrix orientation spreads the
+      // indexed scalars throughout the matrix vector.
       if (resultType->isVectorTy()) {
         for (unsigned i = 0; i < resultSize; i++) {
           Value *ResultElt;
           // TODO: This can be inefficient for row major matrix load
           GenerateRawBufLd(handle, bufIdx, idxList[i],
-                              /*status*/ nullptr, EltTy, ResultElt, hlslOP,
-                              ldBuilder, 1, alignment);
+                           /*status*/ nullptr, EltTy, ResultElt, hlslOP,
+                           ldBuilder, 1, alignment);
           ldData = ldBuilder.CreateInsertElement(ldData, ResultElt, i);
         }
       } else {
-        GenerateRawBufLd(handle, bufIdx, idxList[0], /*status*/ nullptr,
-                            EltTy, ldData, hlslOP, ldBuilder, 4, alignment);
+        GenerateRawBufLd(handle, bufIdx, idxList[0], /*status*/ nullptr, EltTy,
+                         ldData, hlslOP, ldBuilder, 4, alignment);
       }
       ldUser->replaceAllUsesWith(ldData);
       ldUser->eraseFromParent();
@@ -7168,10 +9350,10 @@ void TranslateStructBufMatSubscript(CallInst *CI,
   CI->eraseFromParent();
 }
 
-void TranslateStructBufSubscriptUser(
-    Instruction *user, Value *handle, HLResource::Kind ResKind,
-    Value *bufIdx, Value *baseOffset, Value *status,
-    hlsl::OP *OP, const DataLayout &DL) {
+void TranslateStructBufSubscriptUser(Instruction *user, Value *handle,
+                                     HLResource::Kind ResKind, Value *bufIdx,
+                                     Value *baseOffset, Value *status,
+                                     hlsl::OP *OP, const DataLayout &DL) {
   IRBuilder<> Builder(user);
   if (CallInst *userCall = dyn_cast<CallInst>(user)) {
     HLOpcodeGroup group = // user call?
@@ -7207,7 +9389,8 @@ void TranslateStructBufSubscriptUser(
       case IntrinsicOp::IOP_InterlockedExchange: {
         Type *opType = nullptr;
         PointerType *ptrType = dyn_cast<PointerType>(
-                      userCall->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
+            userCall->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)
+                ->getType());
         if (ptrType && ptrType->getElementType()->isFloatTy())
           opType = Type::getInt32Ty(userCall->getContext());
         AtomicHelper helper(userCall, DXIL::OpCode::AtomicBinOp, handle, bufIdx,
@@ -7270,130 +9453,72 @@ void TranslateStructBufSubscriptUser(
       }
       userCall->eraseFromParent();
     } else if (group == HLOpcodeGroup::HLMatLoadStore)
-      TranslateStructBufMatLdSt(userCall, handle, OP, status, bufIdx,
+      // Load/Store matrix within a struct
+      TranslateStructBufMatLdSt(userCall, handle, ResKind, OP, status, bufIdx,
                                 baseOffset, DL);
     else if (group == HLOpcodeGroup::HLSubscript) {
-      TranslateStructBufMatSubscript(userCall,
-        handle, ResKind, bufIdx, baseOffset, status, OP, DL);
+      // Subscript of matrix within a struct
+      TranslateStructBufMatSubscript(userCall, handle, ResKind, bufIdx,
+                                     baseOffset, status, OP, DL);
     }
-  } else if (isa<LoadInst>(user) || isa<StoreInst>(user)) {
-    LoadInst *ldInst = dyn_cast<LoadInst>(user);
-    StoreInst *stInst = dyn_cast<StoreInst>(user);
+  } else if (LoadInst *LdInst = dyn_cast<LoadInst>(user)) {
+    // Load of scalar/vector within a struct or structured raw load.
+    ResLoadHelper helper(LdInst, ResKind, handle, bufIdx, baseOffset, status);
+    TranslateBufLoad(helper, ResKind, Builder, OP, DL);
 
-    Type *Ty = isa<LoadInst>(user) ? ldInst->getType()
-                                   : stInst->getValueOperand()->getType();
-    Type *pOverloadTy = Ty->getScalarType();
-    Value *offset = baseOffset;
-    unsigned arraySize = 1;
-    Value *eltSize = nullptr;
-
-    if (pOverloadTy->isArrayTy()) {
-      arraySize = pOverloadTy->getArrayNumElements();
-      eltSize = OP->GetU32Const(
-          DL.getTypeAllocSize(pOverloadTy->getArrayElementType()));
-
-      pOverloadTy = pOverloadTy->getArrayElementType()->getScalarType();
-    }
-
-    if (ldInst) {
-      auto LdElement = [=](Value *offset, IRBuilder<> &Builder) -> Value * {
-        unsigned numComponents = 0;
-        if (VectorType *VTy = dyn_cast<VectorType>(Ty)) {
-          numComponents = VTy->getNumElements();
-        }
-        else {
-          numComponents = 1;
-        }
-        Constant *alignment =
-            OP->GetI32Const(DL.getTypeAllocSize(Ty->getScalarType()));
-        if (ResKind == HLResource::Kind::TypedBuffer) {
-          // Typed buffer cannot have offsets, they must be loaded all at once
-          ResRetValueArray ResRet = GenerateTypedBufferLoad(
-            handle, pOverloadTy, bufIdx, status, OP, Builder);
-
-          return ExtractFromTypedBufferLoad(ResRet, Ty, offset, Builder);
-        }
-        else {
-          Value* ResultElts[4];
-          GenerateRawBufLd(handle, bufIdx, offset, status, pOverloadTy,
-                              ResultElts, OP, Builder, numComponents, alignment);
-          return ScalarizeElements(Ty, ResultElts, Builder);
-        }
-      };
-
-      Value *newLd = LdElement(offset, Builder);
-      if (arraySize > 1) {
-        newLd =
-            Builder.CreateInsertValue(UndefValue::get(Ty), newLd, (uint64_t)0);
-
-        for (unsigned i = 1; i < arraySize; i++) {
-          offset = Builder.CreateAdd(offset, eltSize);
-          Value *eltLd = LdElement(offset, Builder);
-          newLd = Builder.CreateInsertValue(newLd, eltLd, i);
-        }
-      }
-      ldInst->replaceAllUsesWith(newLd);
-    } else {
-      Value *val = stInst->getValueOperand();
-      auto StElement = [&](Value *offset, Value *val, IRBuilder<> &Builder) {
-        Value *undefVal = llvm::UndefValue::get(pOverloadTy);
-        Value *vals[] = {undefVal, undefVal, undefVal, undefVal};
-        uint8_t mask = 0;
-        if (Ty->isVectorTy()) {
-          unsigned vectorNumElements = Ty->getVectorNumElements();
-          DXASSERT(vectorNumElements <= 4, "up to 4 elements in vector");
-          _Analysis_assume_(vectorNumElements <= 4);
-          for (unsigned i = 0; i < vectorNumElements; i++) {
-            vals[i] = Builder.CreateExtractElement(val, i);
-            mask |= (1<<i);
-          }
-        } else {
-          vals[0] = val;
-          mask = DXIL::kCompMask_X;
-        }
-        Constant *alignment =
-          OP->GetI32Const(DL.getTypeAllocSize(Ty->getScalarType()));
-        GenerateStructBufSt(handle, bufIdx, offset, pOverloadTy, OP, Builder,
-                            vals, mask, alignment);
-      };
-      if (arraySize > 1)
-        val = Builder.CreateExtractValue(val, 0);
-
-      StElement(offset, val, Builder);
-      if (arraySize > 1) {
-        val = stInst->getValueOperand();
-
-        for (unsigned i = 1; i < arraySize; i++) {
-          offset = Builder.CreateAdd(offset, eltSize);
-          Value *eltVal = Builder.CreateExtractValue(val, i);
-          StElement(offset, eltVal, Builder);
-        }
-      }
-    }
-    user->eraseFromParent();
+    LdInst->eraseFromParent();
+  } else if (StoreInst *StInst = dyn_cast<StoreInst>(user)) {
+    // Store of scalar/vector within a struct or structured raw store.
+    Value *val = StInst->getValueOperand();
+    TranslateStore(DxilResource::Kind::StructuredBuffer, handle, val, bufIdx,
+                   baseOffset, Builder, OP);
+    StInst->eraseFromParent();
   } else if (BitCastInst *BCI = dyn_cast<BitCastInst>(user)) {
     // Recurse users
     for (auto U = BCI->user_begin(); U != BCI->user_end();) {
       Value *BCIUser = *(U++);
-      TranslateStructBufSubscriptUser(cast<Instruction>(BCIUser),
-        handle, ResKind, bufIdx, baseOffset, status, OP, DL);
+      TranslateStructBufSubscriptUser(cast<Instruction>(BCIUser), handle,
+                                      ResKind, bufIdx, baseOffset, status, OP,
+                                      DL);
     }
     BCI->eraseFromParent();
+  } else if (PHINode *Phi = dyn_cast<PHINode>(user)) {
+    if (Phi->getNumIncomingValues() != 1) {
+      dxilutil::EmitErrorOnInstruction(
+          Phi, "Phi not supported for buffer subscript");
+      return;
+    }
+    // Since the phi only has a single value we can safely process its
+    // users to translate the subscript. These single-value phis are
+    // inserted by the lcssa pass.
+    for (auto U = Phi->user_begin(); U != Phi->user_end();) {
+      Value *PhiUser = *(U++);
+      TranslateStructBufSubscriptUser(cast<Instruction>(PhiUser), handle,
+                                      ResKind, bufIdx, baseOffset, status, OP,
+                                      DL);
+    }
+    Phi->eraseFromParent();
   } else {
     // should only used by GEP
     GetElementPtrInst *GEP = cast<GetElementPtrInst>(user);
     Type *Ty = GEP->getType()->getPointerElementType();
 
-    Value *offset = GEPIdxToOffset(GEP, Builder, OP, DL);
-    DXASSERT_LOCALVAR(Ty, offset->getType() == Type::getInt32Ty(Ty->getContext()),
-             "else bitness is wrong");
-    offset = Builder.CreateAdd(offset, baseOffset);
+    Value *offset = dxilutil::GEPIdxToOffset(GEP, Builder, OP, DL);
+    DXASSERT_LOCALVAR(Ty,
+                      offset->getType() == Type::getInt32Ty(Ty->getContext()),
+                      "else bitness is wrong");
+    // No offset into element for Raw buffers; byte offset is in bufIdx.
+    if (DXIL::IsRawBuffer(ResKind))
+      bufIdx = Builder.CreateAdd(offset, bufIdx);
+    else
+      baseOffset = Builder.CreateAdd(offset, baseOffset);
 
     for (auto U = GEP->user_begin(); U != GEP->user_end();) {
       Value *GEPUser = *(U++);
 
-      TranslateStructBufSubscriptUser(cast<Instruction>(GEPUser),
-        handle, ResKind, bufIdx, offset, status, OP, DL);
+      TranslateStructBufSubscriptUser(cast<Instruction>(GEPUser), handle,
+                                      ResKind, bufIdx, baseOffset, status, OP,
+                                      DL);
     }
     // delete the inst
     GEP->eraseFromParent();
@@ -7401,43 +9526,39 @@ void TranslateStructBufSubscriptUser(
 }
 
 void TranslateStructBufSubscript(CallInst *CI, Value *handle, Value *status,
-                                 hlsl::OP *OP, HLResource::Kind ResKind, const DataLayout &DL) {
-  Value *subscriptIndex = CI->getArgOperand(HLOperandIndex::kSubscriptIndexOpIdx);
-  Value* bufIdx = nullptr;
+                                 hlsl::OP *OP, HLResource::Kind ResKind,
+                                 const DataLayout &DL) {
+  Value *subscriptIndex =
+      CI->getArgOperand(HLOperandIndex::kSubscriptIndexOpIdx);
+  Value *bufIdx = nullptr;
   Value *offset = nullptr;
-  if (ResKind == HLResource::Kind::RawBuffer) {
-    offset = subscriptIndex;
-  }
-  else {
+  bufIdx = subscriptIndex;
+  if (ResKind == HLResource::Kind::RawBuffer)
+    offset = UndefValue::get(Type::getInt32Ty(CI->getContext()));
+  else
     // StructuredBuffer, TypedBuffer, etc.
-    bufIdx = subscriptIndex;
     offset = OP->GetU32Const(0);
-  }
 
   for (auto U = CI->user_begin(); U != CI->user_end();) {
     Value *user = *(U++);
 
-    TranslateStructBufSubscriptUser(cast<Instruction>(user),
-      handle, ResKind, bufIdx, offset, status, OP, DL);
+    TranslateStructBufSubscriptUser(cast<Instruction>(user), handle, ResKind,
+                                    bufIdx, offset, status, OP, DL);
   }
 }
-}
+} // namespace
 
 // HLSubscript.
 namespace {
 
-Value *TranslateTypedBufLoad(CallInst *CI, DXIL::ResourceKind RK,
-                             DXIL::ResourceClass RC, Value *handle,
-                             LoadInst *ldInst, IRBuilder<> &Builder,
-                             hlsl::OP *hlslOP, const DataLayout &DL) {
-  ResLoadHelper ldHelper(CI, RK, RC, handle, IntrinsicOp::MOP_Load, /*bForSubscript*/ true);
-  // Default sampleIdx for 2DMS textures.
-  if (RK == DxilResource::Kind::Texture2DMS ||
-      RK == DxilResource::Kind::Texture2DMSArray)
-    ldHelper.mipLevel = hlslOP->GetU32Const(0);
-  // use ldInst as retVal
-  ldHelper.retVal = ldInst;
-  TranslateLoad(ldHelper, RK, Builder, hlslOP, DL);
+Value *TranslateTypedBufSubscript(CallInst *CI, DXIL::ResourceKind RK,
+                                  DXIL::ResourceClass RC, Value *handle,
+                                  LoadInst *ldInst, IRBuilder<> &Builder,
+                                  hlsl::OP *hlslOP, const DataLayout &DL) {
+  // The arguments to the call instruction are used to determine the access,
+  // the return value and type come from the load instruction.
+  ResLoadHelper ldHelper(CI, RK, RC, handle, IntrinsicOp::MOP_Load, ldInst);
+  TranslateBufLoad(ldHelper, RK, Builder, hlslOP, DL);
   // delete the ld
   ldInst->eraseFromParent();
   return ldHelper.retVal;
@@ -7480,7 +9601,9 @@ Value *UpdateVectorElt(Value *VecVal, Value *EltVal, Value *EltIdx,
   return VecVal;
 }
 
-void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+void TranslateTypedBufferSubscript(CallInst *CI, HLOperationLowerHelper &helper,
+                                   HLObjectOperationLowerHelper *pObjHelper,
+                                   bool &Translated) {
   Value *ptr = CI->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx);
 
   hlsl::OP *hlslOP = &helper.hlslOP;
@@ -7491,17 +9614,19 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
 
   Type *Ty = CI->getType()->getPointerElementType();
 
-  for (auto It = CI->user_begin(); It != CI->user_end(); ) {
+  for (auto It = CI->user_begin(); It != CI->user_end();) {
     User *user = *(It++);
     Instruction *I = cast<Instruction>(user);
     IRBuilder<> Builder(I);
+    Value *UndefI = UndefValue::get(Builder.getInt32Ty());
     if (LoadInst *ldInst = dyn_cast<LoadInst>(user)) {
-      TranslateTypedBufLoad(CI, RK, RC, handle, ldInst, Builder, hlslOP, helper.dataLayout);
+      TranslateTypedBufSubscript(CI, RK, RC, handle, ldInst, Builder, hlslOP,
+                                 helper.dataLayout);
     } else if (StoreInst *stInst = dyn_cast<StoreInst>(user)) {
       Value *val = stInst->getValueOperand();
       TranslateStore(RK, handle, val,
-                     CI->getArgOperand(HLOperandIndex::kStoreOffsetOpIdx),
-                     Builder, hlslOP);
+                     CI->getArgOperand(HLOperandIndex::kSubscriptIndexOpIdx),
+                     UndefI, Builder, hlslOP);
       // delete the st
       stInst->eraseFromParent();
     } else if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(user)) {
@@ -7518,17 +9643,18 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
           // Generate Ld.
           LoadInst *tmpLd = StBuilder.CreateLoad(CI);
 
-          Value *ldVal = TranslateTypedBufLoad(CI, RK, RC, handle, tmpLd, StBuilder,
-                                          hlslOP, helper.dataLayout);
+          Value *ldVal = TranslateTypedBufSubscript(
+              CI, RK, RC, handle, tmpLd, StBuilder, hlslOP, helper.dataLayout);
           // Update vector.
           ldVal = UpdateVectorElt(ldVal, SI->getValueOperand(), EltIdx,
                                   vectorSize, SI);
           // Generate St.
           // Reset insert point, UpdateVectorElt may move SI to different block.
           StBuilder.SetInsertPoint(SI);
-          TranslateStore(RK, handle, ldVal,
-                         CI->getArgOperand(HLOperandIndex::kStoreOffsetOpIdx),
-                         StBuilder, hlslOP);
+          TranslateStore(
+              RK, handle, ldVal,
+              CI->getArgOperand(HLOperandIndex::kSubscriptIndexOpIdx), UndefI,
+              StBuilder, hlslOP);
           SI->eraseFromParent();
           continue;
         }
@@ -7538,8 +9664,8 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
           // Generate tmp vector load with vector type & translate it
           LoadInst *tmpLd = LdBuilder.CreateLoad(CI);
 
-          Value *ldVal = TranslateTypedBufLoad(CI, RK, RC, handle, tmpLd, LdBuilder,
-            hlslOP, helper.dataLayout);
+          Value *ldVal = TranslateTypedBufSubscript(
+              CI, RK, RC, handle, tmpLd, LdBuilder, hlslOP, helper.dataLayout);
 
           // get the single element
           ldVal = GenerateVecEltFromGEP(ldVal, GEP, LdBuilder,
@@ -7549,50 +9675,11 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
           LI->eraseFromParent();
           continue;
         }
-        if (!isa<CallInst>(GEPUser)) {
-          // Invalid operations.
-          Translated = false;
-          dxilutil::EmitErrorOnInstruction(GEP, "Invalid operation on typed buffer.");
-          return;
-        }
-        CallInst *userCall = cast<CallInst>(GEPUser);
-        HLOpcodeGroup group =
-            hlsl::GetHLOpcodeGroupByName(userCall->getCalledFunction());
-        if (group != HLOpcodeGroup::HLIntrinsic) {
-          // Invalid operations.
-          Translated = false;
-          dxilutil::EmitErrorOnInstruction(userCall, "Invalid operation on typed buffer.");
-          return;
-        }
-        unsigned opcode = hlsl::GetHLOpcode(userCall);
-        IntrinsicOp IOP = static_cast<IntrinsicOp>(opcode);
-        switch (IOP) {
-        case IntrinsicOp::IOP_InterlockedAdd:
-        case IntrinsicOp::IOP_InterlockedAnd:
-        case IntrinsicOp::IOP_InterlockedExchange:
-        case IntrinsicOp::IOP_InterlockedMax:
-        case IntrinsicOp::IOP_InterlockedMin:
-        case IntrinsicOp::IOP_InterlockedUMax:
-        case IntrinsicOp::IOP_InterlockedUMin:
-        case IntrinsicOp::IOP_InterlockedOr:
-        case IntrinsicOp::IOP_InterlockedXor:
-        case IntrinsicOp::IOP_InterlockedCompareStore:
-        case IntrinsicOp::IOP_InterlockedCompareExchange:
-        case IntrinsicOp::IOP_InterlockedCompareStoreFloatBitwise:
-        case IntrinsicOp::IOP_InterlockedCompareExchangeFloatBitwise: {
-          // Invalid operations.
-          Translated = false;
-          dxilutil::EmitErrorOnInstruction(
-              userCall, "Typed resources used in atomic operations must have a scalar element type.");
-          return;
-        } break;
-        default:
-          // Invalid operations.
-          Translated = false;
-          dxilutil::EmitErrorOnInstruction(userCall, "Invalid operation on typed buffer.");
-          return;
-          break;
-        }
+        // Invalid operations.
+        Translated = false;
+        dxilutil::EmitErrorOnInstruction(GEP,
+                                         "Invalid operation on typed buffer.");
+        return;
       }
       GEP->eraseFromParent();
     } else {
@@ -7605,50 +9692,34 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
         if (RC == DXIL::ResourceClass::SRV) {
           // Invalid operations.
           Translated = false;
-          switch (IOP) {
-          case IntrinsicOp::IOP_InterlockedAdd:
-          case IntrinsicOp::IOP_InterlockedAnd:
-          case IntrinsicOp::IOP_InterlockedExchange:
-          case IntrinsicOp::IOP_InterlockedMax:
-          case IntrinsicOp::IOP_InterlockedMin:
-          case IntrinsicOp::IOP_InterlockedUMax:
-          case IntrinsicOp::IOP_InterlockedUMin:
-          case IntrinsicOp::IOP_InterlockedOr:
-          case IntrinsicOp::IOP_InterlockedXor:
-          case IntrinsicOp::IOP_InterlockedCompareStore:
-          case IntrinsicOp::IOP_InterlockedCompareExchange:
-          case IntrinsicOp::IOP_InterlockedCompareStoreFloatBitwise:
-          case IntrinsicOp::IOP_InterlockedCompareExchangeFloatBitwise: {
-            dxilutil::EmitErrorOnInstruction(
-                userCall, "Atomic operation targets must be groupshared or UAV.");
-            return;
-          } break;
-          default:
-            dxilutil::EmitErrorOnInstruction(userCall, "Invalid operation on typed buffer.");
-            return;
-            break;
-          }
+          dxilutil::EmitErrorOnInstruction(userCall,
+                                           "Invalid operation on SRV.");
+          return;
         }
         switch (IOP) {
         case IntrinsicOp::IOP_InterlockedAdd: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedAdd);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedAdd);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(atomHelper, DXIL::AtomicBinOpCode::Add,
                                          Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedAnd: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedAnd);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedAnd);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(atomHelper, DXIL::AtomicBinOpCode::And,
                                          Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedExchange: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedExchange);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedExchange);
           Type *opType = nullptr;
           PointerType *ptrType = dyn_cast<PointerType>(
-                       userCall->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)->getType());
+              userCall->getArgOperand(HLOperandIndex::kInterlockedDestOpIndex)
+                  ->getType());
           if (ptrType && ptrType->getElementType()->isFloatTy())
             opType = Type::getInt32Ty(userCall->getContext());
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
@@ -7657,42 +9728,48 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
               atomHelper, DXIL::AtomicBinOpCode::Exchange, Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedMax: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedMax);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedMax);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(
               atomHelper, DXIL::AtomicBinOpCode::IMax, Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedMin: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedMin);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedMin);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(
               atomHelper, DXIL::AtomicBinOpCode::IMin, Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedUMax: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedUMax);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedUMax);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(
               atomHelper, DXIL::AtomicBinOpCode::UMax, Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedUMin: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedUMin);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedUMin);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(
               atomHelper, DXIL::AtomicBinOpCode::UMin, Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedOr: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedOr);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedOr);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(atomHelper, DXIL::AtomicBinOpCode::Or,
                                          Builder, hlslOP);
         } break;
         case IntrinsicOp::IOP_InterlockedXor: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedXor);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedXor);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicBinOp, handle,
                                   helper.addr, /*offset*/ nullptr);
           TranslateAtomicBinaryOperation(atomHelper, DXIL::AtomicBinOpCode::Xor,
@@ -7700,7 +9777,8 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
         } break;
         case IntrinsicOp::IOP_InterlockedCompareStore:
         case IntrinsicOp::IOP_InterlockedCompareExchange: {
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedCompareExchange);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedCompareExchange);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicCompareExchange,
                                   handle, helper.addr, /*offset*/ nullptr);
           TranslateAtomicCmpXChg(atomHelper, Builder, hlslOP);
@@ -7708,9 +9786,11 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
         case IntrinsicOp::IOP_InterlockedCompareStoreFloatBitwise:
         case IntrinsicOp::IOP_InterlockedCompareExchangeFloatBitwise: {
           Type *i32Ty = Type::getInt32Ty(userCall->getContext());
-          ResLoadHelper helper(CI, RK, RC, handle, IntrinsicOp::IOP_InterlockedCompareExchange);
+          ResLoadHelper helper(CI, RK, RC, handle,
+                               IntrinsicOp::IOP_InterlockedCompareExchange);
           AtomicHelper atomHelper(userCall, DXIL::OpCode::AtomicCompareExchange,
-                                  handle, helper.addr, /*offset*/ nullptr, i32Ty);
+                                  handle, helper.addr, /*offset*/ nullptr,
+                                  i32Ty);
           TranslateAtomicCmpXChg(atomHelper, Builder, hlslOP);
         } break;
         default:
@@ -7724,9 +9804,12 @@ void TranslateDefaultSubscript(CallInst *CI, HLOperationLowerHelper &helper,  HL
     }
   }
 }
+} // namespace
 
 void TranslateHLSubscript(CallInst *CI, HLSubscriptOpcode opcode,
-                          HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper, bool &Translated) {
+                          HLOperationLowerHelper &helper,
+                          HLObjectOperationLowerHelper *pObjHelper,
+                          bool &Translated) {
   if (CI->user_empty()) {
     Translated = true;
     return;
@@ -7735,20 +9818,16 @@ void TranslateHLSubscript(CallInst *CI, HLSubscriptOpcode opcode,
 
   Value *ptr = CI->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx);
   if (opcode == HLSubscriptOpcode::CBufferSubscript) {
-    HLModule::MergeGepUse(CI);
+    dxilutil::MergeGepUse(CI);
     // Resource ptr.
     Value *handle = CI->getArgOperand(HLOperandIndex::kSubscriptObjectOpIdx);
-    if (helper.bLegacyCBufferLoad)
-      TranslateCBOperationsLegacy(handle, CI, hlslOP, helper.dxilTypeSys,
-                                  helper.dataLayout, pObjHelper);
-    else {
-      TranslateCBOperations(handle, CI, /*offset*/ hlslOP->GetU32Const(0),
-                            hlslOP, helper.dxilTypeSys,
-                            CI->getModule()->getDataLayout(), pObjHelper);
-    }
+    TranslateCBOperationsLegacy(handle, CI, hlslOP, helper.dxilTypeSys,
+                                helper.dataLayout, pObjHelper);
     Translated = true;
     return;
-  } else if (opcode == HLSubscriptOpcode::DoubleSubscript) {
+  }
+
+  if (opcode == HLSubscriptOpcode::DoubleSubscript) {
     // Resource ptr.
     Value *handle = ptr;
     DXIL::ResourceKind RK = pObjHelper->GetRK(handle);
@@ -7757,84 +9836,56 @@ void TranslateHLSubscript(CallInst *CI, HLSubscriptOpcode opcode,
         CI->getArgOperand(HLOperandIndex::kDoubleSubscriptMipLevelOpIdx);
 
     auto U = CI->user_begin();
-    DXASSERT(CI->hasOneUse(), "subscript should only has one use");
-    // TODO: support store.
-    Instruction *ldInst = cast<Instruction>(*U);
-    ResLoadHelper ldHelper(ldInst, handle, coord, mipLevel);
+    DXASSERT(CI->hasOneUse(), "subscript should only have one use");
     IRBuilder<> Builder(CI);
-    TranslateLoad(ldHelper, RK, Builder, hlslOP, helper.dataLayout);
-    ldInst->eraseFromParent();
+    if (LoadInst *ldInst = dyn_cast<LoadInst>(*U)) {
+      Value *Offset = UndefValue::get(Builder.getInt32Ty());
+      ResLoadHelper ldHelper(ldInst, RK, handle, coord, Offset,
+                             /*status*/ nullptr, mipLevel);
+      TranslateBufLoad(ldHelper, RK, Builder, hlslOP, helper.dataLayout);
+      ldInst->eraseFromParent();
+    } else {
+      StoreInst *stInst = cast<StoreInst>(*U);
+      Value *val = stInst->getValueOperand();
+      Value *UndefI = UndefValue::get(Builder.getInt32Ty());
+      TranslateStore(RK, handle, val,
+                     CI->getArgOperand(HLOperandIndex::kSubscriptIndexOpIdx),
+                     UndefI, Builder, hlslOP, mipLevel);
+      stInst->eraseFromParent();
+    }
     Translated = true;
     return;
-  } else {
-    Type *HandleTy = hlslOP->GetHandleType();
-    if (ptr->getType() == HandleTy) {
-      // Resource ptr.
-      Value *handle = ptr;
-      DXIL::ResourceKind RK = pObjHelper->GetRK(handle);
-      if (RK == DxilResource::Kind::Invalid) {
-        Translated = false;
-        return;
-      }
-      Translated = true;
-      Type *ObjTy = pObjHelper->GetResourceType(handle);
-      Type *RetTy = ObjTy->getStructElementType(0);
-      if (DXIL::IsStructuredBuffer(RK)) {
-        TranslateStructBufSubscript(CI, handle, /*status*/ nullptr, hlslOP, RK,
-                                    helper.dataLayout);
-      } else if (RetTy->isAggregateType() &&
-                 RK == DxilResource::Kind::TypedBuffer) {
-        TranslateStructBufSubscript(CI, handle, /*status*/ nullptr, hlslOP, RK,
-                                    helper.dataLayout);
-        // Clear offset for typed buf.
-        for (auto User = handle->user_begin(); User != handle->user_end(); ) {
-          CallInst *CI = cast<CallInst>(*(User++));
-          // Skip not lowered HL functions.
-          if (hlsl::GetHLOpcodeGroupByName(CI->getCalledFunction()) != HLOpcodeGroup::NotHL)
-            continue;
-          switch (hlslOP->GetDxilOpFuncCallInst(CI)) {
-          case DXIL::OpCode::BufferLoad: {
-            CI->setArgOperand(DXIL::OperandIndex::kBufferLoadCoord1OpIdx,
-                              UndefValue::get(helper.i32Ty));
-          } break;
-          case DXIL::OpCode::BufferStore: {
-            CI->setArgOperand(DXIL::OperandIndex::kBufferStoreCoord1OpIdx,
-                              UndefValue::get(helper.i32Ty));
-          } break;
-          case DXIL::OpCode::AtomicBinOp: {
-            CI->setArgOperand(DXIL::OperandIndex::kAtomicBinOpCoord1OpIdx,
-                              UndefValue::get(helper.i32Ty));
-          } break;
-          case DXIL::OpCode::AtomicCompareExchange: {
-            CI->setArgOperand(DXIL::OperandIndex::kAtomicCmpExchangeCoord1OpIdx,
-                              UndefValue::get(helper.i32Ty));
-          } break;
-          case DXIL::OpCode::RawBufferLoad: {
-            // Structured buffer inside a typed buffer must be converted to typed buffer load.
-            // Typed buffer load is equivalent to raw buffer load, except there is no mask.
-            StructType *STy = cast<StructType>(CI->getFunctionType()->getReturnType());
-            Type *ETy = STy->getElementType(0);
-            SmallVector<Value *, 4> Args;
-            Args.emplace_back(hlslOP->GetI32Const((unsigned)DXIL::OpCode::BufferLoad));
-            Args.emplace_back(CI->getArgOperand(1)); // handle
-            Args.emplace_back(CI->getArgOperand(2)); // index
-            Args.emplace_back(UndefValue::get(helper.i32Ty)); // offset
-            IRBuilder<> builder(CI);
-            Function *newFunction = hlslOP->GetOpFunc(DXIL::OpCode::BufferLoad, ETy);
-            CallInst *newCall = builder.CreateCall(newFunction, Args);
-            CI->replaceAllUsesWith(newCall);
-            CI->eraseFromParent();
-          } break;
-          default:
-            DXASSERT(0, "Invalid operation on resource handle");
-            break;
-          }
-        }
-      } else {
-        TranslateDefaultSubscript(CI, helper, pObjHelper, Translated);
-      }
+  }
+
+  Type *HandleTy = hlslOP->GetHandleType();
+  if (ptr->getType() == hlslOP->GetNodeRecordHandleType()) {
+    DXASSERT(false, "Shouldn't get here, NodeRecord subscripts should have "
+                    "been lowered in LowerRecordAccessToGetNodeRecordPtr");
+    return;
+  }
+
+  if (ptr->getType() == HandleTy) {
+    // Resource ptr.
+    Value *handle = ptr;
+    DXIL::ResourceKind RK = DxilResource::Kind::Invalid;
+    Type *ObjTy = nullptr;
+    Type *RetTy = nullptr;
+    RK = pObjHelper->GetRK(handle);
+    if (RK == DxilResource::Kind::Invalid) {
+      Translated = false;
       return;
     }
+    ObjTy = pObjHelper->GetResourceType(handle);
+    RetTy = ObjTy->getStructElementType(0);
+    Translated = true;
+
+    if (DXIL::IsStructuredBuffer(RK))
+      TranslateStructBufSubscript(CI, handle, /*status*/ nullptr, hlslOP, RK,
+                                  helper.dataLayout);
+    else
+      TranslateTypedBufferSubscript(CI, helper, pObjHelper, Translated);
+
+    return;
   }
 
   Value *basePtr = CI->getArgOperand(HLOperandIndex::kMatSubscriptMatOpIdx);
@@ -7845,15 +9896,14 @@ void TranslateHLSubscript(CallInst *CI, HLSubscriptOpcode opcode,
     Translated = true;
     return;
   }
+
   // Other case should be take care in TranslateStructBufSubscript or
   // TranslateCBOperations.
   Translated = false;
-  return;
 }
 
-}
-
-void TranslateSubscriptOperation(Function *F, HLOperationLowerHelper &helper,  HLObjectOperationLowerHelper *pObjHelper) {
+void TranslateSubscriptOperation(Function *F, HLOperationLowerHelper &helper,
+                                 HLObjectOperationLowerHelper *pObjHelper) {
   for (auto U = F->user_begin(); U != F->user_end();) {
     Value *user = *(U++);
     if (!isa<Instruction>(user))
@@ -7862,8 +9912,8 @@ void TranslateSubscriptOperation(Function *F, HLOperationLowerHelper &helper,  H
     CallInst *CI = cast<CallInst>(user);
     unsigned opcode = GetHLOpcode(CI);
     bool Translated = true;
-    TranslateHLSubscript(
-        CI, static_cast<HLSubscriptOpcode>(opcode), helper, pObjHelper, Translated);
+    TranslateHLSubscript(CI, static_cast<HLSubscriptOpcode>(opcode), helper,
+                         pObjHelper, Translated);
     if (Translated) {
       // delete the call
       DXASSERT(CI->use_empty(),
@@ -7873,38 +9923,44 @@ void TranslateSubscriptOperation(Function *F, HLOperationLowerHelper &helper,  H
   }
 }
 
-// Create BitCast if ptr, otherwise, create alloca of new type, write to bitcast of alloca, and return load from alloca
-// If bOrigAllocaTy is true: create alloca of old type instead, write to alloca, and return load from bitcast of alloca
-static Instruction *BitCastValueOrPtr(Value* V, Instruction *Insert, Type *Ty, bool bOrigAllocaTy = false, const Twine &Name = "") {
+// Create BitCast if ptr, otherwise, create alloca of new type, write to bitcast
+// of alloca, and return load from alloca If bOrigAllocaTy is true: create
+// alloca of old type instead, write to alloca, and return load from bitcast of
+// alloca
+static Instruction *BitCastValueOrPtr(Value *V, Instruction *Insert, Type *Ty,
+                                      bool bOrigAllocaTy = false,
+                                      const Twine &Name = "") {
   IRBuilder<> Builder(Insert);
   if (Ty->isPointerTy()) {
     // If pointer, we can bitcast directly
     return cast<Instruction>(Builder.CreateBitCast(V, Ty, Name));
-  } else {
-    // If value, we have to alloca, store to bitcast ptr, and load
-    IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Insert));
-    Type *allocaTy = bOrigAllocaTy ? V->getType() : Ty;
-    Type *otherTy = bOrigAllocaTy ? Ty : V->getType();
-    Instruction *allocaInst = AllocaBuilder.CreateAlloca(allocaTy);
-    Instruction *bitCast = cast<Instruction>(Builder.CreateBitCast(allocaInst, otherTy->getPointerTo()));
-    Builder.CreateStore(V, bOrigAllocaTy ? allocaInst : bitCast);
-    return Builder.CreateLoad(bOrigAllocaTy ? bitCast : allocaInst, Name);
   }
+
+  // If value, we have to alloca, store to bitcast ptr, and load
+  IRBuilder<> AllocaBuilder(dxilutil::FindAllocaInsertionPt(Insert));
+  Type *allocaTy = bOrigAllocaTy ? V->getType() : Ty;
+  Type *otherTy = bOrigAllocaTy ? Ty : V->getType();
+  Instruction *allocaInst = AllocaBuilder.CreateAlloca(allocaTy);
+  Instruction *bitCast = cast<Instruction>(
+      Builder.CreateBitCast(allocaInst, otherTy->getPointerTo()));
+  Builder.CreateStore(V, bOrigAllocaTy ? allocaInst : bitCast);
+  return Builder.CreateLoad(bOrigAllocaTy ? bitCast : allocaInst, Name);
 }
 
-static Instruction *CreateTransposeShuffle(IRBuilder<> &Builder, Value *vecVal, unsigned toRows, unsigned toCols) {
+static Instruction *CreateTransposeShuffle(IRBuilder<> &Builder, Value *vecVal,
+                                           unsigned toRows, unsigned toCols) {
   SmallVector<int, 16> castMask(toCols * toRows);
   unsigned idx = 0;
   for (unsigned r = 0; r < toRows; r++)
     for (unsigned c = 0; c < toCols; c++)
       castMask[idx++] = c * toRows + r;
   return cast<Instruction>(
-    Builder.CreateShuffleVector(vecVal, vecVal, castMask));
+      Builder.CreateShuffleVector(vecVal, vecVal, castMask));
 }
 
-
 void TranslateHLBuiltinOperation(Function *F, HLOperationLowerHelper &helper,
-                               hlsl::HLOpcodeGroup group, HLObjectOperationLowerHelper *pObjHelper) {
+                                 hlsl::HLOpcodeGroup group,
+                                 HLObjectOperationLowerHelper *pObjHelper) {
   if (group == HLOpcodeGroup::HLIntrinsic) {
     // map to dxil operations
     for (auto U = F->user_begin(); U != F->user_end();) {
@@ -7947,20 +10003,33 @@ void TranslateHLBuiltinOperation(Function *F, HLOperationLowerHelper &helper,
             // must be call inst
             CallInst *CI = cast<CallInst>(User);
             IRBuilder<> Builder(CI);
-            HLMatLoadStoreOpcode opcode = static_cast<HLMatLoadStoreOpcode>(hlsl::GetHLOpcode(CI));
+            HLMatLoadStoreOpcode opcode =
+                static_cast<HLMatLoadStoreOpcode>(hlsl::GetHLOpcode(CI));
             switch (opcode) {
             case HLMatLoadStoreOpcode::ColMatStore:
             case HLMatLoadStoreOpcode::RowMatStore: {
-              Value *vecVal = CI->getArgOperand(HLOperandIndex::kMatStoreValOpIdx);
-              Value *matPtr = CI->getArgOperand(HLOperandIndex::kMatStoreDstPtrOpIdx);
-              Value *castPtr = Builder.CreateBitCast(matPtr, vecVal->getType()->getPointerTo());
+              Value *vecVal =
+                  CI->getArgOperand(HLOperandIndex::kMatStoreValOpIdx);
+              Value *matPtr =
+                  CI->getArgOperand(HLOperandIndex::kMatStoreDstPtrOpIdx);
+              matPtr = SkipAddrSpaceCast(matPtr);
+              unsigned addrSpace =
+                  cast<PointerType>(matPtr->getType())->getAddressSpace();
+
+              Value *castPtr = Builder.CreateBitCast(
+                  matPtr, vecVal->getType()->getPointerTo(addrSpace));
               Builder.CreateStore(vecVal, castPtr);
               CI->eraseFromParent();
             } break;
             case HLMatLoadStoreOpcode::ColMatLoad:
             case HLMatLoadStoreOpcode::RowMatLoad: {
-              Value *matPtr = CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx);
-              Value *castPtr = Builder.CreateBitCast(matPtr, CI->getType()->getPointerTo());
+              Value *matPtr =
+                  CI->getArgOperand(HLOperandIndex::kMatLoadPtrOpIdx);
+              matPtr = SkipAddrSpaceCast(matPtr);
+              unsigned addrSpace =
+                  cast<PointerType>(matPtr->getType())->getAddressSpace();
+              Value *castPtr = Builder.CreateBitCast(
+                  matPtr, CI->getType()->getPointerTo(addrSpace));
               Value *vecVal = Builder.CreateLoad(castPtr);
               CI->replaceAllUsesWith(vecVal);
               CI->eraseFromParent();
@@ -7979,25 +10048,30 @@ void TranslateHLBuiltinOperation(Function *F, HLOperationLowerHelper &helper,
           // must be call inst
           CallInst *CI = cast<CallInst>(User);
           IRBuilder<> Builder(CI);
-          HLCastOpcode opcode = static_cast<HLCastOpcode>(hlsl::GetHLOpcode(CI));
+          HLCastOpcode opcode =
+              static_cast<HLCastOpcode>(hlsl::GetHLOpcode(CI));
           bool bTranspose = false;
           bool bColDest = false;
           switch (opcode) {
           case HLCastOpcode::RowMatrixToColMatrix:
             bColDest = true;
+            LLVM_FALLTHROUGH;
           case HLCastOpcode::ColMatrixToRowMatrix:
             bTranspose = true;
+            LLVM_FALLTHROUGH;
           case HLCastOpcode::ColMatrixToVecCast:
           case HLCastOpcode::RowMatrixToVecCast: {
-            Value *matVal = CI->getArgOperand(HLOperandIndex::kInitFirstArgOpIdx);
-            Value *vecVal = BitCastValueOrPtr(matVal, CI, CI->getType(),
-              /*bOrigAllocaTy*/false,
-              matVal->getName());
+            Value *matVal =
+                CI->getArgOperand(HLOperandIndex::kInitFirstArgOpIdx);
+            Value *vecVal =
+                BitCastValueOrPtr(matVal, CI, CI->getType(),
+                                  /*bOrigAllocaTy*/ false, matVal->getName());
             if (bTranspose) {
               HLMatrixType MatTy = HLMatrixType::cast(matVal->getType());
               unsigned row = MatTy.getNumRows();
               unsigned col = MatTy.getNumColumns();
-              if (bColDest) std::swap(row, col);
+              if (bColDest)
+                std::swap(row, col);
               vecVal = CreateTransposeShuffle(Builder, vecVal, row, col);
             }
             CI->replaceAllUsesWith(vecVal);
@@ -8016,7 +10090,7 @@ void TranslateHLBuiltinOperation(Function *F, HLOperationLowerHelper &helper,
 typedef std::unordered_map<llvm::Instruction *, llvm::Value *> HandleMap;
 static void TranslateHLExtension(Function *F,
                                  HLSLExtensionsCodegenHelper *helper,
-                                 OP& hlslOp,
+                                 OP &hlslOp,
                                  HLObjectOperationLowerHelper &objHelper) {
   // Find all calls to the function F.
   // Store the calls in a vector for now to be replaced the loop below.
@@ -8036,11 +10110,11 @@ static void TranslateHLExtension(Function *F,
 
   // Replace all calls that were successfully translated.
   for (CallInst *CI : CallsToReplace) {
-      Value *Result = lower.Translate(CI);
-      if (Result && Result != CI) {
-        CI->replaceAllUsesWith(Result);
-        CI->eraseFromParent();
-      }
+    Value *Result = lower.Translate(CI);
+    if (Result && Result != CI) {
+      CI->replaceAllUsesWith(Result);
+      CI->eraseFromParent();
+    }
   }
 }
 
@@ -8048,7 +10122,7 @@ namespace hlsl {
 
 void TranslateBuiltinOperations(
     HLModule &HLM, HLSLExtensionsCodegenHelper *extCodegenHelper,
-    std::unordered_set<LoadInst *> &UpdateCounterSet) {
+    std::unordered_set<Instruction *> &UpdateCounterSet) {
   HLOperationLowerHelper helper(HLM);
 
   HLObjectOperationLowerHelper objHelper = {HLM, UpdateCounterSet};
@@ -8087,9 +10161,71 @@ void TranslateBuiltinOperations(
   // Translate last so value placed in NonUniformSet is still valid.
   if (!NonUniformResourceIndexIntrinsics.empty()) {
     for (auto F : NonUniformResourceIndexIntrinsics) {
-      TranslateHLBuiltinOperation(F, helper, HLOpcodeGroup::HLIntrinsic, &objHelper);
+      TranslateHLBuiltinOperation(F, helper, HLOpcodeGroup::HLIntrinsic,
+                                  &objHelper);
     }
   }
 }
 
+void EmitGetNodeRecordPtrAndUpdateUsers(HLOperationLowerHelper &helper,
+                                        CallInst *CI, Value *ArrayIndex) {
+  IRBuilder<> Builder(CI);
+  Value *opArg = nullptr;
+  Value *Handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+  opArg = Builder.getInt32((unsigned)DXIL::OpCode::GetNodeRecordPtr);
+  StructType *origRecordUDT =
+      cast<StructType>(cast<PointerType>(CI->getType())->getElementType());
+  Type *getNodeRecordPtrRT = origRecordUDT;
+  // Translate node record type here
+  auto findIt = helper.loweredTypes.find(origRecordUDT);
+  if (findIt != helper.loweredTypes.end()) {
+    getNodeRecordPtrRT = findIt->second;
+  } else {
+    getNodeRecordPtrRT = GetLoweredUDT(origRecordUDT, &helper.dxilTypeSys);
+    if (origRecordUDT != getNodeRecordPtrRT)
+      helper.loweredTypes[origRecordUDT] = getNodeRecordPtrRT;
+  }
+  getNodeRecordPtrRT =
+      getNodeRecordPtrRT->getPointerTo(DXIL::kNodeRecordAddrSpace);
+  Function *getNodeRecordPtr = helper.hlslOP.GetOpFunc(
+      DXIL::OpCode::GetNodeRecordPtr, getNodeRecordPtrRT);
+  Value *args[] = {opArg, Handle, ArrayIndex};
+  Value *NodeRecordPtr = Builder.CreateCall(getNodeRecordPtr, args);
+  ReplaceUsesForLoweredUDT(CI, NodeRecordPtr);
 }
+
+void LowerRecordAccessToGetNodeRecordPtr(HLModule &HLM) {
+  Module *M = HLM.GetModule();
+  HLOperationLowerHelper helper(HLM);
+  for (iplist<Function>::iterator F : M->getFunctionList()) {
+    if (F->user_empty())
+      continue;
+    hlsl::HLOpcodeGroup group = hlsl::GetHLOpcodeGroup(F);
+    if (group == HLOpcodeGroup::HLSubscript) {
+      for (auto U = F->user_begin(); U != F->user_end();) {
+        Value *User = *(U++);
+        if (!isa<Instruction>(User))
+          continue;
+        // must be call inst
+        CallInst *CI = cast<CallInst>(User);
+        HLSubscriptOpcode opcode =
+            static_cast<HLSubscriptOpcode>(hlsl::GetHLOpcode(CI));
+        if (opcode != HLSubscriptOpcode::DefaultSubscript)
+          continue;
+
+        hlsl::OP *OP = &helper.hlslOP;
+        Value *Handle = CI->getArgOperand(HLOperandIndex::kHandleOpIdx);
+        if (Handle->getType() != OP->GetNodeRecordHandleType()) {
+          continue;
+        }
+
+        Value *Index = CI->getNumArgOperands() > 2
+                           ? CI->getArgOperand(2)
+                           : ConstantInt::get(helper.i32Ty, 0);
+        EmitGetNodeRecordPtrAndUpdateUsers(helper, CI, Index);
+        CI->eraseFromParent();
+      }
+    }
+  }
+}
+} // namespace hlsl

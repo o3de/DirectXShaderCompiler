@@ -13,10 +13,18 @@
 #include "dxc/Support/SPIRVOptions.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/Type.h"
+#include "clang/SPIRV/SpirvType.h"
 #include "clang/Sema/Sema.h"
 
 namespace clang {
 namespace spirv {
+
+/// Returns a string name for the function if |fn| is not an overloaded
+/// operator. Otherwise, returns the name of the operator. If
+/// |addClassNameWithOperator| is true, adds the name of RecordType that
+/// defines the overloaded operator in front of the operator name.
+std::string getFunctionOrOperatorName(const FunctionDecl *fn,
+                                      bool addClassNameWithOperator);
 
 /// Returns a string name for the given type.
 std::string getAstTypeName(QualType type);
@@ -114,6 +122,10 @@ bool isConstantTextureBuffer(QualType);
 /// * SubpassInput(MS)
 bool isResourceType(QualType);
 
+/// \brief Returns true if the given type is a user-defined struct or class
+/// type (not HLSL built-in type).
+bool isUserDefinedRecordType(const ASTContext &, QualType);
+
 /// Returns true if the given type is or contains a 16-bit type.
 /// The caller must also specify whether 16-bit types have been enabled via
 /// command line options.
@@ -202,9 +214,20 @@ bool isAppendStructuredBuffer(QualType type);
 /// \brief Returns true if the given type is a ConsumeStructuredBuffer type.
 bool isConsumeStructuredBuffer(QualType type);
 
+/// \brief Returns true if the given type is a RWStructuredBuffer type.
+bool isRWStructuredBuffer(QualType type);
+
 /// \brief Returns true if the given type is a RW/Append/Consume
 /// StructuredBuffer type.
 bool isRWAppendConsumeSBuffer(QualType type);
+
+/// \brief Returns true if the given type is a ResourceDescriptorHeap.
+bool isResourceDescriptorHeap(QualType T);
+bool isResourceDescriptorHeap(const Decl *D);
+
+/// \brief Returns true if the given type is a SamplerDescriptorHeap.
+bool isSamplerDescriptorHeap(const Decl *D);
+bool isSamplerDescriptorHeap(QualType T);
 
 /// \brief Returns true if the given type is the HLSL ByteAddressBufferType.
 bool isByteAddressBuffer(QualType type);
@@ -234,11 +257,24 @@ bool isTexture(QualType);
 /// Texture2DMSArray type.
 bool isTextureMS(QualType);
 
+/// \brief Returns true if the given type is an HLSL SampledTexture2DMS or
+/// SampledTexture2DMSArray type.
+bool isSampledTextureMS(QualType);
+
+/// \brief Returns true if the given type is an HLSL SampledTexture type.
+bool isSampledTexture(QualType);
+
 /// \brief Returns true if the given type is an HLSL RWTexture type.
 bool isRWTexture(QualType);
 
 /// \brief Returns true if the given type is an HLSL sampler type.
 bool isSampler(QualType);
+
+/// \brief Returns true if the given type is InputPatch.
+bool isInputPatch(QualType type);
+
+/// \brief Returns true if the given type is OutputPatch.
+bool isOutputPatch(QualType type);
 
 /// \brief Returns true if the given type is SubpassInput.
 bool isSubpassInput(QualType);
@@ -272,6 +308,9 @@ bool isOpaqueStructType(QualType type);
 /// operated on with a relaxed precision.
 bool isRelaxedPrecisionType(QualType, const SpirvCodeGenOptions &);
 
+/// Returns true if the given type is a rasterizer ordered view.
+bool isRasterizerOrderedView(QualType type);
+
 /// Returns true if the given type is a bool or vector of bool type.
 bool isBoolOrVecOfBoolType(QualType type);
 
@@ -282,6 +321,9 @@ bool isSintOrVecOfSintType(QualType type);
 /// Returns true if the given type is an unsigned integer or vector of unsigned
 /// integer type.
 bool isUintOrVecOfUintType(QualType type);
+
+/// Returns true if the given type is a half or vector of half type.
+bool isHalfOrVecOfHalfType(QualType type);
 
 /// Returns true if the given type is a float or vector of float type.
 bool isFloatOrVecOfFloatType(QualType type);
@@ -307,10 +349,20 @@ bool isOrContainsNonFpColMajorMatrix(const ASTContext &,
                                      const SpirvCodeGenOptions &, QualType type,
                                      const Decl *decl);
 
-/// \bried Returns true if the given type is a String or StringLiteral type.
+/// brief Returns true if the type is a boolean type or an aggragate type that
+/// contains a boolean type.
+bool isOrContainsBoolType(QualType type);
+
+/// \brief Returns true if the given type is `vk::ext_result_id<T>`.
+bool isExtResultIdType(QualType type);
+
+/// \brief Returns true if the given type is defined in `vk` namespace.
+bool isTypeInVkNamespace(const RecordType *type);
+
+/// \brief Returns true if the given type is a String or StringLiteral type.
 bool isStringType(QualType);
 
-/// \bried Returns true if the given type is a bindless array of an opaque type.
+/// \brief Returns true if the given type is a bindless array of an opaque type.
 bool isBindlessOpaqueArray(QualType type);
 
 /// \brief Generates the corresponding SPIR-V vector type for the given Clang
@@ -354,6 +406,28 @@ bool isStructureContainingAnyKindOfBuffer(QualType type);
 /// types, or it's an array of scalar, vector, or matrix of numeric types.
 bool isScalarOrNonStructAggregateOfNumericalTypes(QualType type);
 
+/// Calls `operation` on for each field in the base and derives class defined by
+/// `recordType`. The `operation` will receive the AST type linked to the field,
+/// the SPIRV type linked to the field, and the index of the field in the final
+/// SPIR-V representation. This index of the field can vary from the AST
+/// field-index because bitfields are merged into a single field in the SPIR-V
+/// representation.
+///
+/// If `includeMerged` is true, `operation` will be called on the same spir-v
+/// field for each field it represents. For example, if a spir-v field holds the
+/// values for 3 bit-fields, `operation` will be called 3 times with the same
+/// `spirvFieldIndex`. The `bitfield` information in `field` will be different.
+///
+/// If false, `operation` will be called once on the first field in the merged
+/// field.
+///
+/// If the operation returns false, we stop processing fields.
+void forEachSpirvField(
+    const RecordType *recordType, const StructType *spirvType,
+    std::function<bool(size_t spirvFieldIndex, const QualType &fieldType,
+                       const StructType::FieldInfo &field)>
+        operation,
+    bool includeMerged = false);
 } // namespace spirv
 } // namespace clang
 

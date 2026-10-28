@@ -331,7 +331,7 @@ trailingHexadecimalFraction(StringRef::iterator p, StringRef::iterator end,
 
   /* If we ran off the end it is exactly zero or one-half, otherwise
      a little more.  */
-  if (hexDigit == -1U)
+  if (hexDigit == ~0U)
     return digitValue == 0 ? lfExactlyZero: lfExactlyHalf;
   else
     return digitValue == 0 ? lfLessThanHalf: lfMoreThanHalf;
@@ -446,7 +446,7 @@ ulpsFromBoundary(const integerPart *parts, unsigned int bits, bool isNearest)
       if (~parts[count])
         return ~(integerPart) 0; /* A lot.  */
 
-    return -parts[0];
+    return (~parts[0] + 1);
   }
 
   return ~(integerPart) 0; /* A lot.  */
@@ -527,8 +527,8 @@ static const char NaNU[] = "NAN";
    significant nibble.  Write out exactly COUNT hexdigits, return
    COUNT.  */
 static unsigned int
-partAsHex (_Out_writes_(count) char *dst, integerPart part, unsigned int count,
-           _In_count_(16) const char *hexDigitChars)
+partAsHex (char *dst, integerPart part, unsigned int count,
+           const char *hexDigitChars)
 {
   unsigned int result = count;
 
@@ -545,7 +545,7 @@ partAsHex (_Out_writes_(count) char *dst, integerPart part, unsigned int count,
 
 /* Write out an unsigned decimal integer.  */
 static char *
-writeUnsignedDecimal (_Out_writes_(10) char *dst, unsigned int n) // HLSL Change: '4294967295' is ten characters
+writeUnsignedDecimal (char *dst, unsigned int n)
 {
   char buff[40], *p;
 
@@ -563,7 +563,7 @@ writeUnsignedDecimal (_Out_writes_(10) char *dst, unsigned int n) // HLSL Change
 
 /* Write out a signed decimal integer.  */
 static char *
-writeSignedDecimal(_Out_writes_(11) char *dst, int value) // HLSL Change: '-2147483648' is eleven characters
+writeSignedDecimal(char *dst, int value)
 {
   if (value < 0) {
     *dst++ = '-';
@@ -1554,11 +1554,13 @@ APFloat::divideSpecials(const APFloat &rhs)
   case PackCategoriesIntoKey(fcInfinity, fcNaN):
     category = fcNaN;
     copySignificand(rhs);
+    LLVM_FALLTHROUGH; // HLSL Change
   case PackCategoriesIntoKey(fcNaN, fcZero):
   case PackCategoriesIntoKey(fcNaN, fcNormal):
   case PackCategoriesIntoKey(fcNaN, fcInfinity):
   case PackCategoriesIntoKey(fcNaN, fcNaN):
     sign = false;
+    LLVM_FALLTHROUGH; // HLSL Change
   case PackCategoriesIntoKey(fcInfinity, fcZero):
   case PackCategoriesIntoKey(fcInfinity, fcNormal):
   case PackCategoriesIntoKey(fcZero, fcInfinity):
@@ -2366,7 +2368,7 @@ APFloat::convertFromHexadecimalString(StringRef s, roundingMode rounding_mode)
     }
 
     hex_value = hexDigitValue(*p);
-    if (hex_value == -1U)
+    if (hex_value == ~0U)
       break;
 
     p++;

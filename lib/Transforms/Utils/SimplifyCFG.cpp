@@ -1830,6 +1830,14 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
       isa<ConstantInt>(IfCond))
     return false;
 
+  // HLSL Change Begins: Patching in llvm/llvm-project@602ab24
+  // Don't try to fold an unreachable block. For example, the phi node itself
+  // can't be the candidate if-condition for a select that we want to form.
+  if (auto *IfCondPhiInst = dyn_cast<PHINode>(IfCond))
+    if (IfCondPhiInst->getParent() == BB)
+      return false;
+  // HLSL Change Ends.
+
   // Okay, we found that we can merge this two-entry phi node into a select.
   // Doing so would require us to fold *all* two entry phi nodes in this block.
   // At some point this becomes non-profitable (particularly if the target
@@ -2619,7 +2627,10 @@ static bool SimplifyTerminatorOnSelect(TerminatorInst *OldTerm, Value *Cond,
     else if (Succ == KeepEdge2)
       KeepEdge2 = nullptr;
     else
-      Succ->removePredecessor(OldTerm->getParent());
+      Succ->removePredecessor(
+          OldTerm->getParent(),
+          /*DontDeleteUselessPHIs=*/true // HLSL Change: foward port LLVM fix
+      );
   }
 
   IRBuilder<> Builder(OldTerm);
@@ -3844,7 +3855,13 @@ SwitchLookupTable::SwitchLookupTable(
   // If the type is integer and the table fits in a register, build a bitmap.
   if (WouldFitInRegister(DL, TableSize, ValueType)) {
     IntegerType *IT = cast<IntegerType>(ValueType);
-    APInt TableInt(TableSize * IT->getBitWidth(), 0);
+    // HLSL Change Begin: Round bitmap width up to size supported by DXIL (i16
+    // or i32)
+    uint64_t RawBitMapWidth = TableSize * IT->getBitWidth();
+    uint64_t BitMapWidth =
+        NextPowerOf2(std::max(UINT64_C(15), RawBitMapWidth - 1));
+    APInt TableInt(BitMapWidth, 0);
+    // HLSL Change End
     for (uint64_t I = TableSize; I > 0; --I) {
       TableInt <<= IT->getBitWidth();
       // Insert values into the bitmap. Undef values are set to zero.
@@ -3939,6 +3956,11 @@ bool SwitchLookupTable::WouldFitInRegister(const DataLayout &DL,
   // Avoid overflow, fitsInLegalInteger uses unsigned int for the width.
   if (TableSize >= UINT_MAX/IT->getBitWidth())
     return false;
+  // HLSL Change Begin: Cap at 32 bits so the bitmap stays in a DXIL-supported
+  // integer width and never promotes to i64 (which would set Int64Ops).
+  if (TableSize * IT->getBitWidth() > 32)
+    return false;
+  // HLSL Change End
   return DL.fitsInLegalInteger(TableSize * IT->getBitWidth());
 }
 

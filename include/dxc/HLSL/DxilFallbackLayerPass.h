@@ -11,10 +11,12 @@
 
 #pragma once
 
-namespace llvm {
-    ModulePass *createDxilUpdateMetadataPass();
-    ModulePass *createDxilPatchShaderRecordBindingsPass();
+#include "llvm/Pass.h"
 
-    void initializeDxilUpdateMetadataPass(llvm::PassRegistry&);
-    void initializeDxilPatchShaderRecordBindingsPass(llvm::PassRegistry&);
-}
+namespace llvm {
+ModulePass *createDxilUpdateMetadataPass();
+ModulePass *createDxilPatchShaderRecordBindingsPass();
+
+void initializeDxilUpdateMetadataPass(llvm::PassRegistry &);
+void initializeDxilPatchShaderRecordBindingsPass(llvm::PassRegistry &);
+} // namespace llvm

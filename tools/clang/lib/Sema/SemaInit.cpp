@@ -5036,7 +5036,7 @@ void InitializationSequence::InitializeFrom(Sema &S,
   assert(Args.size() == 1 && "Zero-argument case handled above");
   // HLSL Change Starts
   assert(Initializer != nullptr && "otherwise prior code changed and Args.size() == 1 no longer reads from first argument");
-  _Analysis_assume_(Initializer != nullptr);
+  assert(Initializer != nullptr);
   // HLSL Change Ends
 
   //    - Otherwise, if the source type is a (possibly cv-qualified) class
@@ -6183,7 +6183,11 @@ InitializationSequence::Perform(Sema &S,
             CK_LValueToRValue, Args[i], /*BasePath=*/0, VK_RValue);
         }
       }
-      CurInit = new (S.getASTContext())InitListExpr(S.getASTContext(), SourceLocation(), Args, SourceLocation());
+      InitListExpr *castInit = new (S.getASTContext())
+          InitListExpr(S.getASTContext(), Kind.getParenRange().getBegin(), Args,
+                       Kind.getParenRange().getEnd());
+      castInit->sawVectorInitWithCXXFunctionalCastExpr(true);
+      CurInit = castInit;
     }
     break;
   }
@@ -7058,7 +7062,7 @@ bool InitializationSequence::Diagnose(Sema &S,
       << Args[0]->getSourceRange();
       break;
     }
-    // Intentional fallthrough
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case FK_NonConstLValueReferenceBindingToUnrelated:
     S.Diag(Kind.getLocation(),

@@ -32,7 +32,8 @@ void addTemplateTypeAndItsParamsToModule(SpirvModule *module,
 void DebugTypeVisitor::setDefaultDebugInfo(SpirvDebugInstruction *instr) {
   instr->setAstResultType(astContext.VoidTy);
   instr->setResultType(context.getVoidType());
-  instr->setInstructionSet(spvBuilder.getOpenCLDebugInfoExtInstSet());
+  instr->setInstructionSet(
+      spvBuilder.getDebugInfoExtInstSet(spvOptions.debugInfoVulkan));
 }
 
 SpirvDebugInfoNone *DebugTypeVisitor::getDebugInfoNone() {
@@ -53,8 +54,21 @@ SpirvDebugTypeComposite *DebugTypeVisitor::createDebugTypeComposite(
 
   RichDebugInfo *debugInfo = &spvContext.getDebugInfo().begin()->second;
   const char *file = sm.getPresumedLoc(loc).getFilename();
-  if (file)
-    debugInfo = &spvContext.getDebugInfo()[file];
+  if (file) {
+    auto &debugInfoMap = spvContext.getDebugInfo();
+    auto it = debugInfoMap.find(file);
+    if (it != debugInfoMap.end()) {
+      debugInfo = &it->second;
+    } else {
+      auto *dbgSrc = spvBuilder.createDebugSource(file);
+      setDefaultDebugInfo(dbgSrc);
+      auto dbgCompUnit = spvBuilder.getModule()->getDebugCompilationUnit();
+      setDefaultDebugInfo(dbgCompUnit);
+      debugInfo =
+          &debugInfoMap.insert({file, RichDebugInfo(dbgSrc, dbgCompUnit)})
+               .first->second;
+    }
+  }
   return spvContext.getDebugTypeComposite(
       type, name, debugInfo->source, line, column,
       /* parent */ debugInfo->compilationUnit, linkageName, 3u, tag);
@@ -83,9 +97,8 @@ void DebugTypeVisitor::addDebugTypeForMemberVariables(
     // For example, we do not have physical layout for a local variable.
 
     // Get offset (in bits) of this member within the composite.
-    uint32_t offsetInBits = field.offset.hasValue()
-                                ? offsetInBits = *field.offset * 8
-                                : compositeSizeInBits;
+    uint32_t offsetInBits =
+        field.offset.hasValue() ? *field.offset * 8 : compositeSizeInBits;
     // Get size (in bits) of this member within the composite.
     uint32_t sizeInBits = field.sizeInBytes.hasValue()
                               ? *field.sizeInBytes * 8
@@ -147,6 +160,14 @@ void DebugTypeVisitor::lowerDebugTypeMembers(
   } else {
     assert(false && "Uknown DeclContext for DebugTypeMember generation");
   }
+
+  // Note:
+  //    Generating forward references is possible for non-semantic debug info,
+  //    but not when using OpenCL.DebugInfo.100.
+  //    Doing so would go against the SPIR-V spec.
+  //    See https://github.com/KhronosGroup/SPIRV-Registry/issues/203
+  if (!spvOptions.debugInfoVulkan)
+    return;
 
   // Push member functions to DebugTypeComposite Members operand.
   for (auto *subDecl : decl->decls()) {
@@ -302,6 +323,7 @@ SpirvDebugType *DebugTypeVisitor::lowerToDebugType(const SpirvType *spirvType) {
   }
   case SpirvType::TK_Image:
   case SpirvType::TK_Sampler:
+  case SpirvType::TK_RayQueryKHR:
   case SpirvType::TK_Struct: {
     debugType = lowerToDebugTypeComposite(spirvType);
     break;
@@ -324,7 +346,28 @@ SpirvDebugType *DebugTypeVisitor::lowerToDebugType(const SpirvType *spirvType) {
     debugType = spvContext.getDebugTypeArray(spirvType, elemDebugType, counts);
     break;
   }
-  // TODO: Handle TK_RuntimeArray. We need spec updates for the bindless array.
+  case SpirvType::TK_RuntimeArray: {
+    auto *arrType = dyn_cast<RuntimeArrayType>(spirvType);
+    SpirvDebugInstruction *elemDebugType =
+        lowerToDebugType(arrType->getElementType());
+
+    llvm::SmallVector<uint32_t, 4> counts;
+    counts.push_back(0u);
+
+    debugType = spvContext.getDebugTypeArray(spirvType, elemDebugType, counts);
+    break;
+  }
+  case SpirvType::TK_NodePayloadArrayAMD: {
+    auto *arrType = dyn_cast<NodePayloadArrayType>(spirvType);
+    SpirvDebugInstruction *elemDebugType =
+        lowerToDebugType(arrType->getElementType());
+
+    llvm::SmallVector<uint32_t, 4> counts;
+    counts.push_back(0u);
+
+    debugType = spvContext.getDebugTypeArray(spirvType, elemDebugType, counts);
+    break;
+  }
   case SpirvType::TK_Vector: {
     auto *vecType = dyn_cast<VectorType>(spirvType);
     SpirvDebugInstruction *elemDebugType =
@@ -334,15 +377,18 @@ SpirvDebugType *DebugTypeVisitor::lowerToDebugType(const SpirvType *spirvType) {
     break;
   }
   case SpirvType::TK_Matrix: {
-    // TODO: I temporarily use a DebugTypeArray for a matrix type.
-    // However, when the debug info extension supports matrix type
-    // e.g., DebugTypeMatrix, we must replace DebugTypeArray with
-    // DebugTypeMatrix.
     auto *matType = dyn_cast<MatrixType>(spirvType);
-    SpirvDebugInstruction *elemDebugType =
-        lowerToDebugType(matType->getElementType());
-    debugType = spvContext.getDebugTypeArray(
-        spirvType, elemDebugType, {matType->numRows(), matType->numCols()});
+    if (spvOptions.debugInfoVulkan) {
+      SpirvDebugInstruction *vecDebugType =
+          lowerToDebugType(matType->getVecType());
+      debugType = spvContext.getDebugTypeMatrix(spirvType, vecDebugType,
+                                                matType->numCols());
+    } else {
+      SpirvDebugInstruction *elemDebugType =
+          lowerToDebugType(matType->getElementType());
+      debugType = spvContext.getDebugTypeArray(
+          spirvType, elemDebugType, {matType->numRows(), matType->numCols()});
+    }
     break;
   }
   case SpirvType::TK_Pointer: {
@@ -371,6 +417,17 @@ SpirvDebugType *DebugTypeVisitor::lowerToDebugType(const SpirvType *spirvType) {
     const uint32_t flags = 3u;
     debugType =
         spvContext.getDebugTypeFunction(spirvType, flags, returnType, params);
+    break;
+  }
+  case SpirvType::TK_BufferEXT:
+  case SpirvType::TK_UntypedPointerKHR: {
+    // There is no standard debug type for opaque buffer/pointers yet.
+    // For now, lower it as an empty composite type or ignore.
+    debugType = lowerToDebugTypeComposite(spirvType);
+    break;
+  }
+  case SpirvType::TK_AccelerationStructureNV: {
+    debugType = lowerToDebugTypeComposite(spirvType);
     break;
   }
   }

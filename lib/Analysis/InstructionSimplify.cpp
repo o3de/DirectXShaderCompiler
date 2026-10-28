@@ -2721,7 +2721,7 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
                      Q.CxtI, Q.DT);
       if (!KnownNonNegative)
         break;
-      // fall-through
+      LLVM_FALLTHROUGH; // HLSL Change
     case ICmpInst::ICMP_EQ:
     case ICmpInst::ICMP_UGT:
     case ICmpInst::ICMP_UGE:
@@ -2732,7 +2732,7 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
                      Q.CxtI, Q.DT);
       if (!KnownNonNegative)
         break;
-      // fall-through
+      LLVM_FALLTHROUGH; // HLSL Change
     case ICmpInst::ICMP_NE:
     case ICmpInst::ICMP_ULT:
     case ICmpInst::ICMP_ULE:
@@ -2752,7 +2752,7 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
                      Q.CxtI, Q.DT);
       if (!KnownNonNegative)
         break;
-      // fall-through
+      LLVM_FALLTHROUGH; // HLSL Change
     case ICmpInst::ICMP_NE:
     case ICmpInst::ICMP_UGT:
     case ICmpInst::ICMP_UGE:
@@ -2763,7 +2763,7 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
                      Q.CxtI, Q.DT);
       if (!KnownNonNegative)
         break;
-      // fall-through
+      LLVM_FALLTHROUGH; // HLSL Change
     case ICmpInst::ICMP_EQ:
     case ICmpInst::ICMP_ULT:
     case ICmpInst::ICMP_ULE:
@@ -2823,7 +2823,7 @@ static Value *SimplifyICmpInst(unsigned Predicate, Value *LHS, Value *RHS,
     case Instruction::LShr:
       if (ICmpInst::isSigned(Pred))
         break;
-      // fall-through
+      LLVM_FALLTHROUGH; // HLSL Change
     case Instruction::SDiv:
     case Instruction::AShr:
       if (!LBO->isExact() || !RBO->isExact())
@@ -4109,7 +4109,7 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {
         // Shift it to the right place, depending on endianness.
         Src = ConstantExpr::getShl(Src,
                                    ConstantInt::get(Src->getType(), ShiftAmt));
-        ShiftAmt += isLittleEndian ? SrcBitSize : -SrcBitSize;
+        ShiftAmt += isLittleEndian ? SrcBitSize : (~SrcBitSize + 1U);
 
         // Mix it in.
         Elt = ConstantExpr::getOr(Elt, Src);
@@ -4144,9 +4144,9 @@ Constant *FoldBitCast(Constant *C, Type *DestTy, const DataLayout &DL) {
     for (unsigned j = 0; j != Ratio; ++j) {
       // Shift the piece of the value into the right place, depending on
       // endianness.
-      Constant *Elt = ConstantExpr::getLShr(Src,
-                                  ConstantInt::get(Src->getType(), ShiftAmt));
-      ShiftAmt += isLittleEndian ? DstBitSize : -DstBitSize;
+      Constant *Elt = ConstantExpr::getLShr(
+          Src, ConstantInt::get(Src->getType(), ShiftAmt));
+      ShiftAmt += isLittleEndian ? DstBitSize : (~DstBitSize + 1U);
 
       // Truncate the element to an integer with the same pointer size and
       // convert the element back to a pointer using a inttoptr.

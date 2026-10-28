@@ -66,19 +66,20 @@ namespace llvm {
     /*implicit*/ StringRef() : Data(nullptr), Length(0) {}
     StringRef(std::nullptr_t) = delete; // HLSL Change - So we don't accidentally pass `false` again
 
+    // HLSL Change - Begin - Make StringRef constructors constexpr.
     /// Construct a string ref from a cstring.
-    /*implicit*/ StringRef(const char *Str)
-      : Data(Str) {
-        assert(Str && "StringRef cannot be built from a NULL argument");
-        Length = ::strlen(Str); // invoking strlen(NULL) is undefined behavior
-      }
+    /*implicit*/ constexpr StringRef(const char *Str)
+        : Data(Str), Length(Str ? std::char_traits<char>::length(Str) : 0) {
+      assert(Str && "StringRef cannot be built from a NULL argument");
+    }
 
     /// Construct a string ref from a pointer and length.
-    /*implicit*/ StringRef(const char *data, size_t length)
-      : Data(data), Length(length) {
-        assert((data || length == 0) &&
-        "StringRef cannot be built from a NULL argument with non-null length");
-      }
+    /*implicit*/ constexpr StringRef(const char *data, size_t length)
+        : Data(data), Length(length) {
+      assert((data || length == 0) && "StringRef cannot be built from a NULL "
+                                      "argument with non-null length");
+    }
+    // HLSL Change - End - Make StringRef constructors constexpr.
 
     /// Construct a string ref from an std::string.
     /*implicit*/ StringRef(const std::string &Str)
@@ -570,9 +571,13 @@ namespace llvm {
 }
 
 // HLSL Change Starts
-// StringRef provides an operator string; that trips up the std::pair noexcept specification,
-// which (a) enables the moves constructor (because conversion is allowed), but (b)
-// misclassifies the the construction as nothrow.
+// StringRef provides an operator string; that trips up the std::pair noexcept
+// specification, which (a) enables the moves constructor (because conversion is
+// allowed), but (b) misclassifies the the construction as nothrow. Newer libc++
+// releases reject user specializations of this trait outright, and also compute
+// the trait correctly without help.
+#if !defined(_LIBCPP_VERSION) &&                                               \
+    !(defined(_MSVC_STL_UPDATE) && _MSVC_STL_UPDATE >= 202604L)
 namespace std {
   template<>
   struct is_nothrow_constructible <std::string, llvm::StringRef>
@@ -587,6 +592,7 @@ namespace std {
     : std::false_type {
   };
 }
+#endif
 // HLSL Change Ends
 
 #endif

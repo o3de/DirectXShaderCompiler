@@ -11,7 +11,7 @@
 #include "llvm/ADT/StringRef.h"
 
 namespace llvm {
-  class Instruction;
+class Instruction;
 }
 
 namespace hlsl {
@@ -20,5 +20,7 @@ static const llvm::StringRef kPreservePrefix = "dx.preserve.";
 static const llvm::StringRef kNothingName = "dx.nothing.a";
 static const llvm::StringRef kPreserveName = "dx.preserve.value.a";
 
+bool IsPreserveRelatedValue(llvm::Instruction *I);
 bool IsPreserve(llvm::Instruction *S);
-}
+bool IsNop(llvm::Instruction *I);
+} // namespace hlsl

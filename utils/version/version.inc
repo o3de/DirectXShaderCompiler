@@ -13,12 +13,12 @@
 #ifdef RC_VERSION_FIELD_2
 #undef RC_VERSION_FIELD_2
 #endif
-#define RC_VERSION_FIELD_2 6
+#define RC_VERSION_FIELD_2 9
 
 #ifdef RC_VERSION_FIELD_3
 #undef RC_VERSION_FIELD_3
 #endif
-#define RC_VERSION_FIELD_3 2104
+#define RC_VERSION_FIELD_3 2609
 
 #ifdef RC_VERSION_FIELD_4
 #undef RC_VERSION_FIELD_4
@@ -28,12 +28,12 @@
 #ifdef RC_FILE_VERSION
 #undef RC_FILE_VERSION
 #endif
-#define RC_FILE_VERSION "1.6.2104.0"
+#define RC_FILE_VERSION "1.9.2609.0"
 
 #ifdef RC_FILE_DESCRIPTION
 #undef RC_FILE_DESCRIPTION
 #endif
-#define RC_FILE_DESCRIPTION "DirectX Compiler - Out Of Band"
+#define RC_FILE_DESCRIPTION "DirectX Compiler - Out Of Band - Preview"
 
 #ifdef RC_COPYRIGHT
 #undef RC_COPYRIGHT
@@ -43,10 +43,25 @@
 #ifdef RC_PRODUCT_NAME
 #undef RC_PRODUCT_NAME
 #endif
-#define RC_PRODUCT_NAME "Microsoft(r) DirectX for Windows(r) - Out Of Band"
+#define RC_PRODUCT_NAME                                                        \
+  "Microsoft(r) DirectX for Windows(r) - Out Of Band - Preview"
 
 #ifdef RC_PRODUCT_VERSION
 #undef RC_PRODUCT_VERSION
 #endif
-#define RC_PRODUCT_VERSION "1.6.2104.0"
+#define RC_PRODUCT_VERSION "1.9.2609.0"
 
+#ifdef HLSL_TOOL_NAME
+#undef HLSL_TOOL_NAME
+#endif
+#define HLSL_TOOL_NAME "dxcoob"
+
+#ifdef HLSL_VERSION_MACRO
+#undef HLSL_VERSION_MACRO
+#endif
+#define HLSL_VERSION_MACRO HLSL_TOOL_NAME " " RC_FILE_VERSION
+
+#ifdef HLSL_LLVM_IDENT
+#undef HLSL_LLVM_IDENT
+#endif
+#define HLSL_LLVM_IDENT HLSL_TOOL_NAME " " RC_PRODUCT_VERSION

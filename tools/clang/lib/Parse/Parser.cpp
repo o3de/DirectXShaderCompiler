@@ -354,7 +354,7 @@ bool Parser::SkipUntil(ArrayRef<tok::TokenKind> Toks, SkipUntilFlags Flags) {
     case tok::semi:
       if (HasFlagsSet(Flags, StopAtSemi))
         return false;
-      // FALL THROUGH.
+      LLVM_FALLTHROUGH; // HLSL Change
     default:
       // Skip this token.
       ConsumeToken();
@@ -587,12 +587,13 @@ bool Parser::ParseTopLevelDecl(DeclGroupPtrTy &Result) {
 
   // HLSL Change Starts - skip legacy effects technique syntax
   case tok::kw_technique:
-    Diag(Tok.getLocation(), diag::warn_hlsl_effect_technique);
-    SkipUntil(tok::l_brace);    // skip through {
-    SkipUntil(tok::r_brace);    // skip through matching }
+    Diag(Tok.getLocation(), diag::warn_hlsl_2026_effects)
+        << /*technique*/ 3 << /*known not possible*/ 1;
+    SkipUntil(tok::l_brace); // skip through {
+    SkipUntil(tok::r_brace); // skip through matching }
     Result = DeclGroupPtrTy();
     return false;
-  // HLSL Change Ends
+    // HLSL Change Ends
 
   default:
     break;
@@ -1414,9 +1415,7 @@ Parser::TryAnnotateName(bool IsAddressOfOperand,
     if (TryAnnotateTypeOrScopeTokenAfterScopeSpec(EnteringContext, false, SS,
                                                   !WasScopeAnnotation))
       return ANK_Error;
-    // HLSL Change Starts - allow implicitly annotated templates
-    return (Tok.isNot(tok::annot_typename) || SS.isInvalid()) ? ANK_Unresolved : ANK_Success;
-    // HLSL Change End
+    return ANK_Unresolved;
   }
 
   IdentifierInfo *Name = Tok.getIdentifierInfo();
@@ -1507,7 +1506,7 @@ Parser::TryAnnotateName(bool IsAddressOfOperand,
         AnnotateScopeToken(SS, !WasScopeAnnotation);
       return ANK_TemplateName;
     }
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
   case Sema::NC_VarTemplate:
   case Sema::NC_FunctionTemplate: {
     // We have a type, variable or function template followed by '<'.
@@ -1833,6 +1832,7 @@ bool Parser::isTokenEqualOrEqualTypo() {
     Diag(Tok, diag::err_invalid_token_after_declarator_suggest_equal)
         << Kind
         << FixItHint::CreateReplacement(SourceRange(Tok.getLocation()), "=");
+    LLVM_FALLTHROUGH; // HLSL Change
   case tok::equal:
     return true;
   }

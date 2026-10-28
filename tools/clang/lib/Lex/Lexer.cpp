@@ -229,7 +229,7 @@ void Lexer::Stringify(SmallVectorImpl<char> &Str) {
 /// \brief Slow case of getSpelling. Extract the characters comprising the
 /// spelling of this token from the provided input buffer.
 static size_t getSpellingSlow(const Token &Tok, const char *BufPtr,
-                              const LangOptions &LangOpts, _Out_cap_x_(Tok.getLength()) char *Spelling) {
+                              const LangOptions &LangOpts, char *Spelling) {
   assert(Tok.needsCleaning() && "getSpellingSlow called on simple token");
 
   size_t Length = 0;
@@ -480,7 +480,7 @@ static SourceLocation getBeginningOfFileToken(SourceLocation Loc,
   }
   
   // Create a lexer starting at the beginning of this token.
-  SourceLocation LexerStartLoc = Loc.getLocWithOffset(-LocInfo.second);
+  SourceLocation LexerStartLoc = Loc.getLocWithOffset(~LocInfo.second + 1);
   Lexer TheLexer(LexerStartLoc, LangOpts, BufStart, LexStart, Buffer.end());
   TheLexer.SetCommentRetentionState(true);
   
@@ -2467,7 +2467,7 @@ void Lexer::ReadToEndOfLine(SmallVectorImpl<char> *Result) {
           Result->push_back(Char);
         break;
       }
-      // FALL THROUGH.
+      LLVM_FALLTHROUGH; // HLSL Change
     case '\r':
     case '\n':
       // Okay, we found the end of the line. First, back up past the \0, \r, \n.
@@ -2737,7 +2737,7 @@ uint32_t Lexer::tryReadUCN(const char *&StartPtr, const char *SlashLoc,
     char C = getCharAndSize(CurPtr, CharSize);
 
     unsigned Value = llvm::hexDigitValue(C);
-    if (Value == -1U) {
+    if (Value == std::numeric_limits<unsigned>::max()) {
       if (Result && !isLexingRawMode()) {
         if (i == 0) {
           Diag(BufferPtr, diag::warn_ucn_escape_no_digits)
@@ -3179,6 +3179,7 @@ LexNextToken:
       return LexCharConstant(Result, ConsumeChar(CurPtr, SizeTmp, Result),
                              tok::wide_char_constant);
     // FALL THROUGH, treating L like the start of an identifier.
+    LLVM_FALLTHROUGH; // HLSL Change
 
   // C99 6.4.2: Identifiers.
   case 'A': case 'B': case 'C': case 'D': case 'E': case 'F': case 'G':

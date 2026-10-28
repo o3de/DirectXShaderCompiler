@@ -17,9 +17,9 @@
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/IRBuilder.h"
 
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
@@ -64,6 +64,8 @@ bool CanSimplify(const llvm::Function *F) {
       break;
     case OP::OpCodeClass::Tertiary:
       return true;
+    case OP::OpCodeClass::VectorReduce:
+      return true;
     }
   }
 
@@ -75,9 +77,7 @@ bool CanSimplify(const llvm::Function *F) {
 ///
 /// If this call could not be simplified returns null.
 Value *SimplifyDxilCall(llvm::Function *F, ArrayRef<Value *> Args,
-                        llvm::Instruction *I,
-                        bool MayInsert)
-{
+                        llvm::Instruction *I, bool MayInsert) {
   if (!F->getParent()->HasDxilModule()) {
     assert(!OP::IsDxilOpFunc(F) && "dx.op function with no dxil module?");
     return nullptr;
@@ -172,6 +172,38 @@ Value *SimplifyDxilCall(llvm::Function *F, ArrayRef<Value *> Args,
       }
     }
     return nullptr;
+  } break;
+  case DXIL::OpCode::UMax: {
+    Value *op0 = Args[DXIL::OperandIndex::kBinarySrc0OpIdx];
+    Value *op1 = Args[DXIL::OperandIndex::kBinarySrc1OpIdx];
+    Constant *zero = ConstantInt::get(op0->getType(), 0);
+    if (op0 == zero)
+      return op1;
+    if (op1 == zero)
+      return op0;
+    return nullptr;
+  } break;
+  case DXIL::OpCode::VectorReduceAnd:
+  case DXIL::OpCode::VectorReduceOr: {
+    Value *Op = Args[DXIL::OperandIndex::kUnarySrc0OpIdx];
+    Constant *VecC = dyn_cast<Constant>(Op);
+    if (!VecC || !Op->getType()->isVectorTy())
+      return nullptr;
+    unsigned NumElts = Op->getType()->getVectorNumElements();
+    if (NumElts == 0)
+      return nullptr;
+    Constant *Result = VecC->getAggregateElement(0u);
+    if (!Result)
+      return nullptr;
+    for (unsigned i = 1; i < NumElts; ++i) {
+      Constant *Elt = VecC->getAggregateElement(i);
+      if (!Elt)
+        return nullptr;
+      Result = (opcode == DXIL::OpCode::VectorReduceAnd)
+                   ? ConstantExpr::getAnd(Result, Elt)
+                   : ConstantExpr::getOr(Result, Elt);
+    }
+    return Result;
   } break;
   }
 }

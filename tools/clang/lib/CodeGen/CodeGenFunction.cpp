@@ -172,6 +172,9 @@ TypeEvaluationKind CodeGenFunction::getEvaluationKind(QualType type) {
     case Type::Atomic:
       type = cast<AtomicType>(type)->getValueType();
       continue;
+    case Type::AttributedLinAlgMatrix:
+      type = cast<AttributedLinAlgMatrixType>(type)->getWrappedType();
+      continue;
     }
     llvm_unreachable("unknown type kind!");
   }
@@ -1088,8 +1091,9 @@ void CodeGenFunction::EmitBranchOnBoolExpr(const Expr *Cond,
       }
 
       // HLSL Change Begins.
-      if (getLangOpts().HLSL) {
-        // HLSL don't short circuit.
+      if (getLangOpts().HLSL &&
+          getLangOpts().HLSLVersion < hlsl::LangStd::v2021) {
+        // HLSL does not short circuit by default.
         // Emit the code with the fully general case.
         llvm::Value *CondV;
         {
@@ -1148,8 +1152,9 @@ void CodeGenFunction::EmitBranchOnBoolExpr(const Expr *Cond,
       }
 
       // HLSL Change Begins.
-      if (getLangOpts().HLSL) {
-        // HLSL don't short circuit.
+      if (getLangOpts().HLSL &&
+          getLangOpts().HLSLVersion < hlsl::LangStd::v2021) {
+        // HLSL does not short circuit by default.
         // Emit the code with the fully general case.
         llvm::Value *CondV;
         {
@@ -1670,6 +1675,7 @@ void CodeGenFunction::EmitVariablyModifiedType(QualType type) {
     case Type::TypeOf:
     case Type::UnaryTransform:
     case Type::Attributed:
+    case Type::AttributedLinAlgMatrix: // HLSL Change
     case Type::SubstTemplateTypeParm:
     case Type::PackExpansion:
       // Keep walking after single level desugaring.

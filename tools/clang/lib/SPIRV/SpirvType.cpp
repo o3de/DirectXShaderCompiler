@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/SPIRV/SpirvType.h"
-
+#include "clang/SPIRV/SpirvInstruction.h"
 #include <sstream>
 
 namespace clang {
@@ -92,6 +92,11 @@ bool SpirvType::isResourceType(const SpirvType *type) {
       isa<AccelerationStructureTypeNV>(type))
     return true;
 
+  if (auto *UTP = dyn_cast<UntypedPointerKHRType>(type))
+    return UTP->getStorageClass() == spv::StorageClass::UniformConstant ||
+           UTP->getStorageClass() == spv::StorageClass::Uniform ||
+           UTP->getStorageClass() == spv::StorageClass::StorageBuffer;
+
   if (const auto *structType = dyn_cast<StructType>(type))
     return structType->getInterfaceType() !=
            StructInterfaceType::InternalStorage;
@@ -167,14 +172,39 @@ bool RuntimeArrayType::operator==(const RuntimeArrayType &that) const {
          (!stride.hasValue() || stride.getValue() == that.stride.getValue());
 }
 
+bool NodePayloadArrayType::operator==(const NodePayloadArrayType &that) const {
+  return elementType == that.elementType && nodeDecl == that.nodeDecl;
+}
+
+bool SpvIntrinsicTypeOperand::operator==(
+    const SpvIntrinsicTypeOperand &that) const {
+  if (isTypeOperand != that.isTypeOperand)
+    return false;
+
+  if (isTypeOperand) {
+    return operand_as_type == that.operand_as_type;
+  } else {
+    auto constantInst = dyn_cast<SpirvConstant>(operand_as_inst);
+    assert(constantInst != nullptr);
+    auto thatConstantInst = dyn_cast<SpirvConstant>(that.operand_as_inst);
+    assert(thatConstantInst != nullptr);
+    return *constantInst == *thatConstantInst;
+  }
+}
+
+SpirvIntrinsicType::SpirvIntrinsicType(
+    unsigned typeOp, llvm::ArrayRef<SpvIntrinsicTypeOperand> inOps)
+    : SpirvType(TK_SpirvIntrinsicType, "spirvIntrinsicType"),
+      typeOpCode(typeOp), operands(inOps.begin(), inOps.end()) {}
+
 StructType::StructType(llvm::ArrayRef<StructType::FieldInfo> fieldsVec,
                        llvm::StringRef name, bool isReadOnly,
                        StructInterfaceType iface)
     : SpirvType(TK_Struct, name), fields(fieldsVec.begin(), fieldsVec.end()),
       readOnly(isReadOnly), interfaceType(iface) {}
 
-bool StructType::FieldInfo::
-operator==(const StructType::FieldInfo &that) const {
+bool StructType::FieldInfo::operator==(
+    const StructType::FieldInfo &that) const {
   return type == that.type && offset.hasValue() == that.offset.hasValue() &&
          matrixStride.hasValue() == that.matrixStride.hasValue() &&
          isRowMajor.hasValue() == that.isRowMajor.hasValue() &&

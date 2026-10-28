@@ -1,9 +1,7 @@
 # Copyright (C) Microsoft Corporation. All rights reserved.
 # This file is distributed under the University of Illinois Open Source License. See LICENSE.TXT for details.
-set(LLVM_LINK_COMPONENTS
-  ${LLVM_TARGETS_TO_BUILD}
-  passprinters
-)
+
+add_hlsl_hctgen(DxcOptimizer OUTPUT DxcOptimizer.inc BUILD_DIR)
 
 add_llvm_library(LLVMHLSL
   ComputeViewIdState.cpp
@@ -27,13 +25,13 @@ add_llvm_library(LLVMHLSL
   DxilNoops.cpp
   DxilPreserveAllOutputs.cpp
   DxilRenameResourcesPass.cpp
+  DxilScalarizeVectorIntrinsics.cpp
   DxilSimpleGVNHoist.cpp
   DxilSignatureValidation.cpp
   DxilTargetLowering.cpp
   DxilTargetTransformInfo.cpp
   DxilTranslateRawBuffer.cpp
   DxilExportMap.cpp
-  DxilValidation.cpp
   DxcOptimizer.cpp
   HLDeadFunctionElimination.cpp
   HLExpandStoreIntrinsics.cpp
@@ -55,6 +53,8 @@ add_llvm_library(LLVMHLSL
   PauseResumePasses.cpp
   WaveSensitivityAnalysis.cpp
   DxilNoOptLegalize.cpp
+  DxilPoisonValues.cpp
+  DxilDeleteRedundantDebugValues.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/IR

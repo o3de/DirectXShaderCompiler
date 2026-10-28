@@ -9,28 +9,32 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-
-#include "dxc/DXIL/DxilTypeSystem.h"
 #include "dxc/DXIL/DxilUtil.h"
+#include "dxc/DXIL/DxilConstants.h"
+#include "dxc/DXIL/DxilInstructions.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilTypeSystem.h"
 #include "dxc/HLSL/DxilConvergentName.h"
 #include "dxc/Support/Global.h"
+
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
-#include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/DiagnosticPrinter.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DIBuilder.h"
-#include "llvm/IR/IRBuilder.h"
 
 using namespace llvm;
 using namespace hlsl;
@@ -63,10 +67,9 @@ bool HasDynamicIndexing(Value *V) {
   return false;
 }
 
-unsigned
-GetLegacyCBufferFieldElementSize(DxilFieldAnnotation &fieldAnnotation,
-                                           llvm::Type *Ty,
-                                           DxilTypeSystem &typeSys) {
+unsigned GetLegacyCBufferFieldElementSize(DxilFieldAnnotation &fieldAnnotation,
+                                          llvm::Type *Ty,
+                                          DxilTypeSystem &typeSys) {
 
   while (isa<ArrayType>(Ty)) {
     Ty = Ty->getArrayElementType();
@@ -74,10 +77,12 @@ GetLegacyCBufferFieldElementSize(DxilFieldAnnotation &fieldAnnotation,
 
   // Bytes.
   CompType compType = fieldAnnotation.GetCompType();
-  unsigned compSize = compType.Is64Bit() ? 8 : compType.Is16Bit() && !typeSys.UseMinPrecision() ? 2 : 4;
+  unsigned compSize = compType.Is64Bit()                                 ? 8
+                      : compType.Is16Bit() && !typeSys.UseMinPrecision() ? 2
+                                                                         : 4;
   unsigned fieldSize = compSize;
   if (Ty->isVectorTy()) {
-    fieldSize *= Ty->getVectorNumElements();
+    fieldSize *= cast<FixedVectorType>(Ty)->getNumElements();
   } else if (StructType *ST = dyn_cast<StructType>(Ty)) {
     DxilStructAnnotation *EltAnnotation = typeSys.GetStructAnnotation(ST);
     if (EltAnnotation) {
@@ -121,7 +126,7 @@ bool RemoveUnusedFunctions(Module &M, Function *EntryFunc,
   for (auto &F : M.functions()) {
     if (&F == EntryFunc || &F == PatchConstantFunc)
       continue;
-    if (F.isDeclaration() || !IsLib) {
+    if (F.isDeclaration() || !IsLib || F.hasInternalLinkage()) {
       if (F.user_empty())
         deadList.emplace_back(&F);
     }
@@ -152,7 +157,8 @@ StringRef DemangleFunctionName(StringRef name) {
 std::string ReplaceFunctionName(StringRef originalName, StringRef newName) {
   if (originalName.startswith(ManglingPrefix)) {
     return (Twine(ManglingPrefix) + newName +
-      originalName.substr(originalName.find_first_of('@'))).str();
+            originalName.substr(originalName.find_first_of('@')))
+        .str();
   } else if (originalName.startswith(EntryPrefix)) {
     return (Twine(EntryPrefix) + newName).str();
   }
@@ -178,11 +184,11 @@ void PrintUnescapedString(StringRef Name, raw_ostream &Out) {
     if (C == '\\') {
       C = Name[++i];
       unsigned value = hexDigitValue(C);
-      if (value != -1U) {
+      if (value != ~0U) {
         C = (unsigned char)value;
-        unsigned value2 = hexDigitValue(Name[i+1]);
-        assert(value2 != -1U && "otherwise, not a two digit hex escape");
-        if (value2 != -1U) {
+        unsigned value2 = hexDigitValue(Name[i + 1]);
+        assert(value2 != ~0U && "otherwise, not a two digit hex escape");
+        if (value2 != ~0U) {
           C = (C << 4) + (unsigned char)value2;
           ++i;
         }
@@ -190,179 +196,6 @@ void PrintUnescapedString(StringRef Name, raw_ostream &Out) {
     }
     Out << C;
   }
-}
-
-std::unique_ptr<llvm::Module> LoadModuleFromBitcode(llvm::MemoryBuffer *MB,
-  llvm::LLVMContext &Ctx,
-  std::string &DiagStr) {
-  // Note: the DiagStr is not used.
-  auto pModule = llvm::parseBitcodeFile(MB->getMemBufferRef(), Ctx);
-  if (!pModule) {
-    return nullptr;
-  }
-  return std::unique_ptr<llvm::Module>(pModule.get().release());
-}
-
-std::unique_ptr<llvm::Module> LoadModuleFromBitcodeLazy(std::unique_ptr<llvm::MemoryBuffer> &&MB,
-  llvm::LLVMContext &Ctx, std::string &DiagStr)
-{
-  // Note: the DiagStr is not used.
-  auto pModule = llvm::getLazyBitcodeModule(std::move(MB), Ctx, nullptr, true);
-  if (!pModule) {
-    return nullptr;
-  }
-  return std::unique_ptr<llvm::Module>(pModule.get().release());
-}
-
-std::unique_ptr<llvm::Module> LoadModuleFromBitcode(llvm::StringRef BC,
-  llvm::LLVMContext &Ctx,
-  std::string &DiagStr) {
-  std::unique_ptr<llvm::MemoryBuffer> pBitcodeBuf(
-    llvm::MemoryBuffer::getMemBuffer(BC, "", false));
-  return LoadModuleFromBitcode(pBitcodeBuf.get(), Ctx, DiagStr);
-}
-
-
-DIGlobalVariable *FindGlobalVariableDebugInfo(GlobalVariable *GV,
-                                              DebugInfoFinder &DbgInfoFinder) {
-  struct GlobalFinder {
-    GlobalVariable *GV;
-    bool operator()(llvm::DIGlobalVariable *const arg) const {
-      return arg->getVariable() == GV;
-    }
-  };
-  GlobalFinder F = {GV};
-  DebugInfoFinder::global_variable_iterator Found =
-      std::find_if(DbgInfoFinder.global_variables().begin(),
-                   DbgInfoFinder.global_variables().end(), F);
-  if (Found != DbgInfoFinder.global_variables().end()) {
-    return *Found;
-  }
-  return nullptr;
-}
-
-static void EmitWarningOrErrorOnInstruction(Instruction *I, Twine Msg,
-                                            DiagnosticSeverity severity);
-
-// If we don't have debug location and this is select/phi,
-// try recursing users to find instruction with debug info.
-// Only recurse phi/select and limit depth to prevent doing
-// too much work if no debug location found.
-static bool EmitWarningOrErrorOnInstructionFollowPhiSelect(Instruction *I,
-                                                           Twine Msg,
-                                                           DiagnosticSeverity severity,
-                                                           unsigned depth = 0) {
-  if (depth > 4)
-    return false;
-  if (I->getDebugLoc().get()) {
-    EmitWarningOrErrorOnInstruction(I, Msg, severity);
-    return true;
-  }
-  if (isa<PHINode>(I) || isa<SelectInst>(I)) {
-    for (auto U : I->users())
-      if (Instruction *UI = dyn_cast<Instruction>(U))
-        if (EmitWarningOrErrorOnInstructionFollowPhiSelect(UI, Msg, severity,
-                                                           depth + 1))
-          return true;
-  }
-  return false;
-}
-
-static void EmitWarningOrErrorOnInstruction(Instruction *I, Twine Msg,
-                                            DiagnosticSeverity severity) {
-  const DebugLoc &DL = I->getDebugLoc();
-  if (!DL.get() && (isa<PHINode>(I) || isa<SelectInst>(I))) {
-    if (EmitWarningOrErrorOnInstructionFollowPhiSelect(I, Msg, severity))
-      return;
-  }
-
-  I->getContext().diagnose(DiagnosticInfoDxil(I->getParent()->getParent(),
-                                              DL.get(), Msg, severity));
-}
-
-void EmitErrorOnInstruction(Instruction *I, Twine Msg) {
-  EmitWarningOrErrorOnInstruction(I, Msg, DiagnosticSeverity::DS_Error);
-}
-
-void EmitWarningOnInstruction(Instruction *I, Twine Msg) {
-  EmitWarningOrErrorOnInstruction(I, Msg, DiagnosticSeverity::DS_Warning);
-}
-
-static void EmitWarningOrErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg,
-                                         DiagnosticSeverity severity) {
-  DILocation *DLoc = nullptr;
-
-  if (DISubprogram *DISP = getDISubprogram(F)) {
-    DLoc = DILocation::get(F->getContext(), DISP->getLine(), 0,
-                           DISP, nullptr /*InlinedAt*/);
-  }
-  Ctx.diagnose(DiagnosticInfoDxil(F, DLoc, Msg, severity));
-}
-
-void EmitErrorOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
-  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Error);
-}
-
-void EmitWarningOnFunction(llvm::LLVMContext &Ctx, Function *F, Twine Msg) {
-  EmitWarningOrErrorOnFunction(Ctx, F, Msg, DiagnosticSeverity::DS_Warning);
-}
-
-static void EmitWarningOrErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV,
-                                               Twine Msg, DiagnosticSeverity severity) {
-  DIVariable *DIV = nullptr;
-
-  DILocation *DLoc = nullptr;
-
-  if (GV) {
-    Module &M = *GV->getParent();
-    if (hasDebugInfo(M)) {
-      DebugInfoFinder FinderObj;
-      DebugInfoFinder &Finder = FinderObj;
-      // Debug modules have no dxil modules. Use it if you got it.
-      if (M.HasDxilModule())
-        Finder = M.GetDxilModule().GetOrCreateDebugInfoFinder();
-      else
-        Finder.processModule(M);
-      DIV = FindGlobalVariableDebugInfo(GV, Finder);
-      if (DIV)
-        DLoc = DILocation::get(GV->getContext(), DIV->getLine(), 0,
-                               DIV->getScope(), nullptr /*InlinedAt*/);
-    }
-  }
-
-  Ctx.diagnose(DiagnosticInfoDxil(nullptr /*Function*/, DLoc, Msg, severity));
-}
-
-void EmitErrorOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
-  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Error);
-}
-
-void EmitWarningOnGlobalVariable(llvm::LLVMContext &Ctx, GlobalVariable *GV, Twine Msg) {
-  EmitWarningOrErrorOnGlobalVariable(Ctx, GV, Msg, DiagnosticSeverity::DS_Warning);
-}
-
-const char *kResourceMapErrorMsg =
-    "local resource not guaranteed to map to unique global resource.";
-void EmitResMappingError(Instruction *Res) {
-  EmitErrorOnInstruction(Res, kResourceMapErrorMsg);
-}
-
-// Mostly just a locationless diagnostic output
-static void EmitWarningOrErrorOnContext(LLVMContext &Ctx, Twine Msg, DiagnosticSeverity severity) {
-  Ctx.diagnose(DiagnosticInfoDxil(nullptr /*Func*/, nullptr /*DLoc*/,
-                                  Msg, severity));
-}
-
-void EmitErrorOnContext(LLVMContext &Ctx, Twine Msg) {
-  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Error);
-}
-
-void EmitWarningOnContext(LLVMContext &Ctx, Twine Msg) {
-  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Warning);
-}
-
-void EmitNoteOnContext(LLVMContext &Ctx, Twine Msg) {
-  EmitWarningOrErrorOnContext(Ctx, Msg, DiagnosticSeverity::DS_Note);
 }
 
 void CollectSelect(llvm::Instruction *Inst,
@@ -392,7 +225,7 @@ void CollectSelect(llvm::Instruction *Inst,
 }
 
 Value *MergeSelectOnSameValue(Instruction *SelInst, unsigned startOpIdx,
-                            unsigned numOperands) {
+                              unsigned numOperands) {
   Value *op0 = nullptr;
   for (unsigned i = startOpIdx; i < numOperands; i++) {
     Value *op = SelInst->getOperand(i);
@@ -432,83 +265,16 @@ bool SimplifyTrivialPHIs(BasicBlock *BB) {
   return Changed;
 }
 
-llvm::BasicBlock *GetSwitchSuccessorForCond(llvm::SwitchInst *Switch,llvm::ConstantInt *Cond) {
-  for (auto it = Switch->case_begin(), end = Switch->case_end(); it != end; it++) {
+llvm::BasicBlock *GetSwitchSuccessorForCond(llvm::SwitchInst *Switch,
+                                            llvm::ConstantInt *Cond) {
+  for (auto it = Switch->case_begin(), end = Switch->case_end(); it != end;
+       it++) {
     if (it.getCaseValue() == Cond) {
       return it.getCaseSuccessor();
       break;
     }
   }
   return Switch->getDefaultDest();
-}
-
-static DbgValueInst *FindDbgValueInst(Value *Val) {
-  if (auto *ValAsMD = LocalAsMetadata::getIfExists(Val)) {
-    if (auto *ValMDAsVal = MetadataAsValue::getIfExists(Val->getContext(), ValAsMD)) {
-      for (User *ValMDUser : ValMDAsVal->users()) {
-        if (DbgValueInst *DbgValInst = dyn_cast<DbgValueInst>(ValMDUser))
-          return DbgValInst;
-      }
-    }
-  }
-  return nullptr;
-}
-
-void MigrateDebugValue(Value *Old, Value *New) {
-  DbgValueInst *DbgValInst = FindDbgValueInst(Old);
-  if (DbgValInst == nullptr) return;
-  
-  DbgValInst->setOperand(0, MetadataAsValue::get(New->getContext(), ValueAsMetadata::get(New)));
-
-  // Move the dbg value after the new instruction
-  if (Instruction *NewInst = dyn_cast<Instruction>(New)) {
-    if (NewInst->getNextNode() != DbgValInst) {
-      DbgValInst->removeFromParent();
-      DbgValInst->insertAfter(NewInst);
-    }
-  }
-}
-
-// Propagates any llvm.dbg.value instruction for a given vector
-// to the elements that were used to create it through a series
-// of insertelement instructions.
-//
-// This is used after lowering a vector-returning intrinsic.
-// If we just keep the debug info on the recomposed vector,
-// we will lose it when we break it apart again during later
-// optimization stages.
-void TryScatterDebugValueToVectorElements(Value *Val) {
-  if (!isa<InsertElementInst>(Val) || !Val->getType()->isVectorTy()) return;
-
-  DbgValueInst *VecDbgValInst = FindDbgValueInst(Val);
-  if (VecDbgValInst == nullptr) return;
-
-  Type *ElemTy = Val->getType()->getVectorElementType();
-  DIBuilder DbgInfoBuilder(*VecDbgValInst->getModule());
-  unsigned ElemSizeInBits = VecDbgValInst->getModule()->getDataLayout().getTypeSizeInBits(ElemTy);
-
-  DIExpression *ParentBitPiece = VecDbgValInst->getExpression();
-  if (ParentBitPiece != nullptr && !ParentBitPiece->isBitPiece())
-    ParentBitPiece = nullptr;
-
-  while (InsertElementInst *InsertElt = dyn_cast<InsertElementInst>(Val)) {
-    Value *NewElt = InsertElt->getOperand(1);
-    unsigned EltIdx = static_cast<unsigned>(cast<ConstantInt>(InsertElt->getOperand(2))->getLimitedValue());
-    unsigned OffsetInBits = EltIdx * ElemSizeInBits;
-
-    if (ParentBitPiece) {
-      assert(OffsetInBits + ElemSizeInBits <= ParentBitPiece->getBitPieceSize()
-        && "Nested bit piece expression exceeds bounds of its parent.");
-      OffsetInBits += ParentBitPiece->getBitPieceOffset();
-    }
-
-    DIExpression *DIExpr = DbgInfoBuilder.createBitPieceExpression(OffsetInBits, ElemSizeInBits);
-    // Offset is basically unused and deprecated in later LLVM versions.
-    // Emit it as zero otherwise later versions of the bitcode reader will drop the intrinsic.
-    DbgInfoBuilder.insertDbgValueIntrinsic(NewElt, /* Offset */ 0, VecDbgValInst->getVariable(),
-      DIExpr, VecDbgValInst->getDebugLoc(), InsertElt);
-    Val = InsertElt->getOperand(0);
-  }
 }
 
 Value *SelectOnOperation(llvm::Instruction *Inst, unsigned operandIdx) {
@@ -558,31 +324,32 @@ llvm::Instruction *SkipAllocas(llvm::Instruction *I) {
     I = I->getNextNode();
   return I;
 }
-llvm::Instruction *FindAllocaInsertionPt(llvm::BasicBlock* BB) {
+llvm::Instruction *FindAllocaInsertionPt(llvm::BasicBlock *BB) {
   return &*BB->getFirstInsertionPt();
 }
-llvm::Instruction *FindAllocaInsertionPt(llvm::Function* F) {
+llvm::Instruction *FindAllocaInsertionPt(llvm::Function *F) {
   return FindAllocaInsertionPt(&F->getEntryBlock());
 }
-llvm::Instruction *FindAllocaInsertionPt(llvm::Instruction* I) {
+llvm::Instruction *FindAllocaInsertionPt(llvm::Instruction *I) {
   Function *F = I->getParent()->getParent();
   if (F)
     return FindAllocaInsertionPt(F);
   else // BB with no parent function
     return FindAllocaInsertionPt(I->getParent());
 }
-llvm::Instruction *FirstNonAllocaInsertionPt(llvm::Instruction* I) {
+llvm::Instruction *FirstNonAllocaInsertionPt(llvm::Instruction *I) {
   return SkipAllocas(FindAllocaInsertionPt(I));
 }
-llvm::Instruction *FirstNonAllocaInsertionPt(llvm::BasicBlock* BB) {
+llvm::Instruction *FirstNonAllocaInsertionPt(llvm::BasicBlock *BB) {
   return SkipAllocas(FindAllocaInsertionPt(BB));
 }
-llvm::Instruction *FirstNonAllocaInsertionPt(llvm::Function* F) {
+llvm::Instruction *FirstNonAllocaInsertionPt(llvm::Function *F) {
   return SkipAllocas(FindAllocaInsertionPt(F));
 }
 
 static bool ConsumePrefix(StringRef &Str, StringRef Prefix) {
-  if (!Str.startswith(Prefix)) return false;
+  if (!Str.startswith(Prefix))
+    return false;
   Str = Str.substr(Prefix.size());
   return true;
 }
@@ -599,12 +366,12 @@ bool IsResourceSingleComponent(Type *Ty) {
       return false;
     }
     return IsResourceSingleComponent(structType->getStructElementType(0));
-  } else if (llvm::VectorType *vectorType =
-                 llvm::dyn_cast<llvm::VectorType>(Ty)) {
+  } else if (llvm::FixedVectorType *vectorType =
+                 llvm::dyn_cast<llvm::FixedVectorType>(Ty)) {
     if (vectorType->getNumElements() > 1) {
       return false;
     }
-    return IsResourceSingleComponent(vectorType->getVectorElementType());
+    return IsResourceSingleComponent(vectorType->getElementType());
   }
   return true;
 }
@@ -616,13 +383,13 @@ uint8_t GetResourceComponentCount(llvm::Type *Ty) {
   } else if (llvm::StructType *structType =
                  llvm::dyn_cast<llvm::StructType>(Ty)) {
     uint32_t Count = 0;
-    for (Type *EltTy : structType->elements())  {
+    for (Type *EltTy : structType->elements()) {
       Count += GetResourceComponentCount(EltTy);
     }
     DXASSERT(Count <= 4, "Component Count out of bound.");
     return Count;
-  } else if (llvm::VectorType *vectorType =
-                 llvm::dyn_cast<llvm::VectorType>(Ty)) {
+  } else if (llvm::FixedVectorType *vectorType =
+                 llvm::dyn_cast<llvm::FixedVectorType>(Ty)) {
     return vectorType->getNumElements();
   }
   return 1;
@@ -632,7 +399,9 @@ bool IsHLSLResourceType(llvm::Type *Ty) {
   return GetHLSLResourceProperties(Ty).first;
 }
 
-static DxilResourceProperties MakeResourceProperties(hlsl::DXIL::ResourceKind Kind, bool UAV, bool ROV, bool Cmp) {
+static DxilResourceProperties
+MakeResourceProperties(hlsl::DXIL::ResourceKind Kind, bool UAV, bool ROV,
+                       bool Cmp) {
   DxilResourceProperties Ret = {};
   Ret.Basic.IsROV = ROV;
   Ret.Basic.SamplerCmpOrHasCounter = Cmp;
@@ -641,10 +410,10 @@ static DxilResourceProperties MakeResourceProperties(hlsl::DXIL::ResourceKind Ki
   return Ret;
 }
 
-std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty)
-{
-   using RetType = std::pair<bool, DxilResourceProperties>;
-   RetType FalseRet(false, DxilResourceProperties{});
+std::pair<bool, DxilResourceProperties>
+GetHLSLResourceProperties(llvm::Type *Ty) {
+  using RetType = std::pair<bool, DxilResourceProperties>;
+  RetType FalseRet(false, DxilResourceProperties{});
 
   if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
     if (!ST->hasName())
@@ -655,25 +424,42 @@ std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty
     ConsumePrefix(name, "struct.");
 
     if (name == "SamplerState")
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Sampler, false, false, false));
+      return RetType(true,
+                     MakeResourceProperties(hlsl::DXIL::ResourceKind::Sampler,
+                                            false, false, false));
 
     if (name == "SamplerComparisonState")
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Sampler, false, false, /*cmp or counter*/true));
+      return RetType(true, MakeResourceProperties(
+                               hlsl::DXIL::ResourceKind::Sampler, /*UAV*/ false,
+                               /*ROV*/ false, /*cmp or counter*/ true));
 
     if (name.startswith("AppendStructuredBuffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, false, false, /*cmp or counter*/true));
+      return RetType(true,
+                     MakeResourceProperties(
+                         hlsl::DXIL::ResourceKind::StructuredBuffer,
+                         /*UAV*/ true, /*ROV*/ false, /*cmp or counter*/ true));
 
     if (name.startswith("ConsumeStructuredBuffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, false, false, /*cmp or counter*/true));
+      return RetType(true, MakeResourceProperties(
+                               hlsl::DXIL::ResourceKind::StructuredBuffer,
+                               /*UAV*/ true, /*ROV*/ false,
+                               /*cmp or counter*/ true));
 
     if (name == "RaytracingAccelerationStructure")
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::RTAccelerationStructure, false, false, false));
+      return RetType(true,
+                     MakeResourceProperties(
+                         hlsl::DXIL::ResourceKind::RTAccelerationStructure,
+                         /*UAV*/ false, /*ROV*/ false, false));
 
     if (name.startswith("ConstantBuffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::CBuffer, false, false, false));
+      return RetType(
+          true, MakeResourceProperties(hlsl::DXIL::ResourceKind::CBuffer,
+                                       /*UAV*/ false, /*ROV*/ false, false));
 
     if (name.startswith("TextureBuffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TBuffer, false, false, false));
+      return RetType(
+          true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TBuffer,
+                                       /*UAV*/ false, /*ROV*/ false, false));
 
     if (ConsumePrefix(name, "FeedbackTexture2D")) {
       hlsl::DXIL::ResourceKind kind = hlsl::DXIL::ResourceKind::Invalid;
@@ -683,7 +469,9 @@ std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty
         kind = hlsl::DXIL::ResourceKind::FeedbackTexture2D;
 
       if (name.startswith("<"))
-        return RetType(true, MakeResourceProperties(kind, false, false, false));
+        return RetType(true,
+                       MakeResourceProperties(kind, /*UAV*/ false,
+                                              /*ROV*/ false, /*Cmp*/ false));
 
       return FalseRet;
     }
@@ -692,41 +480,65 @@ std::pair<bool, DxilResourceProperties> GetHLSLResourceProperties(llvm::Type *Ty
     bool UAV = ConsumePrefix(name, "RW");
 
     if (name == "ByteAddressBuffer")
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::RawBuffer, UAV, ROV, false));
+      return RetType(true,
+                     MakeResourceProperties(hlsl::DXIL::ResourceKind::RawBuffer,
+                                            UAV, ROV, /*Cmp*/ false));
 
     if (name.startswith("Buffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TypedBuffer, UAV, ROV, false));
+      return RetType(
+          true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TypedBuffer,
+                                       UAV, ROV, /*Cmp*/ false));
 
     if (name.startswith("StructuredBuffer<"))
-      return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::StructuredBuffer, UAV, ROV, false));
+      return RetType(true, MakeResourceProperties(
+                               hlsl::DXIL::ResourceKind::StructuredBuffer, UAV,
+                               ROV, /*Cmp*/ false));
 
     if (ConsumePrefix(name, "Texture")) {
       if (name.startswith("1D<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture1D, UAV, ROV, false));
+        return RetType(
+            true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture1D,
+                                         UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("1DArray<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture1DArray, UAV, ROV, false));
+        return RetType(true, MakeResourceProperties(
+                                 hlsl::DXIL::ResourceKind::Texture1DArray, UAV,
+                                 ROV, /*Cmp*/ false));
 
       if (name.startswith("2D<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2D, UAV, ROV, false));
+        return RetType(
+            true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2D,
+                                         UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("2DArray<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DArray, UAV, ROV, false));
+        return RetType(true, MakeResourceProperties(
+                                 hlsl::DXIL::ResourceKind::Texture2DArray, UAV,
+                                 ROV, /*Cmp*/ false));
 
       if (name.startswith("3D<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture3D, UAV, ROV, false));
+        return RetType(
+            true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture3D,
+                                         UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("Cube<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TextureCube, UAV, ROV, false));
+        return RetType(
+            true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TextureCube,
+                                         UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("CubeArray<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::TextureCubeArray, UAV, ROV, false));
+        return RetType(true, MakeResourceProperties(
+                                 hlsl::DXIL::ResourceKind::TextureCubeArray,
+                                 UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("2DMS<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DMS, UAV, ROV, false));
+        return RetType(
+            true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DMS,
+                                         UAV, ROV, /*Cmp*/ false));
 
       if (name.startswith("2DMSArray<"))
-        return RetType(true, MakeResourceProperties(hlsl::DXIL::ResourceKind::Texture2DMSArray, UAV, ROV, false));
+        return RetType(true, MakeResourceProperties(
+                                 hlsl::DXIL::ResourceKind::Texture2DMSArray,
+                                 UAV, ROV, /*Cmp*/ false));
       return FalseRet;
     }
   }
@@ -762,6 +574,15 @@ bool IsHLSLObjectType(llvm::Type *Ty) {
       return true;
     if (name.startswith("LineStream<"))
       return true;
+
+    if (IsHLSLNodeIOType(Ty))
+      return true;
+
+    if (IsHLSLHitObjectType(Ty))
+      return true;
+
+    if (IsHLSLLinAlgMatrixType(Ty))
+      return true;
   }
   return false;
 }
@@ -779,20 +600,223 @@ bool IsHLSLRayQueryType(llvm::Type *Ty) {
   return false;
 }
 
+llvm::Type *GetHLSLHitObjectType(llvm::Module *M) {
+  using namespace llvm;
+  StructType *HitObjectTy = M->getTypeByName("dx.types.HitObject");
+  if (!HitObjectTy)
+    HitObjectTy = StructType::create({Type::getInt8PtrTy(M->getContext(), 0)},
+                                     "dx.types.HitObject", false);
+  return HitObjectTy;
+}
+
+bool IsHLSLHitObjectType(llvm::Type *Ty) {
+  llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty);
+  if (!ST)
+    return false;
+  if (!ST->hasName())
+    return false;
+  return ST->getName() == "dx.types.HitObject";
+}
+
+bool IsHLSLLinAlgMatrixType(llvm::Type *Ty) {
+  llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty);
+  if (!ST)
+    return false;
+  if (!ST->hasName())
+    return false;
+  return ST->getName().startswith(DXIL::kDxLinAlgMatrixTypePrefix);
+}
+
+StringRef GetHLSLLinAlgMatrixTypeMangling(llvm::StructType *Ty) {
+  return Ty->getStructName().substr(strlen(DXIL::kDxLinAlgMatrixTypePrefix));
+}
+
+bool IsHLSLKnownTargetType(llvm::Type *Ty) {
+  // Currently only LinAlgMatrix types are target types.
+  return IsHLSLLinAlgMatrixType(Ty);
+}
+
 bool IsHLSLResourceDescType(llvm::Type *Ty) {
   if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
     if (!ST->hasName())
       return false;
     StringRef name = ST->getName();
 
+    ConsumePrefix(name, "struct.");
+
     // TODO: don't check names.
-    if (name == ("struct..Resource"))
+    if (name == (".Resource"))
       return true;
 
-    if (name == "struct..Sampler")
+    if (name == ".Sampler")
       return true;
   }
   return false;
+}
+
+bool IsHLSLNodeOutputType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.startswith("NodeOutput<") || name.equals("EmptyNodeOutput"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeOutputArrayType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.startswith("NodeOutputArray<") ||
+        name.equals("EmptyNodeOutputArray"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLEmptyNodeOutputType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.equals("EmptyNodeOutput"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLEmptyNodeOutputArrayType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.equals("EmptyNodeOutputArray"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeInputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.startswith("DispatchNodeInputRecord<") ||
+        name.startswith("RWDispatchNodeInputRecord<") ||
+        name.startswith("GroupNodeInputRecords<") ||
+        name.startswith("RWGroupNodeInputRecords<") ||
+        name.startswith("ThreadNodeInputRecord<") ||
+        name.startswith("RWThreadNodeInputRecord<") ||
+        name.equals("EmptyNodeInput"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeEmptyInputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.equals("EmptyNodeInput"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeEmptyOutputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.equals("EmptyNodeOutput"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLRWNodeInputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    if (name.startswith("RWDispatchNodeInputRecord<") ||
+        name.startswith("RWGroupNodeInputRecords<") ||
+        name.startswith("RWThreadNodeInputRecord<"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeOutputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    ConsumePrefix(name, "struct.");
+
+    // TODO: don't check names.
+    if (name.startswith("GroupNodeOutputRecords<") ||
+        name.startswith("ThreadNodeOutputRecords<"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLGSNodeOutputRecordType(llvm::Type *Ty) {
+  if (llvm::StructType *ST = dyn_cast<llvm::StructType>(Ty)) {
+    if (!ST->hasName())
+      return false;
+    StringRef name = ST->getName();
+
+    if (name.startswith("struct.GroupNodeOutputRecords<"))
+      return true;
+  }
+  return false;
+}
+
+bool IsHLSLNodeRecordType(llvm::Type *Ty) {
+  return IsHLSLNodeOutputRecordType(Ty) || IsHLSLNodeInputRecordType(Ty);
+}
+
+bool IsHLSLNodeIOType(llvm::Type *Ty) {
+  return IsHLSLNodeRecordType(Ty) || IsHLSLNodeOutputType(Ty) ||
+         IsHLSLNodeOutputArrayType(Ty);
 }
 
 bool IsIntegerOrFloatingPointType(llvm::Type *Ty) {
@@ -836,7 +860,9 @@ bool IsSplat(llvm::ConstantDataVector *cdv) {
   return true;
 }
 
-llvm::Type* StripArrayTypes(llvm::Type *Ty, llvm::SmallVectorImpl<unsigned> *OuterToInnerLengths) {
+llvm::Type *
+StripArrayTypes(llvm::Type *Ty,
+                llvm::SmallVectorImpl<unsigned> *OuterToInnerLengths) {
   DXASSERT_NOMSG(Ty);
   while (Ty->isArrayTy()) {
     if (OuterToInnerLengths) {
@@ -846,12 +872,23 @@ llvm::Type* StripArrayTypes(llvm::Type *Ty, llvm::SmallVectorImpl<unsigned> *Out
   }
   return Ty;
 }
-llvm::Type* WrapInArrayTypes(llvm::Type *Ty, llvm::ArrayRef<unsigned> OuterToInnerLengths) {
+llvm::Type *WrapInArrayTypes(llvm::Type *Ty,
+                             llvm::ArrayRef<unsigned> OuterToInnerLengths) {
   DXASSERT_NOMSG(Ty);
-  for (auto it = OuterToInnerLengths.rbegin(), E = OuterToInnerLengths.rend(); it != E; ++it) {
+  for (auto it = OuterToInnerLengths.rbegin(), E = OuterToInnerLengths.rend();
+       it != E; ++it) {
     Ty = ArrayType::get(Ty, *it);
   }
   return Ty;
+}
+
+llvm::Value *MirrorGEP(llvm::GEPOperator *GEP, llvm::Value *NewBasePtr) {
+  IRBuilder<> Builder(GEP->getContext());
+  if (GetElementPtrInst *GEPI = dyn_cast<GetElementPtrInst>(GEP))
+    Builder.SetInsertPoint(GEPI);
+
+  SmallVector<Value *, 4> idxList(GEP->idx_begin(), GEP->idx_end());
+  return Builder.CreateGEP(NewBasePtr, idxList);
 }
 
 namespace {
@@ -922,7 +959,7 @@ void Split64bitValForStore(Type *EltTy, ArrayRef<Value *> vals, unsigned size,
     }
   }
 }
-}
+} // namespace
 
 llvm::CallInst *TranslateCallRawBufferLoadToBufferLoad(
     llvm::CallInst *CI, llvm::Function *newFunction, hlsl::OP *op) {
@@ -936,8 +973,7 @@ llvm::CallInst *TranslateCallRawBufferLoadToBufferLoad(
   return newCall;
 }
 
-void ReplaceRawBufferLoadWithBufferLoad(
-    llvm::Function *F, hlsl::OP *op) {
+void ReplaceRawBufferLoadWithBufferLoad(llvm::Function *F, hlsl::OP *op) {
   Type *RTy = F->getReturnType();
   if (StructType *STy = dyn_cast<StructType>(RTy)) {
     Type *ETy = STy->getElementType(0);
@@ -945,7 +981,8 @@ void ReplaceRawBufferLoadWithBufferLoad(
     for (auto U = F->user_begin(), E = F->user_end(); U != E;) {
       User *user = *(U++);
       if (CallInst *CI = dyn_cast<CallInst>(user)) {
-        CallInst *newCall = TranslateCallRawBufferLoadToBufferLoad(CI, newFunction, op);
+        CallInst *newCall =
+            TranslateCallRawBufferLoadToBufferLoad(CI, newFunction, op);
         CI->replaceAllUsesWith(newCall);
         CI->eraseFromParent();
       } else {
@@ -956,7 +993,6 @@ void ReplaceRawBufferLoadWithBufferLoad(
     DXASSERT(false, "RawBufferLoad should return struct type.");
   }
 }
-
 
 llvm::CallInst *TranslateCallRawBufferStoreToBufferStore(
     llvm::CallInst *CI, llvm::Function *newFunction, hlsl::OP *op) {
@@ -971,7 +1007,8 @@ llvm::CallInst *TranslateCallRawBufferStoreToBufferStore(
 }
 
 void ReplaceRawBufferStoreWithBufferStore(llvm::Function *F, hlsl::OP *op) {
-  DXASSERT(F->getReturnType()->isVoidTy(), "rawBufferStore should return a void type.");
+  DXASSERT(F->getReturnType()->isVoidTy(),
+           "rawBufferStore should return a void type.");
   Type *ETy = F->getFunctionType()->getParamType(4); // value
   Function *newFunction = op->GetOpFunc(hlsl::DXIL::OpCode::BufferStore, ETy);
   for (auto U = F->user_begin(), E = F->user_end(); U != E;) {
@@ -979,15 +1016,14 @@ void ReplaceRawBufferStoreWithBufferStore(llvm::Function *F, hlsl::OP *op) {
     if (CallInst *CI = dyn_cast<CallInst>(user)) {
       TranslateCallRawBufferStoreToBufferStore(CI, newFunction, op);
       CI->eraseFromParent();
-    }
-    else {
+    } else {
       DXASSERT(false, "function can only be used with call instructions.");
     }
   }
 }
 
-
-void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy, hlsl::OP *hlslOP) {
+void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy,
+                               hlsl::OP *hlslOP) {
   Function *bufLd = hlslOP->GetOpFunc(DXIL::OpCode::RawBufferLoad,
                                       Type::getInt32Ty(hlslOP->GetCtx()));
   for (auto U = F->user_begin(), E = F->user_end(); U != E;) {
@@ -1008,7 +1044,7 @@ void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy, hlsl::OP *h
         if (idx == 4) {
           bNeedStatus = true;
         } else {
-          size = std::max(size, idx+1);
+          size = std::max(size, idx + 1);
         }
       }
       unsigned maskHi = 0;
@@ -1042,14 +1078,14 @@ void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy, hlsl::OP *h
           // Update offset 4 by 4 bytes.
           if (isa<UndefValue>(offset)) {
             // [RW]ByteAddressBuffer has undef element offset -> update index
-            Value *index = CI->getArgOperand(DXIL::OperandIndex::kRawBufferLoadIndexOpIdx);
+            Value *index =
+                CI->getArgOperand(DXIL::OperandIndex::kRawBufferLoadIndexOpIdx);
             args[DXIL::OperandIndex::kRawBufferLoadIndexOpIdx] =
-              Builder.CreateAdd(index, Builder.getInt32(4 * 4));
-          }
-          else {
+                Builder.CreateAdd(index, Builder.getInt32(4 * 4));
+          } else {
             // [RW]StructuredBuffer -> update element offset
             args[DXIL::OperandIndex::kRawBufferLoadElementOffsetOpIdx] =
-              Builder.CreateAdd(offset, Builder.getInt32(4 * 4));
+                Builder.CreateAdd(offset, Builder.getInt32(4 * 4));
           }
           args[DXIL::OperandIndex::kRawBufferLoadMaskOpIdx] =
               Builder.getInt8(maskHi);
@@ -1063,11 +1099,12 @@ void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy, hlsl::OP *h
             Builder.CreateExtractValue(newLd, resBase + 1 - eltBase);
       }
 
-      Make64bitResultForLoad(EltTy, resultElts32, size, resultElts, hlslOP, Builder);
+      Make64bitResultForLoad(EltTy, resultElts32, size, resultElts, hlslOP,
+                             Builder);
       if (bNeedStatus) {
         resultElts[4] = Builder.CreateExtractValue(newLd, 4);
       }
-      for (auto it = CI->user_begin(); it != CI->user_end(); ) {
+      for (auto it = CI->user_begin(); it != CI->user_end();) {
         ExtractValueInst *Elt = cast<ExtractValueInst>(*(it++));
         DXASSERT(Elt->getNumIndices() == 1, "else invalid use for resRet");
         unsigned idx = Elt->getIndices()[0];
@@ -1085,7 +1122,8 @@ void ReplaceRawBufferLoad64Bit(llvm::Function *F, llvm::Type *EltTy, hlsl::OP *h
   }
 }
 
-void ReplaceRawBufferStore64Bit(llvm::Function *F, llvm::Type *ETy, hlsl::OP *hlslOP) {
+void ReplaceRawBufferStore64Bit(llvm::Function *F, llvm::Type *ETy,
+                                hlsl::OP *hlslOP) {
   Function *newFunction = hlslOP->GetOpFunc(hlsl::DXIL::OpCode::RawBufferStore,
                                             Type::getInt32Ty(hlslOP->GetCtx()));
   for (auto U = F->user_begin(), E = F->user_end(); U != E;) {
@@ -1145,12 +1183,12 @@ void ReplaceRawBufferStore64Bit(llvm::Function *F, llvm::Type *ETy, hlsl::OP *hl
         // Update offset 4 by 4 bytes.
         Value *offset = args[DXIL::OperandIndex::kBufferStoreCoord1OpIdx];
         if (isa<UndefValue>(offset)) {
-          // [RW]ByteAddressBuffer has element offset == undef -> update index instead
+          // [RW]ByteAddressBuffer has element offset == undef -> update index
+          // instead
           Value *index = args[DXIL::OperandIndex::kBufferStoreCoord0OpIdx];
           index = Builder.CreateAdd(index, Builder.getInt32(4 * 4));
           args[DXIL::OperandIndex::kRawBufferStoreIndexOpIdx] = index;
-        }
-        else {
+        } else {
           // [RW]StructuredBuffer -> update element offset
           offset = Builder.CreateAdd(offset, Builder.getInt32(4 * 4));
           args[DXIL::OperandIndex::kRawBufferStoreElementOffsetOpIdx] = offset;
@@ -1192,34 +1230,227 @@ Value *GetConvergentSource(Value *V) {
   return cast<CallInst>(V)->getOperand(0);
 }
 
+bool isCompositeType(Type *Ty) {
+  return isa<ArrayType>(Ty) || isa<StructType>(Ty) || isa<VectorType>(Ty);
 }
-}
 
-///////////////////////////////////////////////////////////////////////////////
+/// If value is a bitcast to base class pattern, equivalent
+/// to a getelementptr X, 0, 0, 0...  turn it into the appropriate gep.
+/// This can enhance SROA and other transforms that want type-safe pointers,
+/// and enables merging with other getelementptr's.
+Value *TryReplaceBaseCastWithGep(Value *V) {
+  if (BitCastOperator *BCO = dyn_cast<BitCastOperator>(V)) {
+    if (!BCO->getSrcTy()->isPointerTy())
+      return nullptr;
 
-namespace {
-class DxilLoadMetadata : public ModulePass {
-public:
-  static char ID; // Pass identification, replacement for typeid
-  explicit DxilLoadMetadata () : ModulePass(ID) {}
+    Type *SrcElTy = BCO->getSrcTy()->getPointerElementType();
+    Type *DstElTy = BCO->getDestTy()->getPointerElementType();
 
-  const char *getPassName() const override { return "HLSL load DxilModule from metadata"; }
-
-  bool runOnModule(Module &M) override {
-    if (!M.HasDxilModule()) {
-      (void)M.GetOrCreateDxilModule();
-      return true;
+    // Adapted from code in InstCombiner::visitBitCast
+    unsigned NumZeros = 0;
+    while (SrcElTy != DstElTy && isCompositeType(SrcElTy) &&
+           SrcElTy->getNumContainedTypes() /* not "{}" */) {
+      SrcElTy = SrcElTy->getContainedType(0);
+      ++NumZeros;
     }
 
-    return false;
+    // If we found a path from the src to dest, create the getelementptr now.
+    if (SrcElTy == DstElTy) {
+      IRBuilder<> Builder(BCO->getContext());
+      StringRef Name = "";
+      if (Instruction *I = dyn_cast<Instruction>(BCO)) {
+        Builder.SetInsertPoint(I);
+        Name = I->getName();
+      }
+      SmallVector<Value *, 8> Indices(NumZeros + 1, Builder.getInt32(0));
+      Value *newGEP =
+          Builder.CreateInBoundsGEP(nullptr, BCO->getOperand(0), Indices, Name);
+      V->replaceAllUsesWith(newGEP);
+      if (auto *I = dyn_cast<Instruction>(V))
+        I->eraseFromParent();
+      return newGEP;
+    }
+  }
+
+  return nullptr;
+}
+
+// returns true if the function call is an intermediate or DXIL op
+// that has no side effects, for functions not marked ReadNone or ReadOnly.
+bool FunctionHasNoSideEffects(Instruction *I) {
+  if (CallInst *CI = dyn_cast<CallInst>(I)) {
+    // don't force unused convergent markers to stay,
+    if (hlsl::dxilutil::IsConvergentMarker(CI))
+      return true;
+
+    if (CI->onlyReadsMemory())
+      return false;
+
+    if (!hlsl::OP::IsDxilOpFunc(CI->getCalledFunction()))
+      return false;
+    switch (hlsl::OP::getOpCode(I)) {
+
+    // remove bad OutputCompletes
+    case hlsl::OP::OpCode::OutputComplete: {
+      hlsl::DxilInst_OutputComplete OutputComplete(CI);
+      Value *NodeRecHandle = OutputComplete.get_output();
+      Constant *C = dyn_cast<Constant>(NodeRecHandle);
+      if (C && C->isZeroValue())
+        return true;
+      break;
+    }
+
+    // TODO: Add Wave Ops
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
+// Calculate Offset
+Value *GEPIdxToOffset(GetElementPtrInst *GEP, IRBuilder<> &Builder,
+                      hlsl::OP *OP, const DataLayout &DL) {
+  SmallVector<Value *, 8> Indices(GEP->idx_begin(), GEP->idx_end());
+  Value *addr = nullptr;
+  // update offset
+  if (GEP->hasAllConstantIndices()) {
+    unsigned gepOffset =
+        DL.getIndexedOffset(GEP->getPointerOperandType(), Indices);
+    addr = OP->GetU32Const(gepOffset);
+  } else {
+    Value *offset = OP->GetU32Const(0);
+    gep_type_iterator GEPIt = gep_type_begin(GEP), E = gep_type_end(GEP);
+    for (; GEPIt != E; GEPIt++) {
+      Value *idx = GEPIt.getOperand();
+      unsigned immIdx = 0;
+      if (llvm::Constant *constIdx = dyn_cast<llvm::Constant>(idx)) {
+        immIdx = constIdx->getUniqueInteger().getLimitedValue();
+        if (immIdx == 0)
+          continue;
+      }
+
+      if (GEPIt->isPointerTy() || GEPIt->isArrayTy() || GEPIt->isVectorTy()) {
+        unsigned size = DL.getTypeAllocSize(GEPIt->getSequentialElementType());
+        if (immIdx) {
+          unsigned tempOffset = size * immIdx;
+          offset = Builder.CreateAdd(offset, OP->GetU32Const(tempOffset));
+        } else {
+          Value *tempOffset = Builder.CreateMul(idx, OP->GetU32Const(size));
+          offset = Builder.CreateAdd(offset, tempOffset);
+        }
+      } else if (GEPIt->isStructTy()) {
+        const StructLayout *Layout =
+            DL.getStructLayout(cast<StructType>(*GEPIt));
+        unsigned structOffset = Layout->getElementOffset(immIdx);
+        offset = Builder.CreateAdd(offset, OP->GetU32Const(structOffset));
+      } else {
+        gep_type_iterator temp = GEPIt;
+        temp++;
+        DXASSERT(temp == E, "scalar type must be the last");
+      }
+    }
+    addr = offset;
+  }
+  return addr;
+}
+
+struct AllocaDeleter {
+  SmallVector<Value *, 10> WorkList;
+  std::unordered_set<Value *> Seen;
+
+  void Add(Value *V) {
+    if (!Seen.count(V)) {
+      Seen.insert(V);
+      WorkList.push_back(V);
+    }
+  }
+
+  bool TryDeleteUnusedAlloca(AllocaInst *AI) {
+    Seen.clear();
+    WorkList.clear();
+
+    Add(AI);
+    while (WorkList.size()) {
+      Value *V = WorkList.pop_back_val();
+      // Keep adding users if we encounter one of these.
+      // None of them imply the alloca is being read.
+      if (isa<GEPOperator>(V) || isa<BitCastOperator>(V) ||
+          isa<AllocaInst>(V) || isa<StoreInst>(V)) {
+        for (User *U : V->users())
+          Add(U);
+      } else if (MemCpyInst *MC = dyn_cast<MemCpyInst>(V)) {
+        // If the memcopy's source is anything we've encountered in the
+        // seen set, then the alloca is being read.
+        if (Seen.count(MC->getSource()))
+          return false;
+      }
+      // If it's anything else, we'll assume it's reading the
+      // alloca. Give up.
+      else {
+        return false;
+      }
+    }
+
+    if (!Seen.size())
+      return false;
+
+    // Delete all the instructions associated with the
+    // alloca.
+    for (Value *V : Seen) {
+      Instruction *I = dyn_cast<Instruction>(V);
+      if (I) {
+        I->dropAllReferences();
+      }
+    }
+    for (Value *V : Seen) {
+      Instruction *I = dyn_cast<Instruction>(V);
+      if (I) {
+        I->eraseFromParent();
+      }
+    }
+
+    return true;
   }
 };
+
+bool DeleteDeadAllocas(llvm::Function &F) {
+  if (F.empty())
+    return false;
+
+  AllocaDeleter Deleter;
+  BasicBlock &Entry = *F.begin();
+  bool Changed = false;
+
+  while (1) {
+    bool LocalChanged = false;
+    for (Instruction *it = &Entry.back(); it;) {
+      AllocaInst *AI = dyn_cast<AllocaInst>(it);
+      it = it->getPrevNode();
+      if (!AI)
+        continue;
+      LocalChanged |= Deleter.TryDeleteUnusedAlloca(AI);
+    }
+    Changed |= LocalChanged;
+    if (!LocalChanged)
+      break;
+  }
+
+  return Changed;
 }
 
-char DxilLoadMetadata::ID = 0;
-
-ModulePass *llvm::createDxilLoadMetadataPass() {
-  return new DxilLoadMetadata();
+// Retrieve dxil version in the given module.
+// Where the module doesn't already have a Dxil module,
+// it identifies and returns the version info from the metatdata.
+// Returns false where none of that works, but that shouldn't happen much.
+bool LoadDxilVersion(const Module *M, unsigned &Major, unsigned &Minor) {
+  if (M->HasDxilModule()) {
+    M->GetDxilModule().GetShaderModel()->GetDxilVersion(Major, Minor);
+    return true;
+  }
+  // No module, try metadata.
+  return DxilMDHelper::LoadDxilVersion(M, Major, Minor);
 }
 
-INITIALIZE_PASS(DxilLoadMetadata, "hlsl-dxilload", "HLSL load DxilModule from metadata", false, false)
+} // namespace dxilutil
+} // namespace hlsl

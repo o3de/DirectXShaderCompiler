@@ -1,4 +1,4 @@
-// Run: %dxc -T vs_6_0 -E main
+// RUN: %dxc -T vs_6_0 -E main -fcgl  %s -spirv | FileCheck %s
 
 // CHECK: OpDecorate %b0 SpecId 0
 // CHECK: OpDecorate %b1 SpecId 1
@@ -57,6 +57,9 @@ float f2 = true;
 [[vk::constant_id(33)]]
 float f3 = 20;
 
+// CHECK: %u1 = OpSpecConstant %uint 12648430
+static const uint u1val = 0xC0FFEE;
+[[vk::constant_id(1)]] const uint u1 = u1val;
 
 float main() : A {
     return 1.0;

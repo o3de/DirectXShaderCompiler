@@ -1,4 +1,4 @@
-// Run: %dxc -T vs_6_0 -E main
+// RUN: %dxc -T vs_6_0 -E main -fcgl  %s -spirv | FileCheck %s
 
 // CHECK: %type_MyCBuffer = OpTypeStruct %v4float
 cbuffer MyCBuffer {

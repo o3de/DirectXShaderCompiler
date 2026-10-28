@@ -970,17 +970,26 @@ ExprResult Sema::ActOnCXXThis(SourceLocation Loc) {
 
   CheckCXXThisCapture(Loc);
   // HLSL Change Starts - adjust this from T* to T&-like
-  if (getLangOpts().HLSL && ThisTy.getTypePtr()->isPointerType()) {
-    // Expressions cannot be of reference type - instead, they yield
-    // an lvalue on the underlying type.
-    CXXThisExpr* ResultExpr = new (Context)CXXThisExpr(
-      Loc, ThisTy.getTypePtr()->getPointeeType(), /*isImplicit=*/false);
-    ResultExpr->setValueKind(ExprValueKind::VK_LValue);
-    return ResultExpr;
+  if (getLangOpts().HLSL) {
+    return genereateHLSLThis(Loc, ThisTy, /*isImplicit=*/false);
   }
   // HLSL Change Ends
   return new (Context) CXXThisExpr(Loc, ThisTy, /*isImplicit=*/false);
 }
+
+// HLSL Change Begin - adjust this from T* to T&-like
+CXXThisExpr *Sema::genereateHLSLThis(SourceLocation Loc, QualType ThisType,
+                                   bool isImplicit) {
+  // Expressions cannot be of reference type - instead, they yield
+  // an lvalue on the underlying type.
+  if (ThisType->isPointerType() || ThisType->isReferenceType())
+    ThisType = ThisType->getPointeeType();
+  CXXThisExpr *ResultExpr =
+      new (Context) CXXThisExpr(Loc, ThisType, isImplicit);
+  ResultExpr->setValueKind(ExprValueKind::VK_LValue);
+  return ResultExpr;
+}
+// HLSL Change End - adjust this from T* to T&-like
 
 bool Sema::isThisOutsideMemberFunctionBody(QualType BaseType) {
   // If we're outside the body of a member function, then we'll have a specified
@@ -1043,6 +1052,56 @@ Sema::BuildCXXTypeConstructExpr(TypeSourceInfo *TInfo,
   // corresponding cast expression.
   if (Exprs.size() == 1 && !ListInitialization) {
     Expr *Arg = Exprs[0];
+#ifdef ENABLE_SPIRV_CODEGEN
+    if (hlsl::IsVKBufferPointerType(Ty) && Arg->getType()->isIntegerType()) {
+      typedef DeclContext::specific_decl_iterator<FunctionTemplateDecl> ft_iter;
+      auto *recordDecl = Ty->getAsCXXRecordDecl();
+      auto *specDecl = cast<ClassTemplateSpecializationDecl>(recordDecl);
+      auto *templatedDecl =
+          specDecl->getSpecializedTemplate()->getTemplatedDecl();
+      auto functionTemplateDecls =
+          llvm::iterator_range<ft_iter>(ft_iter(templatedDecl->decls_begin()),
+                                        ft_iter(templatedDecl->decls_end()));
+      for (auto *ftd : functionTemplateDecls) {
+        auto *fd = ftd->getTemplatedDecl();
+        if (fd->getNumParams() != 1 ||
+            !fd->getParamDecl(0)->getType()->isIntegerType())
+          continue;
+
+        void *insertPos;
+        auto templateArgs = ftd->getInjectedTemplateArgs();
+        auto *functionDecl = ftd->findSpecialization(templateArgs, insertPos);
+        if (!functionDecl) {
+          DeclarationNameInfo DInfo(ftd->getDeclName(),
+                                    recordDecl->getLocation());
+          auto *templateArgList = TemplateArgumentList::CreateCopy(
+              Context, templateArgs.data(), templateArgs.size());
+          functionDecl = CXXConstructorDecl::Create(
+              Context, recordDecl, Arg->getLocStart(), DInfo, Ty, TInfo, false,
+              false, false, false);
+          functionDecl->setFunctionTemplateSpecialization(ftd, templateArgList,
+                                                          insertPos);
+        } else if (functionDecl->getDeclKind() != Decl::Kind::CXXConstructor) {
+          continue;
+        }
+
+        CanQualType argType = Arg->getType()->getCanonicalTypeUnqualified();
+        if (!Arg->isRValue()) {
+          Arg = ImpCastExprToType(Arg, argType, CK_LValueToRValue).get();
+        }
+        if (argType != Context.UnsignedLongLongTy) {
+          Arg = ImpCastExprToType(Arg, Context.UnsignedLongLongTy,
+                                  CK_IntegralCast)
+                    .get();
+        }
+        return CXXConstructExpr::Create(
+            Context, Ty, TyBeginLoc, cast<CXXConstructorDecl>(functionDecl),
+            false, {Arg}, false, false, false, false,
+            CXXConstructExpr::ConstructionKind::CK_Complete,
+            SourceRange(LParenLoc, RParenLoc));
+      }
+    }
+#endif
     return BuildCXXFunctionalCastExpr(TInfo, LParenLoc, Arg, RParenLoc);
   }
 

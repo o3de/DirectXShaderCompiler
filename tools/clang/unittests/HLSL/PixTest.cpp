@@ -9,152 +9,70 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-// This whole file is win32-only
-#ifdef _WIN32
-
-
 #ifndef UNICODE
 #define UNICODE
 #endif
 
-#include <memory>
-#include <vector>
-#include <string>
-#include <map>
-#include <cassert>
-#include <sstream>
 #include <algorithm>
+#include <array>
+#include <cassert>
 #include <cfloat>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
 #include "dxc/DxilContainer/DxilContainer.h"
+#include "dxc/DxilContainer/DxilRuntimeReflection.h"
+#include "dxc/DxilRootSignature/DxilRootSignature.h"
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/dxcapi.h"
 #include "dxc/dxcpix.h"
+#ifdef _WIN32
 #include <atlfile.h>
-#include "dia2.h"
+#endif
 
 #include "dxc/DXIL/DxilModule.h"
 
+#include "dxc/Test/DxcTestUtils.h"
 #include "dxc/Test/HLSLTestData.h"
 #include "dxc/Test/HlslTestUtils.h"
-#include "dxc/Test/DxcTestUtils.h"
 
-#include "llvm/Support/raw_os_ostream.h"
+#include "dxc/DXIL/DxilUtil.h"
 #include "dxc/Support/Global.h"
-#include "dxc/Support/dxcapi.use.h"
-#include "dxc/Support/microcom.h"
 #include "dxc/Support/HLSLOptions.h"
 #include "dxc/Support/Unicode.h"
+#include "dxc/Support/dxcapi.use.h"
+#include "dxc/Support/microcom.h"
 
-#include <fstream>
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ModuleSlotTracker.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/MSFileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
-#include "llvm/ADT/SmallString.h"
-#include "llvm/ADT/StringSwitch.h"
+#include <fstream>
 
-
-#include <../lib/DxilDia/DxilDiaSession.h>
-#include <../lib/DxilDia/DxcPixLiveVariables.h>
 #include <../lib/DxilDia/DxcPixLiveVariables_FragmentIterator.h>
 #include <dxc/DxilPIXPasses/DxilPIXVirtualRegisters.h>
+
+#include "PixTestUtils.h"
 
 using namespace std;
 using namespace hlsl;
 using namespace hlsl_test;
-
-// Aligned to SymTagEnum.
-const char *SymTagEnumText[] = {
-    "Null",               // SymTagNull
-    "Exe",                // SymTagExe
-    "Compiland",          // SymTagCompiland
-    "CompilandDetails",   // SymTagCompilandDetails
-    "CompilandEnv",       // SymTagCompilandEnv
-    "Function",           // SymTagFunction
-    "Block",              // SymTagBlock
-    "Data",               // SymTagData
-    "Annotation",         // SymTagAnnotation
-    "Label",              // SymTagLabel
-    "PublicSymbol",       // SymTagPublicSymbol
-    "UDT",                // SymTagUDT
-    "Enum",               // SymTagEnum
-    "FunctionType",       // SymTagFunctionType
-    "PointerType",        // SymTagPointerType
-    "ArrayType",          // SymTagArrayType
-    "BaseType",           // SymTagBaseType
-    "Typedef",            // SymTagTypedef
-    "BaseClass",          // SymTagBaseClass
-    "Friend",             // SymTagFriend
-    "FunctionArgType",    // SymTagFunctionArgType
-    "FuncDebugStart",     // SymTagFuncDebugStart
-    "FuncDebugEnd",       // SymTagFuncDebugEnd
-    "UsingNamespace",     // SymTagUsingNamespace
-    "VTableShape",        // SymTagVTableShape
-    "VTable",             // SymTagVTable
-    "Custom",             // SymTagCustom
-    "Thunk",              // SymTagThunk
-    "CustomType",         // SymTagCustomType
-    "ManagedType",        // SymTagManagedType
-    "Dimension",          // SymTagDimension
-    "CallSite",           // SymTagCallSite
-    "InlineSite",         // SymTagInlineSite
-    "BaseInterface",      // SymTagBaseInterface
-    "VectorType",         // SymTagVectorType
-    "MatrixType",         // SymTagMatrixType
-    "HLSLType",           // SymTagHLSLType
-    "Caller",             // SymTagCaller
-    "Callee",             // SymTagCallee
-    "Export",             // SymTagExport
-    "HeapAllocationSite", // SymTagHeapAllocationSite
-    "CoffGroup",          // SymTagCoffGroup
-};
-
-// Aligned to LocationType.
-const char* LocationTypeText[] =
-{
-  "Null",
-  "Static",
-  "TLS",
-  "RegRel",
-  "ThisRel",
-  "Enregistered",
-  "BitField",
-  "Slot",
-  "IlRel",
-  "MetaData",
-  "Constant",
-};
-
-// Aligned to DataKind.
-const char* DataKindText[] =
-{
-  "Unknown",
-  "Local",
-  "StaticLocal",
-  "Param",
-  "ObjectPtr",
-  "FileStatic",
-  "Global",
-  "Member",
-  "StaticMember",
-  "Constant",
-};
-
-// Aligned to UdtKind.
-const char* UdtKindText[] =
-{
-  "Struct",
-  "Class",
-  "Union",
-  "Interface",
-};
+using namespace pix_test;
 
 static std::vector<std::string> Tokenize(const std::string &str,
                                          const char *delimiters) {
@@ -169,28 +87,38 @@ static std::vector<std::string> Tokenize(const std::string &str,
   return tokens;
 }
 
+#ifdef _WIN32
 class PixTest {
+#else
+class PixTest : public ::testing::Test {
+#endif
 public:
   BEGIN_TEST_CLASS(PixTest)
-    TEST_CLASS_PROPERTY(L"Parallel", L"true")
-    TEST_METHOD_PROPERTY(L"Priority", L"0")
+  TEST_CLASS_PROPERTY(L"Parallel", L"true")
+  TEST_METHOD_PROPERTY(L"Priority", L"0")
   END_TEST_CLASS()
 
   TEST_CLASS_SETUP(InitSupport);
 
-  TEST_METHOD(CompileWhenDebugThenDIPresent)
-  
-  TEST_METHOD(CompileDebugPDB)
+  TEST_METHOD(DebugUAV_CS_6_1)
+  TEST_METHOD(DebugUAV_CS_6_2)
+  TEST_METHOD(DebugUAV_lib_6_3_through_6_8)
+
   TEST_METHOD(CompileDebugDisasmPDB)
-  
-  TEST_METHOD(DiaLoadBadBitcodeThenFail)
-  TEST_METHOD(DiaLoadDebugThenOK)
-  TEST_METHOD(DiaTableIndexThenOK)
-  TEST_METHOD(DiaLoadDebugSubrangeNegativeThenOK)
-  TEST_METHOD(DiaLoadRelocatedBitcode)
-  TEST_METHOD(DiaLoadBitcodePlusExtraData)
-  TEST_METHOD(DiaCompileArgs)
-  TEST_METHOD(PixDebugCompileInfo)
+
+  TEST_METHOD(AddToASPayload)
+  TEST_METHOD(AddToASGroupSharedPayload)
+  TEST_METHOD(AddToASGroupSharedPayload_MeshletCullSample)
+  TEST_METHOD(SignatureModification_Empty)
+  TEST_METHOD(SignatureModification_VertexIdAlready)
+  TEST_METHOD(SignatureModification_SomethingElseFirst)
+
+  TEST_METHOD(AccessTracking_ModificationReport_Nothing)
+  TEST_METHOD(AccessTracking_ModificationReport_Read)
+  TEST_METHOD(AccessTracking_ModificationReport_Write)
+  TEST_METHOD(AccessTracking_ModificationReport_SM66)
+
+  TEST_METHOD(PixStructAnnotation_Lib_DualRaygen)
 
   TEST_METHOD(PixStructAnnotation_Simple)
   TEST_METHOD(PixStructAnnotation_CopiedStruct)
@@ -210,464 +138,40 @@ public:
   TEST_METHOD(PixStructAnnotation_ResourceAsMember)
   TEST_METHOD(PixStructAnnotation_WheresMyDbgValue)
 
-  dxc::DxcDllSupport m_dllSupport;
+  TEST_METHOD(VirtualRegisters_InstructionCounts)
+  TEST_METHOD(VirtualRegisters_AlignedOffsets)
+
+  TEST_METHOD(RootSignatureUpgrade_SubObjects)
+  TEST_METHOD(RootSignatureUpgrade_Annotation)
+
+  TEST_METHOD(DxilPIXDXRInvocationsLog_SanityTest)
+  TEST_METHOD(DxilPIXDXRInvocationsLog_EmbeddedRootSigs)
+
+  TEST_METHOD(DebugInstrumentation_TextOutput)
+  TEST_METHOD(DebugInstrumentation_BlockReport)
+
+  TEST_METHOD(DebugInstrumentation_VectorAllocaWrite_Structs)
+
+  TEST_METHOD(DebugBreakInstrumentation_Basic)
+  TEST_METHOD(DebugBreakInstrumentation_NoDebugBreak)
+  TEST_METHOD(DebugBreakInstrumentation_Multiple)
+
+  TEST_METHOD(NonUniformResourceIndex_Resource)
+  TEST_METHOD(NonUniformResourceIndex_DescriptorHeap)
+  TEST_METHOD(NonUniformResourceIndex_Raytracing)
+
+  dxc::DxCompilerDllLoader m_dllSupport;
   VersionSupportInfo m_ver;
-
-  void CreateBlobPinned(_In_bytecount_(size) LPCVOID data, SIZE_T size,
-                        UINT32 codePage, _Outptr_ IDxcBlobEncoding **ppBlob) {
-    CComPtr<IDxcLibrary> library;
-    IFT(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &library));
-    IFT(library->CreateBlobWithEncodingFromPinned(data, size, codePage,
-                                                  ppBlob));
-  }
-
-  void CreateBlobFromFile(LPCWSTR name, _Outptr_ IDxcBlobEncoding **ppBlob) {
-    CComPtr<IDxcLibrary> library;
-    IFT(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &library));
-    const std::wstring path = hlsl_test::GetPathToHlslDataFile(name);
-    IFT(library->CreateBlobFromFile(path.c_str(), nullptr, ppBlob));
-  }
-
-  void CreateBlobFromText(_In_z_ const char *pText,
-                          _Outptr_ IDxcBlobEncoding **ppBlob) {
-    CreateBlobPinned(pText, strlen(pText) + 1, CP_UTF8, ppBlob);
-  }
-
-  HRESULT CreateCompiler(IDxcCompiler **ppResult) {
-    return m_dllSupport.CreateInstance(CLSID_DxcCompiler, ppResult);
-  }
 
   HRESULT CreateContainerBuilder(IDxcContainerBuilder **ppResult) {
     return m_dllSupport.CreateInstance(CLSID_DxcContainerBuilder, ppResult);
   }
 
-  template <typename T, typename TDefault, typename TIface>
-  void WriteIfValue(TIface *pSymbol, std::wstringstream &o,
-                    TDefault defaultValue, LPCWSTR valueLabel,
-                    HRESULT (__stdcall TIface::*pFn)(T *)) {
-    T value;
-    HRESULT hr = (pSymbol->*(pFn))(&value);
-    if (SUCCEEDED(hr) && value != defaultValue) {
-      o << L", " << valueLabel << L": " << value;
-    }
-  }
-
-  template <typename TIface>
-  void WriteIfValue(TIface *pSymbol, std::wstringstream &o,
-    LPCWSTR valueLabel, HRESULT(__stdcall TIface::*pFn)(BSTR *)) {
-    CComBSTR value;
-    HRESULT hr = (pSymbol->*(pFn))(&value);
-    if (SUCCEEDED(hr) && value.Length()) {
-      o << L", " << valueLabel << L": " << (LPCWSTR)value;
-    }
-  }
-  template <typename TIface>
-  void WriteIfValue(TIface *pSymbol, std::wstringstream &o,
-    LPCWSTR valueLabel, HRESULT(__stdcall TIface::*pFn)(VARIANT *)) {
-    CComVariant value;
-    HRESULT hr = (pSymbol->*(pFn))(&value);
-    if (SUCCEEDED(hr) && value.vt != VT_NULL && value.vt != VT_EMPTY) {
-      if (SUCCEEDED(value.ChangeType(VT_BSTR))) {
-        o << L", " << valueLabel << L": " << (LPCWSTR)value.bstrVal;
-      }
-    }
-  }
-  template <typename TIface>
-  void WriteIfValue(TIface *pSymbol, std::wstringstream &o,
-    LPCWSTR valueLabel, HRESULT(__stdcall TIface::*pFn)(IDiaSymbol **)) {
-    CComPtr<IDiaSymbol> value;
-    HRESULT hr = (pSymbol->*(pFn))(&value);
-    if (SUCCEEDED(hr) && value.p != nullptr) {
-      DWORD symId;
-      value->get_symIndexId(&symId);
-      o << L", " << valueLabel << L": id=" << symId;
-    }
-  }
-
-  std::wstring GetDebugInfoAsText(_In_ IDiaDataSource* pDataSource) {
-    CComPtr<IDiaSession> pSession;
-    CComPtr<IDiaTable> pTable;
-    CComPtr<IDiaEnumTables> pEnumTables;
-    std::wstringstream o;
-
-    VERIFY_SUCCEEDED(pDataSource->openSession(&pSession));
-    VERIFY_SUCCEEDED(pSession->getEnumTables(&pEnumTables));
-    LONG count;
-    VERIFY_SUCCEEDED(pEnumTables->get_Count(&count));
-    for (LONG i = 0; i < count; ++i) {
-      pTable.Release();
-      ULONG fetched;
-      VERIFY_SUCCEEDED(pEnumTables->Next(1, &pTable, &fetched));
-      VERIFY_ARE_EQUAL(fetched, 1);
-      CComBSTR tableName;
-      VERIFY_SUCCEEDED(pTable->get_name(&tableName));
-      o << L"Table: " << (LPWSTR)tableName << std::endl;
-      LONG rowCount;
-      IFT(pTable->get_Count(&rowCount));
-      o << L" Row count: " << rowCount << std::endl;
-
-      for (LONG rowIndex = 0; rowIndex < rowCount; ++rowIndex) {
-        CComPtr<IUnknown> item;
-        o << L'#' << rowIndex;
-        IFT(pTable->Item(rowIndex, &item));
-        CComPtr<IDiaSymbol> pSymbol;
-        if (SUCCEEDED(item.QueryInterface(&pSymbol))) {
-          DWORD symTag;
-          DWORD dataKind;
-          DWORD locationType;
-          DWORD registerId;
-          pSymbol->get_symTag(&symTag);
-          pSymbol->get_dataKind(&dataKind);
-          pSymbol->get_locationType(&locationType);
-          pSymbol->get_registerId(&registerId);
-          //pSymbol->get_value(&value);
-
-          WriteIfValue(pSymbol.p, o, 0, L"symIndexId", &IDiaSymbol::get_symIndexId);
-          o << L", " << SymTagEnumText[symTag];
-          if (dataKind != 0) o << L", " << DataKindText[dataKind];
-          WriteIfValue(pSymbol.p, o, L"name", &IDiaSymbol::get_name);
-          WriteIfValue(pSymbol.p, o, L"lexicalParent", &IDiaSymbol::get_lexicalParent);
-          WriteIfValue(pSymbol.p, o, L"type", &IDiaSymbol::get_type);
-          WriteIfValue(pSymbol.p, o, 0, L"slot", &IDiaSymbol::get_slot);
-          WriteIfValue(pSymbol.p, o, 0, L"platform", &IDiaSymbol::get_platform);
-          WriteIfValue(pSymbol.p, o, 0, L"language", &IDiaSymbol::get_language);
-          WriteIfValue(pSymbol.p, o, 0, L"frontEndMajor", &IDiaSymbol::get_frontEndMajor);
-          WriteIfValue(pSymbol.p, o, 0, L"frontEndMinor", &IDiaSymbol::get_frontEndMinor);
-          WriteIfValue(pSymbol.p, o, 0, L"token", &IDiaSymbol::get_token);
-          WriteIfValue(pSymbol.p, o,    L"value", &IDiaSymbol::get_value);
-          WriteIfValue(pSymbol.p, o, 0, L"code", &IDiaSymbol::get_code);
-          WriteIfValue(pSymbol.p, o, 0, L"function", &IDiaSymbol::get_function);
-          WriteIfValue(pSymbol.p, o, 0, L"udtKind", &IDiaSymbol::get_udtKind);
-          WriteIfValue(pSymbol.p, o, 0, L"hasDebugInfo", &IDiaSymbol::get_hasDebugInfo);
-          WriteIfValue(pSymbol.p, o,    L"compilerName", &IDiaSymbol::get_compilerName);
-          WriteIfValue(pSymbol.p, o, 0, L"isLocationControlFlowDependent", &IDiaSymbol::get_isLocationControlFlowDependent);
-          WriteIfValue(pSymbol.p, o, 0, L"numberOfRows", &IDiaSymbol::get_numberOfRows);
-          WriteIfValue(pSymbol.p, o, 0, L"numberOfColumns", &IDiaSymbol::get_numberOfColumns);
-          WriteIfValue(pSymbol.p, o, 0, L"length", &IDiaSymbol::get_length);
-          WriteIfValue(pSymbol.p, o, 0, L"isMatrixRowMajor", &IDiaSymbol::get_isMatrixRowMajor);
-          WriteIfValue(pSymbol.p, o, 0, L"builtInKind", &IDiaSymbol::get_builtInKind);
-          WriteIfValue(pSymbol.p, o, 0, L"textureSlot", &IDiaSymbol::get_textureSlot);
-          WriteIfValue(pSymbol.p, o, 0, L"memorySpaceKind", &IDiaSymbol::get_memorySpaceKind);
-          WriteIfValue(pSymbol.p, o, 0, L"isHLSLData", &IDiaSymbol::get_isHLSLData);
-        }
-
-        CComPtr<IDiaSourceFile> pSourceFile;
-        if (SUCCEEDED(item.QueryInterface(&pSourceFile))) {
-          WriteIfValue(pSourceFile.p, o, 0, L"uniqueId", &IDiaSourceFile::get_uniqueId);
-          WriteIfValue(pSourceFile.p, o, L"fileName", &IDiaSourceFile::get_fileName);
-        }
-
-        CComPtr<IDiaLineNumber> pLineNumber;
-        if (SUCCEEDED(item.QueryInterface(&pLineNumber))) {
-          WriteIfValue(pLineNumber.p, o, L"compiland", &IDiaLineNumber::get_compiland);
-          //WriteIfValue(pLineNumber.p, o, L"sourceFile", &IDiaLineNumber::get_sourceFile);
-          WriteIfValue(pLineNumber.p, o, 0, L"lineNumber", &IDiaLineNumber::get_lineNumber);
-          WriteIfValue(pLineNumber.p, o, 0, L"lineNumberEnd", &IDiaLineNumber::get_lineNumberEnd);
-          WriteIfValue(pLineNumber.p, o, 0, L"columnNumber", &IDiaLineNumber::get_columnNumber);
-          WriteIfValue(pLineNumber.p, o, 0, L"columnNumberEnd", &IDiaLineNumber::get_columnNumberEnd);
-          WriteIfValue(pLineNumber.p, o, 0, L"addressSection", &IDiaLineNumber::get_addressSection);
-          WriteIfValue(pLineNumber.p, o, 0, L"addressOffset", &IDiaLineNumber::get_addressOffset);
-          WriteIfValue(pLineNumber.p, o, 0, L"relativeVirtualAddress", &IDiaLineNumber::get_relativeVirtualAddress);
-          WriteIfValue(pLineNumber.p, o, 0, L"virtualAddress", &IDiaLineNumber::get_virtualAddress);
-          WriteIfValue(pLineNumber.p, o, 0, L"length", &IDiaLineNumber::get_length);
-          WriteIfValue(pLineNumber.p, o, 0, L"sourceFileId", &IDiaLineNumber::get_sourceFileId);
-          WriteIfValue(pLineNumber.p, o, 0, L"statement", &IDiaLineNumber::get_statement);
-          WriteIfValue(pLineNumber.p, o, 0, L"compilandId", &IDiaLineNumber::get_compilandId);
-        }
-
-        CComPtr<IDiaSectionContrib> pSectionContrib;
-        if (SUCCEEDED(item.QueryInterface(&pSectionContrib))) {
-          WriteIfValue(pSectionContrib.p, o, L"compiland", &IDiaSectionContrib::get_compiland);
-          WriteIfValue(pSectionContrib.p, o, 0, L"addressSection", &IDiaSectionContrib::get_addressSection);
-          WriteIfValue(pSectionContrib.p, o, 0, L"addressOffset", &IDiaSectionContrib::get_addressOffset);
-          WriteIfValue(pSectionContrib.p, o, 0, L"relativeVirtualAddress", &IDiaSectionContrib::get_relativeVirtualAddress);
-          WriteIfValue(pSectionContrib.p, o, 0, L"virtualAddress", &IDiaSectionContrib::get_virtualAddress);
-          WriteIfValue(pSectionContrib.p, o, 0, L"length", &IDiaSectionContrib::get_length);
-          WriteIfValue(pSectionContrib.p, o, 0, L"notPaged", &IDiaSectionContrib::get_notPaged);
-          WriteIfValue(pSectionContrib.p, o, 0, L"code", &IDiaSectionContrib::get_code);
-          WriteIfValue(pSectionContrib.p, o, 0, L"initializedData", &IDiaSectionContrib::get_initializedData);
-          WriteIfValue(pSectionContrib.p, o, 0, L"uninitializedData", &IDiaSectionContrib::get_uninitializedData);
-          WriteIfValue(pSectionContrib.p, o, 0, L"remove", &IDiaSectionContrib::get_remove);
-          WriteIfValue(pSectionContrib.p, o, 0, L"comdat", &IDiaSectionContrib::get_comdat);
-          WriteIfValue(pSectionContrib.p, o, 0, L"discardable", &IDiaSectionContrib::get_discardable);
-          WriteIfValue(pSectionContrib.p, o, 0, L"notCached", &IDiaSectionContrib::get_notCached);
-          WriteIfValue(pSectionContrib.p, o, 0, L"share", &IDiaSectionContrib::get_share);
-          WriteIfValue(pSectionContrib.p, o, 0, L"execute", &IDiaSectionContrib::get_execute);
-          WriteIfValue(pSectionContrib.p, o, 0, L"read", &IDiaSectionContrib::get_read);
-          WriteIfValue(pSectionContrib.p, o, 0, L"write", &IDiaSectionContrib::get_write);
-          WriteIfValue(pSectionContrib.p, o, 0, L"dataCrc", &IDiaSectionContrib::get_dataCrc);
-          WriteIfValue(pSectionContrib.p, o, 0, L"relocationsCrc", &IDiaSectionContrib::get_relocationsCrc);
-          WriteIfValue(pSectionContrib.p, o, 0, L"compilandId", &IDiaSectionContrib::get_compilandId);
-        }
-
-        CComPtr<IDiaSegment> pSegment;
-        if (SUCCEEDED(item.QueryInterface(&pSegment))) {
-          WriteIfValue(pSegment.p, o, 0, L"frame", &IDiaSegment::get_frame);
-          WriteIfValue(pSegment.p, o, 0, L"offset", &IDiaSegment::get_offset);
-          WriteIfValue(pSegment.p, o, 0, L"length", &IDiaSegment::get_length);
-          WriteIfValue(pSegment.p, o, 0, L"read", &IDiaSegment::get_read);
-          WriteIfValue(pSegment.p, o, 0, L"write", &IDiaSegment::get_write);
-          WriteIfValue(pSegment.p, o, 0, L"execute", &IDiaSegment::get_execute);
-          WriteIfValue(pSegment.p, o, 0, L"addressSection", &IDiaSegment::get_addressSection);
-          WriteIfValue(pSegment.p, o, 0, L"relativeVirtualAddress", &IDiaSegment::get_relativeVirtualAddress);
-          WriteIfValue(pSegment.p, o, 0, L"virtualAddress", &IDiaSegment::get_virtualAddress);
-        }
-
-        CComPtr<IDiaInjectedSource> pInjectedSource;
-        if (SUCCEEDED(item.QueryInterface(&pInjectedSource))) {
-          WriteIfValue(pInjectedSource.p, o, 0, L"crc", &IDiaInjectedSource::get_crc);
-          WriteIfValue(pInjectedSource.p, o, 0, L"length", &IDiaInjectedSource::get_length);
-          WriteIfValue(pInjectedSource.p, o, L"filename", &IDiaInjectedSource::get_filename);
-          WriteIfValue(pInjectedSource.p, o, L"objectFilename", &IDiaInjectedSource::get_objectFilename);
-          WriteIfValue(pInjectedSource.p, o, L"virtualFilename", &IDiaInjectedSource::get_virtualFilename);
-          WriteIfValue(pInjectedSource.p, o, 0, L"sourceCompression", &IDiaInjectedSource::get_sourceCompression);
-          // get_source is also available
-        }
-
-        CComPtr<IDiaFrameData> pFrameData;
-        if (SUCCEEDED(item.QueryInterface(&pFrameData))) {
-        }
-
-        o << std::endl;
-      }
-    }
-
-    return o.str();
-  }
-  std::wstring GetDebugFileContent(_In_ IDiaDataSource *pDataSource) {
-    CComPtr<IDiaSession> pSession;
-    CComPtr<IDiaTable> pTable;
-
-    CComPtr<IDiaTable> pSourcesTable;
-
-    CComPtr<IDiaEnumTables> pEnumTables;
-    std::wstringstream o;
-
-    VERIFY_SUCCEEDED(pDataSource->openSession(&pSession));
-    VERIFY_SUCCEEDED(pSession->getEnumTables(&pEnumTables));
-
-    ULONG fetched = 0;
-    while (pEnumTables->Next(1, &pTable, &fetched) == S_OK && fetched == 1) {
-      CComBSTR name;
-      IFT(pTable->get_name(&name));
-
-      if (wcscmp(name, L"SourceFiles") == 0) {
-        pSourcesTable = pTable.Detach();
-        continue;
-      }
-
-      pTable.Release();
-    }
-
-    if (!pSourcesTable) {
-      return L"cannot find source";
-    }
-
-    // Get source file contents.
-    // NOTE: "SourceFiles" has the root file first while "InjectedSources" is in
-    // alphabetical order.
-    //       It is important to keep the root file first for recompilation, so
-    //       iterate "SourceFiles" and look up the corresponding injected
-    //       source.
-    LONG count;
-    IFT(pSourcesTable->get_Count(&count));
-
-    CComPtr<IDiaSourceFile> pSourceFile;
-    CComBSTR pName;
-    CComPtr<IUnknown> pSymbolUnk;
-    CComPtr<IDiaEnumInjectedSources> pEnumInjectedSources;
-    CComPtr<IDiaInjectedSource> pInjectedSource;
-    std::wstring sourceText, sourceFilename;
-
-    while (SUCCEEDED(pSourcesTable->Next(1, &pSymbolUnk, &fetched)) &&
-           fetched == 1) {
-      sourceText = sourceFilename = L"";
-
-      IFT(pSymbolUnk->QueryInterface(&pSourceFile));
-      IFT(pSourceFile->get_fileName(&pName));
-
-      IFT(pSession->findInjectedSource(pName, &pEnumInjectedSources));
-
-      if (SUCCEEDED(pEnumInjectedSources->get_Count(&count)) && count == 1) {
-        IFT(pEnumInjectedSources->Item(0, &pInjectedSource));
-
-        DWORD cbData = 0;
-        std::string tempString;
-        CComBSTR bstr;
-        IFT(pInjectedSource->get_filename(&bstr));
-        IFT(pInjectedSource->get_source(0, &cbData, nullptr));
-
-        tempString.resize(cbData);
-        IFT(pInjectedSource->get_source(
-            cbData, &cbData, reinterpret_cast<BYTE *>(&tempString[0])));
-
-        CA2W tempWString(tempString.data());
-        o << tempWString.m_psz;
-      }
-      pSymbolUnk.Release();
-    }
-
-    return o.str();
-  }
-
-  struct LineNumber { DWORD line; DWORD rva; };
-  std::vector<LineNumber> ReadLineNumbers(IDiaEnumLineNumbers *pEnumLineNumbers) {
-    std::vector<LineNumber> lines;
-    CComPtr<IDiaLineNumber> pLineNumber;
-    DWORD lineCount;
-    while (SUCCEEDED(pEnumLineNumbers->Next(1, &pLineNumber, &lineCount)) && lineCount == 1)
-    {
-      DWORD line;
-      DWORD rva;
-      VERIFY_SUCCEEDED(pLineNumber->get_lineNumber(&line));
-      VERIFY_SUCCEEDED(pLineNumber->get_relativeVirtualAddress(&rva));
-      lines.push_back({ line, rva });
-      pLineNumber.Release();
-    }
-    return lines;
-  }
- 
   std::string GetOption(std::string &cmd, char *opt) {
     std::string option = cmd.substr(cmd.find(opt));
     option = option.substr(option.find_first_of(' '));
     option = option.substr(option.find_first_not_of(' '));
     return option.substr(0, option.find_first_of(' '));
-  }
-
-  HRESULT CreateDiaSourceForCompile(const char* hlsl,
-    IDiaDataSource** ppDiaSource)
-  {
-    if (!ppDiaSource)
-      return E_POINTER;
-
-    CComPtr<IDxcCompiler> pCompiler;
-    CComPtr<IDxcOperationResult> pResult;
-    CComPtr<IDxcBlobEncoding> pSource;
-    CComPtr<IDxcBlob> pProgram;
-
-    VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
-    CreateBlobFromText(hlsl, &pSource);
-    LPCWSTR args[] = { L"/Zi", L"/Qembed_debug", L"/Od" };
-    VERIFY_SUCCEEDED(pCompiler->Compile(pSource, L"source.hlsl", L"main",
-      L"ps_6_0", args, _countof(args), nullptr, 0, nullptr, &pResult));
-    
-    HRESULT compilationStatus;
-    VERIFY_SUCCEEDED(pResult->GetStatus(&compilationStatus));
-    if (FAILED(compilationStatus))
-    {
-      CComPtr<IDxcBlobEncoding> pErrros;
-      VERIFY_SUCCEEDED(pResult->GetErrorBuffer(&pErrros));
-      CA2W errorTextW(static_cast<const char *>(pErrros->GetBufferPointer()), CP_UTF8);
-      WEX::Logging::Log::Error(errorTextW);
-    }
-
-    VERIFY_SUCCEEDED(pResult->GetResult(&pProgram));
-
-    // Disassemble the compiled (stripped) program.
-    {
-      CComPtr<IDxcBlobEncoding> pDisassembly;
-      VERIFY_SUCCEEDED(pCompiler->Disassemble(pProgram, &pDisassembly));
-      std::string disText = BlobToUtf8(pDisassembly);
-      CA2W disTextW(disText.c_str(), CP_UTF8);
-      //WEX::Logging::Log::Comment(disTextW);
-    }
-
-    // CONSIDER: have the dia data source look for the part if passed a whole container.
-    CComPtr<IDiaDataSource> pDiaSource;
-    CComPtr<IStream> pProgramStream;
-    CComPtr<IDxcLibrary> pLib;
-    VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-    const hlsl::DxilContainerHeader *pContainer = hlsl::IsDxilContainerLike(
-        pProgram->GetBufferPointer(), pProgram->GetBufferSize());
-    VERIFY_IS_NOT_NULL(pContainer);
-    hlsl::DxilPartIterator partIter =
-        std::find_if(hlsl::begin(pContainer), hlsl::end(pContainer),
-                     hlsl::DxilPartIsType(hlsl::DFCC_ShaderDebugInfoDXIL));
-    const hlsl::DxilProgramHeader *pProgramHeader =
-        (const hlsl::DxilProgramHeader *)hlsl::GetDxilPartData(*partIter);
-    uint32_t bitcodeLength;
-    const char *pBitcode;
-    CComPtr<IDxcBlob> pProgramPdb;
-    hlsl::GetDxilProgramBitcode(pProgramHeader, &pBitcode, &bitcodeLength);
-    VERIFY_SUCCEEDED(pLib->CreateBlobFromBlob(
-        pProgram, pBitcode - (char *)pProgram->GetBufferPointer(), bitcodeLength,
-        &pProgramPdb));
-
-    // Disassemble the program with debug information.
-    {
-      CComPtr<IDxcBlobEncoding> pDbgDisassembly;
-      VERIFY_SUCCEEDED(pCompiler->Disassemble(pProgramPdb, &pDbgDisassembly));
-      std::string disText = BlobToUtf8(pDbgDisassembly);
-      CA2W disTextW(disText.c_str(), CP_UTF8);
-      //WEX::Logging::Log::Comment(disTextW);
-    }
-
-    // Create a short text dump of debug information.
-    VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pProgramPdb, &pProgramStream));
-    VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaSource));
-    VERIFY_SUCCEEDED(pDiaSource->loadDataFromIStream(pProgramStream));
-    *ppDiaSource = pDiaSource.Detach();
-    return S_OK;
-  }
-  
-  CComPtr<IDxcOperationResult> Compile(
-    const char* hlsl,
-    const wchar_t* target,
-    std::vector<const wchar_t *> extraArgs)
-  {
-    CComPtr<IDxcCompiler> pCompiler;
-    CComPtr<IDxcOperationResult> pResult;
-    CComPtr<IDxcBlobEncoding> pSource;
-
-    VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
-    CreateBlobFromText(hlsl, &pSource);
-    std::vector<const wchar_t*>  args = { L"/Zi", L"-enable-16bit-types", L"/Qembed_debug" };
-    args.insert(args.end(), extraArgs.begin(), extraArgs.end());
-    VERIFY_SUCCEEDED(pCompiler->Compile(pSource, L"source.hlsl", L"main",
-      target, args.data(), static_cast<UINT32>(args.size()), nullptr, 0, nullptr, &pResult));
-
-    HRESULT compilationStatus;
-    VERIFY_SUCCEEDED(pResult->GetStatus(&compilationStatus));
-    if (FAILED(compilationStatus))
-    {
-      CComPtr<IDxcBlobEncoding> pErrros;
-      VERIFY_SUCCEEDED(pResult->GetErrorBuffer(&pErrros));
-      CA2W errorTextW(static_cast<const char*>(pErrros->GetBufferPointer()), CP_UTF8);
-      WEX::Logging::Log::Error(errorTextW);
-    }
-
-#if 0 //handy for debugging
-    {
-      CComPtr<IDxcBlob> pProgram;
-      CheckOperationSucceeded(pResult, &pProgram);
-
-      CComPtr<IDxcLibrary> pLib;
-      VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-      const hlsl::DxilContainerHeader *pContainer = hlsl::IsDxilContainerLike(
-          pProgram->GetBufferPointer(), pProgram->GetBufferSize());
-      VERIFY_IS_NOT_NULL(pContainer);
-      hlsl::DxilPartIterator partIter =
-          std::find_if(hlsl::begin(pContainer), hlsl::end(pContainer),
-                       hlsl::DxilPartIsType(hlsl::DFCC_ShaderDebugInfoDXIL));
-      const hlsl::DxilProgramHeader *pProgramHeader =
-          (const hlsl::DxilProgramHeader *)hlsl::GetDxilPartData(*partIter);
-      uint32_t bitcodeLength;
-      const char *pBitcode;
-      CComPtr<IDxcBlob> pProgramPdb;
-      hlsl::GetDxilProgramBitcode(pProgramHeader, &pBitcode, &bitcodeLength);
-      VERIFY_SUCCEEDED(pLib->CreateBlobFromBlob(
-          pProgram, pBitcode - (char *)pProgram->GetBufferPointer(),
-          bitcodeLength, &pProgramPdb));
-
-      CComPtr<IDxcBlobEncoding> pDbgDisassembly;
-      VERIFY_SUCCEEDED(pCompiler->Disassemble(pProgramPdb, &pDbgDisassembly));
-      std::string disText = BlobToUtf8(pDbgDisassembly);
-      CA2W disTextW(disText.c_str(), CP_UTF8);
-      WEX::Logging::Log::Comment(disTextW);
-    }
-#endif
-
-    return pResult;
   }
 
   CComPtr<IDxcBlob> ExtractDxilPart(IDxcBlob *pProgram) {
@@ -691,27 +195,13 @@ public:
     return pDxilBits;
   }
 
-  struct ValueLocation
-  {
-    int base;
-    int count;
-  };
-
-  struct PassOutput
-  {
-    CComPtr<IDxcBlob> blob;
-    std::vector<ValueLocation> valueLocations;
-  };
-
-  PassOutput RunAnnotationPasses(IDxcBlob * dxil)
-  {
+  PassOutput RunValueToDeclarePass(IDxcBlob *dxil, int startingLineNumber = 0) {
     CComPtr<IDxcOptimizer> pOptimizer;
     VERIFY_SUCCEEDED(
         m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
     std::vector<LPCWSTR> Options;
     Options.push_back(L"-opt-mod-passes");
     Options.push_back(L"-dxil-dbg-value-to-dbg-declare");
-    Options.push_back(L"-dxil-annotate-with-virtual-regs");
 
     CComPtr<IDxcBlob> pOptimizedModule;
     CComPtr<IDxcBlobEncoding> pText;
@@ -719,60 +209,61 @@ public:
         dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
 
     std::string outputText;
-    if (pText->GetBufferSize() != 0)
-    {
-      outputText = reinterpret_cast<const char*>(pText->GetBufferPointer());
+    if (pText->GetBufferSize() != 0) {
+      outputText = reinterpret_cast<const char *>(pText->GetBufferPointer());
     }
 
-    auto lines = Tokenize(outputText, "\n");
-
-    std::vector<ValueLocation> valueLocations;
-
-    for (size_t line = 0; line < lines.size(); ++line) {
-      if (lines[line] == "Begin - dxil values to virtual register mapping") {
-        for (++line; line < lines.size(); ++line) {
-          if (lines[line] == "End - dxil values to virtual register mapping") {
-            break;
-          }
-
-          auto lineTokens = Tokenize(lines[line], " ");
-          VERIFY_IS_TRUE(lineTokens.size() >= 2);
-          if (lineTokens[1] == "dxil")
-          {
-            VERIFY_IS_TRUE(lineTokens.size() == 3);
-            valueLocations.push_back({atoi(lineTokens[2].c_str()), 1});
-          }
-          else if (lineTokens[1] == "alloca")
-          {
-            VERIFY_IS_TRUE(lineTokens.size() == 4);
-            valueLocations.push_back(
-                {atoi(lineTokens[2].c_str()), atoi(lineTokens[3].c_str())});
-          }
-          else
-          {
-            VERIFY_IS_TRUE(false);
-          }
-        }
-      }
-    }
-
-    return { std::move(pOptimizedModule), std::move(valueLocations) };
+    return {
+        std::move(pOptimizedModule), {}, Tokenize(outputText.c_str(), "\n")};
   }
 
-  std::wstring Disassemble(IDxcBlob * pProgram)
-  {
-    CComPtr<IDxcCompiler> pCompiler;
-    VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
+  PassOutput RunDebugPass(IDxcBlob *dxil, int UAVSize = 1024 * 1024) {
+    CComPtr<IDxcOptimizer> pOptimizer;
+    VERIFY_SUCCEEDED(
+        m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+    std::vector<LPCWSTR> Options;
+    Options.push_back(L"-opt-mod-passes");
+    Options.push_back(L"-dxil-dbg-value-to-dbg-declare");
+    Options.push_back(L"-dxil-annotate-with-virtual-regs");
+    std::wstring debugArg =
+        L"-hlsl-dxil-debug-instrumentation,UAVSize=" + std::to_wstring(UAVSize);
+    Options.push_back(debugArg.c_str());
+    Options.push_back(L"-viewid-state");
+    Options.push_back(L"-hlsl-dxilemit");
 
-    CComPtr<IDxcBlobEncoding> pDbgDisassembly;
-    VERIFY_SUCCEEDED(pCompiler->Disassemble(pProgram, &pDbgDisassembly));
-    std::string disText = BlobToUtf8(pDbgDisassembly);
-    CA2W disTextW(disText.c_str(), CP_UTF8);
-    return std::wstring(disTextW);
+    CComPtr<IDxcBlob> pOptimizedModule;
+    CComPtr<IDxcBlobEncoding> pText;
+    VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+        dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+    std::string outputText = BlobToUtf8(pText);
+
+    return {
+        std::move(pOptimizedModule), {}, Tokenize(outputText.c_str(), "\n")};
   }
 
-  CComPtr<IDxcBlob> FindModule(hlsl::DxilFourCC fourCC, IDxcBlob *pSource)
-  {
+  PassOutput RunDebugBreakPass(IDxcBlob *dxil) {
+    CComPtr<IDxcOptimizer> pOptimizer;
+    VERIFY_SUCCEEDED(
+        m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+    std::vector<LPCWSTR> Options;
+    Options.push_back(L"-opt-mod-passes");
+    Options.push_back(L"-dxil-annotate-with-virtual-regs");
+    Options.push_back(L"-hlsl-dxil-debugbreak-instrumentation");
+    Options.push_back(L"-hlsl-dxilemit");
+
+    CComPtr<IDxcBlob> pOptimizedModule;
+    CComPtr<IDxcBlobEncoding> pText;
+    VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+        dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+    std::string outputText = BlobToUtf8(pText);
+
+    return {
+        std::move(pOptimizedModule), {}, Tokenize(outputText.c_str(), "\n")};
+  }
+
+  CComPtr<IDxcBlob> FindModule(hlsl::DxilFourCC fourCC, IDxcBlob *pSource) {
     const UINT32 BC_C0DE = ((INT32)(INT8)'B' | (INT32)(INT8)'C' << 8 |
                             (INT32)0xDEC0 << 16); // BC0xc0de in big endian
     const char *pBitcode = nullptr;
@@ -795,8 +286,8 @@ public:
     }
     if (fourCC == pDxilPartHeader->PartFourCC) {
       UINT32 pBlobSize;
-      hlsl::DxilProgramHeader *pDxilProgramHeader =
-          (hlsl::DxilProgramHeader *)(pDxilPartHeader + 1);
+      const hlsl::DxilProgramHeader *pDxilProgramHeader =
+          (const hlsl::DxilProgramHeader *)(pDxilPartHeader + 1);
       hlsl::GetDxilProgramBitcode(pDxilProgramHeader, &pBitcode, &pBlobSize);
       UINT32 offset =
           (UINT32)(pBitcode - (const char *)pSource->GetBufferPointer());
@@ -809,11 +300,9 @@ public:
     return {};
   }
 
-
-  void ReplaceDxilBlobPart(
-      const void *originalShaderBytecode, SIZE_T originalShaderLength,
-      IDxcBlob *pNewDxilBlob, IDxcBlob **ppNewShaderOut)
-  {
+  void ReplaceDxilBlobPart(const void *originalShaderBytecode,
+                           SIZE_T originalShaderLength, IDxcBlob *pNewDxilBlob,
+                           IDxcBlob **ppNewShaderOut) {
     CComPtr<IDxcLibrary> pLibrary;
     IFT(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLibrary));
 
@@ -832,8 +321,7 @@ public:
           pAssembler->AssembleToContainer(pNewDxilBlob, &pAssembleResult));
 
       CComPtr<IDxcBlobEncoding> pAssembleErrors;
-      VERIFY_SUCCEEDED(
-          pAssembleResult->GetErrorBuffer(&pAssembleErrors));
+      VERIFY_SUCCEEDED(pAssembleResult->GetErrorBuffer(&pAssembleErrors));
 
       if (pAssembleErrors && pAssembleErrors->GetBufferSize() != 0) {
         OutputDebugStringA(
@@ -847,16 +335,16 @@ public:
     // Now copy over the blobs from the original container that won't have been
     // invalidated by changing the shader code itself, using the container
     // reflection API
-    { 
+    {
       // Wrap the original code in a container blob
       CComPtr<IDxcBlobEncoding> pContainer;
-      VERIFY_SUCCEEDED(
-          pLibrary->CreateBlobWithEncodingFromPinned(
-              static_cast<LPBYTE>(const_cast<void *>(originalShaderBytecode)),
-              static_cast<UINT32>(originalShaderLength), CP_ACP, &pContainer));
+      VERIFY_SUCCEEDED(pLibrary->CreateBlobWithEncodingFromPinned(
+          static_cast<LPBYTE>(const_cast<void *>(originalShaderBytecode)),
+          static_cast<UINT32>(originalShaderLength), CP_ACP, &pContainer));
 
       CComPtr<IDxcContainerReflection> pReflection;
-      IFT(m_dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
+      IFT(m_dllSupport.CreateInstance(CLSID_DxcContainerReflection,
+                                      &pReflection));
 
       // Load the reflector from the original shader
       VERIFY_SUCCEEDED(pReflection->Load(pContainer));
@@ -866,27 +354,23 @@ public:
       if (SUCCEEDED(pReflection->FindFirstPartKind(hlsl::DFCC_PrivateData,
                                                    &partIndex))) {
         CComPtr<IDxcBlob> pPart;
-        VERIFY_SUCCEEDED(
-            pReflection->GetPartContent(partIndex, &pPart));
+        VERIFY_SUCCEEDED(pReflection->GetPartContent(partIndex, &pPart));
 
         CComPtr<IDxcContainerBuilder> pContainerBuilder;
         IFT(m_dllSupport.CreateInstance(CLSID_DxcContainerBuilder,
                                         &pContainerBuilder));
 
-        VERIFY_SUCCEEDED(
-            pContainerBuilder->Load(pNewContainer));
+        VERIFY_SUCCEEDED(pContainerBuilder->Load(pNewContainer));
 
         VERIFY_SUCCEEDED(
             pContainerBuilder->AddPart(hlsl::DFCC_PrivateData, pPart));
 
         CComPtr<IDxcOperationResult> pBuildResult;
 
-        VERIFY_SUCCEEDED(
-            pContainerBuilder->SerializeContainer(&pBuildResult));
+        VERIFY_SUCCEEDED(pContainerBuilder->SerializeContainer(&pBuildResult));
 
         CComPtr<IDxcBlobEncoding> pBuildErrors;
-        VERIFY_SUCCEEDED(
-            pBuildResult->GetErrorBuffer(&pBuildErrors));
+        VERIFY_SUCCEEDED(pBuildResult->GetErrorBuffer(&pBuildErrors));
 
         if (pBuildErrors && pBuildErrors->GetBufferSize() != 0) {
           OutputDebugStringA(
@@ -894,38 +378,47 @@ public:
           VERIFY_SUCCEEDED(E_FAIL);
         }
 
-        VERIFY_SUCCEEDED(
-            pBuildResult->GetResult(&pNewContainer));
+        VERIFY_SUCCEEDED(pBuildResult->GetResult(&pNewContainer));
       }
     }
 
     *ppNewShaderOut = pNewContainer.Detach();
   }
 
-  class ModuleAndHangersOn
-  {
+  void ValidateAccessTrackingMods(const char *hlsl, bool modsExpected);
+
+  class ModuleAndHangersOn {
     std::unique_ptr<llvm::LLVMContext> llvmContext;
     std::unique_ptr<llvm::Module> llvmModule;
-    DxilModule* dxilModule;
+    DxilModule *dxilModule;
 
   public:
-    ModuleAndHangersOn(IDxcBlob* pBlob)
-    {
-      // Verify we have a valid dxil container.
+    ModuleAndHangersOn(IDxcBlob *pBlob) {
+
+      // Assume we were given a dxil part first:
+      const DxilProgramHeader *pProgramHeader =
+          reinterpret_cast<const DxilProgramHeader *>(
+              pBlob->GetBufferPointer());
+      uint32_t partSize = static_cast<uint32_t>(pBlob->GetBufferSize());
+      // Check if we were given a valid dxil container instead:
       const DxilContainerHeader *pContainer = IsDxilContainerLike(
           pBlob->GetBufferPointer(), pBlob->GetBufferSize());
-      VERIFY_IS_NOT_NULL(pContainer);
-      VERIFY_IS_TRUE(IsValidDxilContainer(pContainer, pBlob->GetBufferSize()));
+      if (pContainer != nullptr) {
+        VERIFY_IS_TRUE(
+            IsValidDxilContainer(pContainer, pBlob->GetBufferSize()));
 
-      // Get Dxil part from container.
-      DxilPartIterator it =
-          std::find_if(begin(pContainer), end(pContainer),
-                       DxilPartIsType(DFCC_ShaderDebugInfoDXIL));
-      VERIFY_IS_FALSE(it == end(pContainer));
+        // Get Dxil part from container.
+        DxilPartIterator it =
+            std::find_if(begin(pContainer), end(pContainer),
+                         DxilPartIsType(DFCC_ShaderDebugInfoDXIL));
+        VERIFY_IS_FALSE(it == end(pContainer));
 
-      const DxilProgramHeader *pProgramHeader =
-          reinterpret_cast<const DxilProgramHeader *>(GetDxilPartData(*it));
-      VERIFY_IS_TRUE(IsValidDxilProgramHeader(pProgramHeader, (*it)->PartSize));
+        pProgramHeader =
+            reinterpret_cast<const DxilProgramHeader *>(GetDxilPartData(*it));
+        partSize = (*it)->PartSize;
+      }
+
+      VERIFY_IS_TRUE(IsValidDxilProgramHeader(pProgramHeader, partSize));
 
       // Get a pointer to the llvm bitcode.
       const char *pIL;
@@ -940,26 +433,20 @@ public:
       llvmContext.reset(new llvm::LLVMContext);
 
       llvm::ErrorOr<std::unique_ptr<llvm::Module>> pModule(
-          llvm::parseBitcodeFile(pBitcodeBuf->getMemBufferRef(),
-                                 *llvmContext));
+          llvm::parseBitcodeFile(pBitcodeBuf->getMemBufferRef(), *llvmContext));
       if (std::error_code ec = pModule.getError()) {
         VERIFY_FAIL();
       }
 
       llvmModule = std::move(pModule.get());
 
-      dxilModule =
-          DxilModule::TryGetDxilModule(llvmModule.get());
+      dxilModule = DxilModule::TryGetDxilModule(llvmModule.get());
     }
 
-    DxilModule& GetDxilModule()
-    {
-      return *dxilModule;
-    }
+    DxilModule &GetDxilModule() { return *dxilModule; }
   };
 
-  struct AggregateOffsetAndSize
-  {
+  struct AggregateOffsetAndSize {
     unsigned countOfMembers;
     unsigned offset;
     unsigned size;
@@ -970,17 +457,30 @@ public:
     uint32_t regSize;
     uint64_t index;
   };
-  struct TestableResults
-  {
+  struct TestableResults {
     std::vector<AggregateOffsetAndSize> OffsetAndSizes;
     std::vector<AllocaWrite> AllocaWrites;
   };
 
-  TestableResults TestStructAnnotationCase(const char* hlsl, const wchar_t* optimizationLevel, bool validateCoverage = true);
-  void ValidateAllocaWrite(std::vector<AllocaWrite> const& allocaWrites, size_t index, const char* name);
-
+  TestableResults TestStructAnnotationCase(const char *hlsl,
+                                           const wchar_t *optimizationLevel,
+                                           bool validateCoverage = true,
+                                           const wchar_t *profile = L"as_6_5");
+  void ValidateAllocaWrite(std::vector<AllocaWrite> const &allocaWrites,
+                           size_t index, const char *name);
+  PassOutput RunShaderAccessTrackingPass(IDxcBlob *blob);
+  std::string RunDxilPIXAddTidToAmplificationShaderPayloadPass(IDxcBlob *blob);
+  CComPtr<IDxcBlob> RunDxilPIXMeshShaderOutputPass(IDxcBlob *blob);
+  CComPtr<IDxcBlob> RunDxilPIXDXRInvocationsLog(IDxcBlob *blob);
+  std::vector<std::string>
+  RunDxilNonUniformResourceIndexInstrumentation(IDxcBlob *blob,
+                                                std::string &outputText);
+  void TestNuriCase(const char *source, const wchar_t *target,
+                    uint32_t expectedResult);
+  void TestPixUAVCase(char const *hlsl, wchar_t const *model,
+                      wchar_t const *entry);
+  std::string Disassemble(IDxcBlob *pProgram);
 };
-
 
 bool PixTest::InitSupport() {
   if (!m_dllSupport.IsEnabled()) {
@@ -990,47 +490,99 @@ bool PixTest::InitSupport() {
   return true;
 }
 
-TEST_F(PixTest, CompileWhenDebugThenDIPresent) {
-  // BUG: the first test written was of this form:
-  // float4 local = 0; return local;
-  //
-  // However we get no numbers because of the _wrapper form
-  // that exports the zero initialization from main into
-  // a global can't be attributed to any particular location
-  // within main, and everything in main is eventually folded away.
-  //
-  // Making the function do a bit more work by calling an intrinsic
-  // helps this case.
-  CComPtr<IDiaDataSource> pDiaSource;
-  VERIFY_SUCCEEDED(CreateDiaSourceForCompile(
-    "float4 main(float4 pos : SV_Position) : SV_Target {\r\n"
-    "  float4 local = abs(pos);\r\n"
-    "  return local;\r\n"
-    "}", &pDiaSource));
-  std::wstring diaDump = GetDebugInfoAsText(pDiaSource).c_str();
-  //WEX::Logging::Log::Comment(GetDebugInfoAsText(pDiaSource).c_str());
+void PixTest::TestPixUAVCase(char const *hlsl, wchar_t const *model,
+                             wchar_t const *entry) {
+  auto mod = Compile(m_dllSupport, hlsl, model, {}, entry);
+  CComPtr<IDxcBlob> dxilPart = FindModule(DFCC_ShaderDebugInfoDXIL, mod);
+  PassOutput passOutput = RunDebugPass(dxilPart);
+  CComPtr<IDxcBlob> modifiedDxilContainer;
+  ReplaceDxilBlobPart(mod->GetBufferPointer(), mod->GetBufferSize(),
+                      passOutput.blob, &modifiedDxilContainer);
 
-  // Very basic tests - we have basic symbols, line numbers, and files with sources.
-  VERIFY_IS_NOT_NULL(wcsstr(diaDump.c_str(), L"symIndexId: 5, CompilandEnv, name: hlslTarget, lexicalParent: id=2, value: ps_6_0"));
-  VERIFY_IS_NOT_NULL(wcsstr(diaDump.c_str(), L"lineNumber: 2"));
-  VERIFY_IS_NOT_NULL(wcsstr(diaDump.c_str(), L"length: 99, filename: source.hlsl"));
-  std::wstring diaFileContent = GetDebugFileContent(pDiaSource).c_str();
-  VERIFY_IS_NOT_NULL(wcsstr(diaFileContent.c_str(), L"loat4 main(float4 pos : SV_Position) : SV_Target"));
-#if SUPPORT_FXC_PDB
-  // Now, fake it by loading from a .pdb!
-  VERIFY_SUCCEEDED(CoInitializeEx(0, COINITBASE_MULTITHREADED));
-  const wchar_t path[] = L"path-to-fxc-blob.bin";
-  pDiaSource.Release();
-  pProgramStream.Release();
-  CComPtr<IDxcBlobEncoding> fxcBlob;
-  CComPtr<IDxcBlob> pdbBlob;
-  VERIFY_SUCCEEDED(pLib->CreateBlobFromFile(path, nullptr, &fxcBlob));
-  std::string s = DumpParts(fxcBlob);
-  CA2W sW(s.c_str(), CP_UTF8);
-  WEX::Logging::Log::Comment(sW);
-  VERIFY_SUCCEEDED(CreateDiaSourceFromDxbcBlob(pLib, fxcBlob, &pDiaSource));
-  WEX::Logging::Log::Comment(GetDebugInfoAsText(pDiaSource).c_str());
-#endif
+  ModuleAndHangersOn moduleEtc(modifiedDxilContainer);
+  auto &compilerGeneratedUAV = moduleEtc.GetDxilModule().GetUAV(0);
+  auto &pixDebugGeneratedUAV = moduleEtc.GetDxilModule().GetUAV(1);
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetClass(),
+                   pixDebugGeneratedUAV.GetClass());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetKind(),
+                   pixDebugGeneratedUAV.GetKind());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetHLSLType(),
+                   pixDebugGeneratedUAV.GetHLSLType());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetSampleCount(),
+                   pixDebugGeneratedUAV.GetSampleCount());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetElementStride(),
+                   pixDebugGeneratedUAV.GetElementStride());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetBaseAlignLog2(),
+                   pixDebugGeneratedUAV.GetBaseAlignLog2());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetCompType(),
+                   pixDebugGeneratedUAV.GetCompType());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetSamplerFeedbackType(),
+                   pixDebugGeneratedUAV.GetSamplerFeedbackType());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.IsGloballyCoherent(),
+                   pixDebugGeneratedUAV.IsGloballyCoherent());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.HasCounter(),
+                   pixDebugGeneratedUAV.HasCounter());
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.HasAtomic64Use(),
+                   pixDebugGeneratedUAV.HasAtomic64Use());
+
+  VERIFY_ARE_EQUAL(compilerGeneratedUAV.GetGlobalSymbol()->getType(),
+                   pixDebugGeneratedUAV.GetGlobalSymbol()->getType());
+}
+
+TEST_F(PixTest, DebugUAV_CS_6_1) {
+  const char *hlsl = R"(
+RWByteAddressBuffer RawUAV : register(u0);
+[numthreads(1, 1, 1)]
+void CSMain()
+{
+    RawUAV.Store(0, RawUAV.Load(4));
+}
+)";
+  TestPixUAVCase(hlsl, L"cs_6_1", L"CSMain");
+}
+
+TEST_F(PixTest, DebugUAV_CS_6_2) {
+  const char *hlsl = R"(
+RWByteAddressBuffer RawUAV : register(u0);
+[numthreads(1, 1, 1)]
+void CSMain()
+{
+    RawUAV.Store(0, RawUAV.Load(4));
+}
+)";
+  // In 6.2, rawBufferLoad replaced bufferLoad for UAVs, but we don't
+  // expect this test to notice the difference. We just test 6.2
+  TestPixUAVCase(hlsl, L"cs_6_2", L"CSMain");
+}
+
+TEST_F(PixTest, DebugUAV_lib_6_3_through_6_8) {
+  const char *hlsl = R"(
+RWByteAddressBuffer RawUAV : register(u0);
+struct [raypayload] Payload
+{
+  double a : read(caller, closesthit, anyhit) : write(caller, miss, closesthit);
+};
+[shader("miss")]
+void Miss( inout Payload payload ) 
+{ 
+    RawUAV.Store(0, RawUAV.Load(4));
+    payload.a = 4.2;
+})";
+  TestPixUAVCase(hlsl, L"lib_6_3", L"");
+  TestPixUAVCase(hlsl, L"lib_6_4", L"");
+  TestPixUAVCase(hlsl, L"lib_6_5", L"");
+
+  if (m_ver.SkipDxilVersion(1, 6))
+    return;
+  TestPixUAVCase(hlsl, L"lib_6_6", L"");
+
+  if (m_ver.SkipDxilVersion(1, 7))
+    return;
+  TestPixUAVCase(hlsl, L"lib_6_7", L"");
+
+  if (m_ver.SkipDxilVersion(1, 8))
+    return;
+  TestPixUAVCase(hlsl, L"lib_6_8", L"");
 }
 
 TEST_F(PixTest, CompileDebugDisasmPDB) {
@@ -1053,14 +605,15 @@ TEST_F(PixTest, CompileDebugDisasmPDB) {
   CComPtr<IDxcBlobEncoding> pSource;
   CComPtr<IDxcBlob> pProgram;
   CComPtr<IDxcBlob> pPdbBlob;
-  WCHAR *pDebugName = nullptr;
+  CComHeapPtr<WCHAR> pDebugName;
 
-  VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
+  VERIFY_SUCCEEDED(CreateCompiler(m_dllSupport, &pCompiler));
   VERIFY_SUCCEEDED(pCompiler.QueryInterface(&pCompiler2));
-  CreateBlobFromText(hlsl, &pSource);
-  LPCWSTR args[] = { L"/Zi", L"/Qembed_debug" };
-  VERIFY_SUCCEEDED(pCompiler2->CompileWithDebug(pSource, L"source.hlsl", L"main",
-    L"ps_6_0", args, _countof(args), nullptr, 0, nullptr, &pResult, &pDebugName, &pPdbBlob));
+  CreateBlobFromText(m_dllSupport, hlsl, &pSource);
+  LPCWSTR args[] = {L"/Zi", L"/Qembed_debug"};
+  VERIFY_SUCCEEDED(pCompiler2->CompileWithDebug(
+      pSource, L"source.hlsl", L"main", L"ps_6_0", args, _countof(args),
+      nullptr, 0, nullptr, &pResult, &pDebugName, &pPdbBlob));
   VERIFY_SUCCEEDED(pResult->GetResult(&pProgram));
 
   // Test that disassembler can consume a PDB container
@@ -1068,771 +621,870 @@ TEST_F(PixTest, CompileDebugDisasmPDB) {
   VERIFY_SUCCEEDED(pCompiler->Disassemble(pPdbBlob, &pDisasm));
 }
 
-// Test that the new PDB format still works with Dia
-TEST_F(PixTest, CompileDebugPDB) {
+PassOutput PixTest::RunShaderAccessTrackingPass(IDxcBlob *blob) {
+  CComPtr<IDxcOptimizer> pOptimizer;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+  std::vector<LPCWSTR> Options;
+  Options.push_back(L"-opt-mod-passes");
+  Options.push_back(L"-hlsl-dxil-pix-shader-access-instrumentation,config=U0:0:"
+                    L"10i0;U0:1:2i0;.0;0;0.");
+
+  CComPtr<IDxcBlob> pOptimizedModule;
+  CComPtr<IDxcBlobEncoding> pText;
+  VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+      blob, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+  CComPtr<IDxcAssembler> pAssembler;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcAssembler, &pAssembler));
+
+  CComPtr<IDxcOperationResult> pAssembleResult;
+  VERIFY_SUCCEEDED(
+      pAssembler->AssembleToContainer(pOptimizedModule, &pAssembleResult));
+
+  HRESULT hr;
+  VERIFY_SUCCEEDED(pAssembleResult->GetStatus(&hr));
+  VERIFY_SUCCEEDED(hr);
+
+  CComPtr<IDxcBlob> pNewContainer;
+  VERIFY_SUCCEEDED(pAssembleResult->GetResult(&pNewContainer));
+
+  PassOutput ret;
+  ret.blob = pNewContainer;
+  std::string outputText = BlobToUtf8(pText);
+  ret.lines = Tokenize(outputText.c_str(), "\n");
+
+  return ret;
+}
+
+CComPtr<IDxcBlob> PixTest::RunDxilPIXMeshShaderOutputPass(IDxcBlob *blob) {
+  CComPtr<IDxcBlob> dxil = FindModule(DFCC_ShaderDebugInfoDXIL, blob);
+  CComPtr<IDxcOptimizer> pOptimizer;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+  std::vector<LPCWSTR> Options;
+  Options.push_back(L"-opt-mod-passes");
+  Options.push_back(L"-hlsl-dxil-pix-meshshader-output-instrumentation,expand-"
+                    L"payload=1,UAVSize=8192");
+
+  CComPtr<IDxcBlob> pOptimizedModule;
+  CComPtr<IDxcBlobEncoding> pText;
+  VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+      dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+  std::string outputText;
+  if (pText->GetBufferSize() != 0) {
+    outputText = reinterpret_cast<const char *>(pText->GetBufferPointer());
+  }
+
+  return pOptimizedModule;
+}
+
+CComPtr<IDxcBlob> PixTest::RunDxilPIXDXRInvocationsLog(IDxcBlob *blob) {
+
+  CComPtr<IDxcBlob> dxil = FindModule(DFCC_ShaderDebugInfoDXIL, blob);
+  CComPtr<IDxcOptimizer> pOptimizer;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+  std::vector<LPCWSTR> Options;
+  Options.push_back(
+      L"-hlsl-dxil-pix-dxr-invocations-log,maxNumEntriesInLog=24");
+
+  CComPtr<IDxcBlob> pOptimizedModule;
+  CComPtr<IDxcBlobEncoding> pText;
+  VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+      blob, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+  std::string outputText;
+  if (pText->GetBufferSize() != 0) {
+    outputText = reinterpret_cast<const char *>(pText->GetBufferPointer());
+  }
+
+  return pOptimizedModule;
+}
+
+std::vector<std::string> PixTest::RunDxilNonUniformResourceIndexInstrumentation(
+    IDxcBlob *blob, std::string &outputText) {
+
+  CComPtr<IDxcBlob> dxil = FindModule(DFCC_ShaderDebugInfoDXIL, blob);
+  CComPtr<IDxcOptimizer> pOptimizer;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+  std::array<LPCWSTR, 4> Options = {
+      L"-opt-mod-passes", L"-dxil-dbg-value-to-dbg-declare",
+      L"-dxil-annotate-with-virtual-regs",
+      L"-hlsl-dxil-non-uniform-resource-index-instrumentation"};
+
+  CComPtr<IDxcBlob> pOptimizedModule;
+  CComPtr<IDxcBlobEncoding> pText;
+  VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+      dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+  outputText = BlobToUtf8(pText);
+
+  const std::string disassembly = Disassemble(pOptimizedModule);
+  return Tokenize(disassembly, "\n");
+}
+
+std::string
+PixTest::RunDxilPIXAddTidToAmplificationShaderPayloadPass(IDxcBlob *blob) {
+  CComPtr<IDxcBlob> dxil = FindModule(DFCC_ShaderDebugInfoDXIL, blob);
+  CComPtr<IDxcOptimizer> pOptimizer;
+  VERIFY_SUCCEEDED(
+      m_dllSupport.CreateInstance(CLSID_DxcOptimizer, &pOptimizer));
+  std::vector<LPCWSTR> Options;
+  Options.push_back(L"-opt-mod-passes");
+  Options.push_back(
+      L"-hlsl-dxil-PIX-add-tid-to-as-payload,dispatchArgY=1,dispatchArgZ=2");
+
+  CComPtr<IDxcBlob> pOptimizedModule;
+  CComPtr<IDxcBlobEncoding> pText;
+  VERIFY_SUCCEEDED(pOptimizer->RunOptimizer(
+      dxil, Options.data(), Options.size(), &pOptimizedModule, &pText));
+
+  std::string outputText;
+  if (pText->GetBufferSize() != 0) {
+    outputText = reinterpret_cast<const char *>(pText->GetBufferPointer());
+  }
+
+  return outputText;
+}
+
+TEST_F(PixTest, AddToASPayload) {
+
   const char *hlsl = R"(
-    [RootSignature("")]
-    float main(float pos : A) : SV_Target {
-      float x = abs(pos);
-      float y = sin(pos);
-      float z = x + y;
-      return z;
-    }
+struct MyPayload
+{
+    float f1;
+    float f2;
+};
+
+[numthreads(1, 1, 1)]
+void ASMain(uint gid : SV_GroupID)
+{
+    MyPayload payload;
+    payload.f1 = (float)gid / 4.f;
+    payload.f2 = (float)gid * 4.f;
+    DispatchMesh(1, 1, 1, payload);
+}
+
+struct PSInput
+{
+    float4 position : SV_POSITION;
+};
+
+
+[outputtopology("triangle")]
+[numthreads(3,1,1)]
+void MSMain(
+    in payload MyPayload small,
+    in uint tid : SV_GroupThreadID,
+    in uint3 dtid : SV_DispatchThreadID,
+    out vertices PSInput verts[3],
+    out indices uint3 triangles[1])
+{
+    SetMeshOutputCounts(3, 1);
+    verts[tid].position = float4(small.f1, small.f2, 0, 0);
+    triangles[0] = uint3(0, 1, 2);
+}
+
   )";
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
 
+  auto as = Compile(m_dllSupport, hlsl, L"as_6_6", {}, L"ASMain");
+  RunDxilPIXAddTidToAmplificationShaderPayloadPass(as);
+
+  auto ms = Compile(m_dllSupport, hlsl, L"ms_6_6", {}, L"MSMain");
+  RunDxilPIXMeshShaderOutputPass(ms);
+}
+unsigned FindOrAddVSInSignatureElementForInstanceOrVertexID(
+    hlsl::DxilSignature &InputSignature, hlsl::DXIL::SemanticKind semanticKind);
+
+TEST_F(PixTest, SignatureModification_Empty) {
+
+  DxilSignature sig(DXIL::ShaderKind::Vertex, DXIL::SignatureKind::Input,
+                    false);
+
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::InstanceID);
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::VertexID);
+
+  VERIFY_ARE_EQUAL(2ull, sig.GetElements().size());
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetKind(), DXIL::SemanticKind::InstanceID);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetStartRow(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetKind(), DXIL::SemanticKind::VertexID);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartRow(), 1);
+}
+
+TEST_F(PixTest, SignatureModification_VertexIdAlready) {
+
+  DxilSignature sig(DXIL::ShaderKind::Vertex, DXIL::SignatureKind::Input,
+                    false);
+
+  auto AddedElement =
+      llvm::make_unique<DxilSignatureElement>(DXIL::SigPointKind::VSIn);
+  AddedElement->Initialize(
+      Semantic::Get(DXIL::SemanticKind::VertexID)->GetName(),
+      hlsl::CompType::getU32(), DXIL::InterpolationMode::Constant, 1, 1, 0, 0,
+      0, {0});
+  AddedElement->SetKind(DXIL::SemanticKind::VertexID);
+  AddedElement->SetUsageMask(1);
+  sig.AppendElement(std::move(AddedElement));
+
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::InstanceID);
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::VertexID);
+
+  VERIFY_ARE_EQUAL(2ull, sig.GetElements().size());
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetKind(), DXIL::SemanticKind::VertexID);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(0).GetStartRow(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetKind(), DXIL::SemanticKind::InstanceID);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartRow(), 1);
+}
+
+TEST_F(PixTest, SignatureModification_SomethingElseFirst) {
+
+  DxilSignature sig(DXIL::ShaderKind::Vertex, DXIL::SignatureKind::Input,
+                    false);
+
+  auto AddedElement =
+      llvm::make_unique<DxilSignatureElement>(DXIL::SigPointKind::VSIn);
+  AddedElement->Initialize("One", hlsl::CompType::getU32(),
+                           DXIL::InterpolationMode::Constant, 1, 6, 0, 0, 0,
+                           {0});
+  AddedElement->SetKind(DXIL::SemanticKind::Arbitrary);
+  AddedElement->SetUsageMask(1);
+  sig.AppendElement(std::move(AddedElement));
+
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::InstanceID);
+  FindOrAddVSInSignatureElementForInstanceOrVertexID(
+      sig, DXIL::SemanticKind::VertexID);
+
+  VERIFY_ARE_EQUAL(3ull, sig.GetElements().size());
+  // Not gonna check the first one cuz that would just be grading our own
+  // homework
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetKind(), DXIL::SemanticKind::InstanceID);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(1).GetStartRow(), 1);
+  VERIFY_ARE_EQUAL(sig.GetElement(2).GetKind(), DXIL::SemanticKind::VertexID);
+  VERIFY_ARE_EQUAL(sig.GetElement(2).GetCols(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(2).GetRows(), 1u);
+  VERIFY_ARE_EQUAL(sig.GetElement(2).GetStartCol(), 0);
+  VERIFY_ARE_EQUAL(sig.GetElement(2).GetStartRow(), 2);
+}
+
+void PixTest::ValidateAccessTrackingMods(const char *hlsl, bool modsExpected) {
+  auto code = Compile(m_dllSupport, hlsl, L"ps_6_6", {L"-Od"}, L"main");
+  auto result = RunShaderAccessTrackingPass(code).lines;
+  bool hasMods = true;
+  for (auto const &line : result)
+    if (line.find("NotModified") != std::string::npos)
+      hasMods = false;
+  VERIFY_ARE_EQUAL(modsExpected, hasMods);
+}
+
+TEST_F(PixTest, AccessTracking_ModificationReport_Nothing) {
+  const char *hlsl = R"(
+float main() : SV_Target 
+{
+  return 0;
+}
+)";
+  ValidateAccessTrackingMods(hlsl, false);
+}
+
+TEST_F(PixTest, AccessTracking_ModificationReport_Read) {
+  const char *hlsl = R"(
+RWByteAddressBuffer g_texture;
+float main() : SV_Target 
+{
+  return g_texture.Load(0);
+}
+)";
+  ValidateAccessTrackingMods(hlsl, true);
+}
+
+TEST_F(PixTest, AccessTracking_ModificationReport_Write) {
+  const char *hlsl = R"(
+RWByteAddressBuffer g_texture;
+float main() : SV_Target 
+{
+  g_texture.Store(0, 0);
+  return 0;
+}
+)";
+  ValidateAccessTrackingMods(hlsl, true);
+}
+
+TEST_F(PixTest, AccessTracking_ModificationReport_SM66) {
+  const char *hlsl = R"(
+float main() : SV_Target 
+{
+    RWByteAddressBuffer g_texture = ResourceDescriptorHeap[0];
+    g_texture.Store(0, 0);
+    return 0;
+}
+)";
+  ValidateAccessTrackingMods(hlsl, true);
+}
+
+TEST_F(PixTest, AddToASGroupSharedPayload) {
+
+  const char *hlsl = R"(
+struct Contained
+{
+    uint j;
+    float af[3];
+};
+
+struct Bigger
+{
+    half h;
+    void Init() { h = 1.f; }
+  Contained a[2];
+};
+
+struct MyPayload
+{
+    uint i;
+    Bigger big[3];
+};
+
+groupshared MyPayload payload;
+
+[numthreads(1, 1, 1)]
+void main(uint gid : SV_GroupID)
+{
+  DispatchMesh(1, 1, 1, payload);
+}
+
+  )";
+
+  auto as = Compile(m_dllSupport, hlsl, L"as_6_6", {L"-Od"}, L"main");
+  RunDxilPIXAddTidToAmplificationShaderPayloadPass(as);
+}
+
+TEST_F(PixTest, AddToASGroupSharedPayload_MeshletCullSample) {
+
+  const char *hlsl = R"(
+struct MyPayload
+{
+    uint i[32];
+};
+
+groupshared MyPayload payload;
+
+[numthreads(1, 1, 1)]
+void main(uint gid : SV_GroupID)
+{
+  DispatchMesh(1, 1, 1, payload);
+}
+
+  )";
+
+  auto as = Compile(m_dllSupport, hlsl, L"as_6_6", {L"-Od"}, L"main");
+  RunDxilPIXAddTidToAmplificationShaderPayloadPass(as);
+}
+static llvm::DIType *PeelTypedefs(llvm::DIType *diTy) {
+  using namespace llvm;
+  const llvm::DITypeIdentifierMap EmptyMap;
+  while (1) {
+    DIDerivedType *diDerivedTy = dyn_cast<DIDerivedType>(diTy);
+    if (!diDerivedTy)
+      return diTy;
+
+    switch (diTy->getTag()) {
+    case dwarf::DW_TAG_member:
+    case dwarf::DW_TAG_inheritance:
+    case dwarf::DW_TAG_typedef:
+    case dwarf::DW_TAG_reference_type:
+    case dwarf::DW_TAG_const_type:
+    case dwarf::DW_TAG_restrict_type:
+      diTy = diDerivedTy->getBaseType().resolve(EmptyMap);
+      break;
+    default:
+      return diTy;
+    }
+  }
+
+  return diTy;
+}
+
+static unsigned GetDITypeSizeInBits(llvm::DIType *diTy) {
+  return PeelTypedefs(diTy)->getSizeInBits();
+}
+
+static unsigned GetDITypeAlignmentInBits(llvm::DIType *diTy) {
+  return PeelTypedefs(diTy)->getAlignInBits();
+}
+
+static bool FindStructMemberFromStore(llvm::StoreInst *S,
+                                      std::string *OutMemberName) {
+  using namespace llvm;
+  Value *Ptr = S->getPointerOperand();
+  AllocaInst *Alloca = nullptr;
+
+  auto &DL = S->getModule()->getDataLayout();
+
+  unsigned OffsetInAlloca = 0;
+  while (Ptr) {
+    if (auto AI = dyn_cast<AllocaInst>(Ptr)) {
+      Alloca = AI;
+      break;
+    } else if (auto Gep = dyn_cast<GEPOperator>(Ptr)) {
+      if (Gep->getNumIndices() < 2 || !Gep->hasAllConstantIndices() ||
+          0 != cast<ConstantInt>(Gep->getOperand(1))->getLimitedValue()) {
+        return false;
+      }
+
+      auto GepSrcPtr = Gep->getPointerOperand();
+      Type *GepSrcPtrTy = GepSrcPtr->getType()->getPointerElementType();
+
+      Type *PeelingType = GepSrcPtrTy;
+      for (unsigned i = 1; i < Gep->getNumIndices(); i++) {
+        uint64_t Idx =
+            cast<ConstantInt>(Gep->getOperand(1 + i))->getLimitedValue();
+
+        if (PeelingType->isStructTy()) {
+          auto StructTy = cast<StructType>(PeelingType);
+          unsigned Offset =
+              DL.getStructLayout(StructTy)->getElementOffsetInBits(Idx);
+          OffsetInAlloca += Offset;
+          PeelingType = StructTy->getElementType(Idx);
+        } else if (PeelingType->isVectorTy()) {
+          OffsetInAlloca +=
+              DL.getTypeSizeInBits(PeelingType->getVectorElementType()) * Idx;
+          PeelingType = PeelingType->getVectorElementType();
+        } else if (PeelingType->isArrayTy()) {
+          OffsetInAlloca +=
+              DL.getTypeSizeInBits(PeelingType->getArrayElementType()) * Idx;
+          PeelingType = PeelingType->getArrayElementType();
+        } else {
+          return false;
+        }
+      }
+
+      Ptr = GepSrcPtr;
+    } else {
+      return false;
+    }
+  }
+
+  // If there's not exactly one dbg.* inst, give up for now.
+  if (hlsl::dxilutil::mdv_user_empty(Alloca) ||
+      std::next(hlsl::dxilutil::mdv_users_begin(Alloca)) !=
+          hlsl::dxilutil::mdv_users_end(Alloca)) {
+    return false;
+  }
+
+  auto DI = dyn_cast<DbgDeclareInst>(*hlsl::dxilutil::mdv_users_begin(Alloca));
+  if (!DI)
+    return false;
+
+  DILocalVariable *diVar = DI->getVariable();
+  DIExpression *diExpr = DI->getExpression();
+  const llvm::DITypeIdentifierMap EmptyMap;
+  DIType *diType = diVar->getType().resolve(EmptyMap);
+
+  unsigned MemberOffset = OffsetInAlloca;
+  if (diExpr->isBitPiece()) {
+    MemberOffset += diExpr->getBitPieceOffset();
+  }
+
+  diType = PeelTypedefs(diType);
+  if (!isa<DICompositeType>(diType))
+    return false;
+
+  unsigned OffsetInDI = 0;
+  std::string MemberName;
+
+  //=====================================================
+  // Find the correct member based on size
+  while (diType) {
+    diType = PeelTypedefs(diType);
+    if (DICompositeType *diCompType = dyn_cast<DICompositeType>(diType)) {
+      if (diCompType->getTag() == dwarf::DW_TAG_structure_type ||
+          diCompType->getTag() == dwarf::DW_TAG_class_type) {
+        bool FoundCompositeMember = false;
+        for (DINode *Elem : diCompType->getElements()) {
+          auto diElemType = dyn_cast<DIType>(Elem);
+          if (!diElemType)
+            return false;
+
+          StringRef CurMemberName;
+          if (diElemType->getTag() == dwarf::DW_TAG_member) {
+            CurMemberName = diElemType->getName();
+          } else if (diElemType->getTag() == dwarf::DW_TAG_inheritance) {
+          } else {
+            return false;
+          }
+
+          unsigned CompositeMemberSize = GetDITypeSizeInBits(diElemType);
+          unsigned CompositeMemberAlignment =
+              GetDITypeAlignmentInBits(diElemType);
+
+          assert(CompositeMemberAlignment);
+          OffsetInDI =
+              llvm::RoundUpToAlignment(OffsetInDI, CompositeMemberAlignment);
+
+          if (OffsetInDI <= MemberOffset &&
+              MemberOffset < OffsetInDI + CompositeMemberSize) {
+            diType = diElemType;
+            if (CurMemberName.size()) {
+              if (MemberName.size())
+                MemberName += ".";
+              MemberName += CurMemberName;
+            }
+            FoundCompositeMember = true;
+            break;
+          }
+
+          // TODO: How will we match up the padding?
+          OffsetInDI += CompositeMemberSize;
+        }
+
+        if (!FoundCompositeMember)
+          return false;
+      }
+      // For arrays, just flatten it for now.
+      // TODO: multi-dimension array
+      else if (diCompType->getTag() == dwarf::DW_TAG_array_type) {
+        if (MemberOffset < OffsetInDI ||
+            MemberOffset >= OffsetInDI + diCompType->getSizeInBits())
+          return false;
+        DIType *diArrayElemType = diCompType->getBaseType().resolve(EmptyMap);
+
+        {
+          unsigned CurSize = diCompType->getSizeInBits();
+          unsigned CurOffset = MemberOffset - OffsetInDI;
+          for (DINode *SubrangeMD : diCompType->getElements()) {
+            DISubrange *Range = cast<DISubrange>(SubrangeMD);
+
+            unsigned ElemSize = CurSize / Range->getCount();
+            unsigned Idx = CurOffset / ElemSize;
+
+            CurOffset -= ElemSize * Idx;
+            CurSize = ElemSize;
+
+            MemberName += "[";
+            MemberName += std::to_string(Idx);
+            MemberName += "]";
+          }
+        }
+
+        unsigned ArrayElemSize = GetDITypeSizeInBits(diArrayElemType);
+        unsigned FlattenedIdx = (MemberOffset - OffsetInDI) / ArrayElemSize;
+        OffsetInDI += FlattenedIdx * ArrayElemSize;
+        diType = diArrayElemType;
+      } else {
+        return false;
+      }
+    } else if (DIBasicType *diBasicType = dyn_cast<DIBasicType>(diType)) {
+      if (OffsetInDI == MemberOffset) {
+        *OutMemberName = MemberName;
+        return true;
+      }
+
+      OffsetInDI += diBasicType->getSizeInBits();
+      return false;
+    } else {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+std::string PixTest::Disassemble(IDxcBlob *pProgram) {
   CComPtr<IDxcCompiler> pCompiler;
-  CComPtr<IDxcCompiler2> pCompiler2;
-
   CComPtr<IDxcOperationResult> pResult;
   CComPtr<IDxcBlobEncoding> pSource;
-  CComPtr<IDxcBlob> pProgram;
-  CComPtr<IDxcBlob> pPdbBlob;
-  WCHAR *pDebugName = nullptr;
-
-  VERIFY_SUCCEEDED(CreateCompiler(&pCompiler));
-  VERIFY_SUCCEEDED(pCompiler.QueryInterface(&pCompiler2));
-  CreateBlobFromText(hlsl, &pSource);
-  LPCWSTR args[] = { L"/Zi", L"/Qembed_debug" };
-  VERIFY_SUCCEEDED(pCompiler2->CompileWithDebug(pSource, L"source.hlsl", L"main",
-    L"ps_6_0", args, _countof(args), nullptr, 0, nullptr, &pResult, &pDebugName, &pPdbBlob));
-  VERIFY_SUCCEEDED(pResult->GetResult(&pProgram));
-
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pProgramStream;
-
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pPdbBlob, &pProgramStream));
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaSource));
-  VERIFY_SUCCEEDED(pDiaSource->loadDataFromIStream(pProgramStream));
-
-  // Test that IDxcContainerReflection can consume a PDB container
-  CComPtr<IDxcContainerReflection> pReflection;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
-  VERIFY_SUCCEEDED(pReflection->Load(pPdbBlob));
-
-  UINT32 uDebugInfoIndex = 0;
-  VERIFY_SUCCEEDED(pReflection->FindFirstPartKind(hlsl::DFCC_ShaderDebugInfoDXIL, &uDebugInfoIndex));
-}
-
-TEST_F(PixTest, DiaLoadBadBitcodeThenFail) {
-  CComPtr<IDxcBlob> pBadBitcode;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pStream;
-  CComPtr<IDxcLibrary> pLib;
-
-  Utf8ToBlob(m_dllSupport, "badcode", &pBadBitcode);
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pBadBitcode, &pStream));
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaSource));
-  VERIFY_FAILED(pDiaSource->loadDataFromIStream(pStream));
-}
-
-static void CompileAndGetDebugPart(dxc::DxcDllSupport &dllSupport, const char *source, wchar_t *profile, IDxcBlob **ppDebugPart) {
-  CComPtr<IDxcBlob> pContainer;
-  CComPtr<IDxcLibrary> pLib;
-  CComPtr<IDxcContainerReflection> pReflection;
-  UINT32 index;
-  std::vector<LPCWSTR> args;
-  args.push_back(L"/Zi");
-  args.push_back(L"/Qembed_debug");
-
-  VerifyCompileOK(dllSupport, source, profile, args, &pContainer);
-  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
-  VERIFY_SUCCEEDED(pReflection->Load(pContainer));
-  VERIFY_SUCCEEDED(pReflection->FindFirstPartKind(hlsl::DFCC_ShaderDebugInfoDXIL, &index));
-  VERIFY_SUCCEEDED(pReflection->GetPartContent(index, ppDebugPart));
-}
-
-static void CompileTestAndLoadDiaSource(dxc::DxcDllSupport &dllSupport, const char *source, wchar_t *profile, IDiaDataSource **ppDataSource) {
-  CComPtr<IDxcBlob> pDebugContent;
-  CComPtr<IStream> pStream;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-
-  CompileAndGetDebugPart(dllSupport, source, profile, &pDebugContent);
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pDebugContent, &pStream));
-  VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaSource));
-  VERIFY_SUCCEEDED(pDiaSource->loadDataFromIStream(pStream));
-  if (ppDataSource) {
-    *ppDataSource = pDiaSource.Detach();
-  }
-}
-
-static const char EmptyCompute[] = "[numthreads(8,8,1)] void main() { }";
-
-static void CompileTestAndLoadDia(dxc::DxcDllSupport &dllSupport, IDiaDataSource **ppDataSource) {
-  CompileTestAndLoadDiaSource(dllSupport, EmptyCompute, L"cs_6_0", ppDataSource);
-}
-
-TEST_F(PixTest, DiaLoadDebugSubrangeNegativeThenOK) {
-  static const char source[] = R"(
-    SamplerState  samp0 : register(s0);
-    Texture2DArray tex0 : register(t0);
-
-    float4 foo(Texture2DArray textures[], int idx, SamplerState samplerState, float3 uvw) {
-      return textures[NonUniformResourceIndex(idx)].Sample(samplerState, uvw);
-    }
-
-    [RootSignature( "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)) " )]
-    float4 main(int index : INDEX, float3 uvw : TEXCOORD) : SV_Target {
-      Texture2DArray textures[] = {
-        tex0,
-      };
-      return foo(textures, index, samp0, uvw);
-    }
-  )";
-
-  CComPtr<IDiaDataSource> pDiaDataSource;
-  CComPtr<IDiaSession> pDiaSession;
-  CompileTestAndLoadDiaSource(m_dllSupport, source, L"ps_6_0", &pDiaDataSource);
-
-  VERIFY_SUCCEEDED(pDiaDataSource->openSession(&pDiaSession));
-}
-
-TEST_F(PixTest, DiaLoadRelocatedBitcode) {
-
-  static const char source[] = R"(
-    SamplerState  samp0 : register(s0);
-    Texture2DArray tex0 : register(t0);
-
-    float4 foo(Texture2DArray textures[], int idx, SamplerState samplerState, float3 uvw) {
-      return textures[NonUniformResourceIndex(idx)].Sample(samplerState, uvw);
-    }
-
-    [RootSignature( "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)) " )]
-    float4 main(int index : INDEX, float3 uvw : TEXCOORD) : SV_Target {
-      Texture2DArray textures[] = {
-        tex0,
-      };
-      return foo(textures, index, samp0, uvw);
-    }
-  )";
-
-  CComPtr<IDxcBlob> pPart;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pStream;
-
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-
-  CompileAndGetDebugPart(m_dllSupport, source, L"ps_6_0", &pPart);
-  const char *pPartData = (char *)pPart->GetBufferPointer();
-  const size_t uPartSize = pPart->GetBufferSize();
-
-  // Get program header
-  const hlsl::DxilProgramHeader *programHeader = (hlsl::DxilProgramHeader *)pPartData;
-
-  const char *pBitcode = nullptr;
-  uint32_t uBitcodeSize = 0;
-  hlsl::GetDxilProgramBitcode(programHeader, &pBitcode, &uBitcodeSize);
-  VERIFY_IS_TRUE(uBitcodeSize % sizeof(UINT32) == 0);
-
-  size_t uNewGapSize = 4 * 10; // Size of some bytes between program header and bitcode
-  size_t uNewSuffixeBytes = 4 * 10; // Size of some random bytes after the program
-
-  hlsl::DxilProgramHeader newProgramHeader = {};
-  memcpy(&newProgramHeader, programHeader, sizeof(newProgramHeader));
-  newProgramHeader.BitcodeHeader.BitcodeOffset = uNewGapSize + sizeof(newProgramHeader.BitcodeHeader);
-
-  unsigned uNewSizeInBytes = sizeof(newProgramHeader) + uNewGapSize + uBitcodeSize + uNewSuffixeBytes;
-  VERIFY_IS_TRUE(uNewSizeInBytes % sizeof(UINT32) == 0);
-  newProgramHeader.SizeInUint32 = uNewSizeInBytes / sizeof(UINT32);
-
-  llvm::SmallVector<char, 0> buffer;
-  llvm::raw_svector_ostream OS(buffer);
-
-  // Write the header
-  OS.write((char *)&newProgramHeader, sizeof(newProgramHeader));
-
-  // Write some garbage between the header and the bitcode
-  for (unsigned i = 0; i < uNewGapSize; i++) {
-    OS.write(0xFF);
-  }
-
-  // Write the actual bitcode
-  OS.write(pBitcode, uBitcodeSize);
-
-  // Write some garbage after the bitcode
-  for (unsigned i = 0; i < uNewSuffixeBytes; i++) {
-    OS.write(0xFF);
-  }
-  OS.flush();
-
-  // Try to load this new program, make sure dia is still okay.
-  CComPtr<IDxcBlobEncoding> pNewProgramBlob;
-  VERIFY_SUCCEEDED(pLib->CreateBlobWithEncodingFromPinned(buffer.data(), buffer.size(), CP_ACP, &pNewProgramBlob));
-
-  CComPtr<IStream> pNewProgramStream;
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pNewProgramBlob, &pNewProgramStream));
-
-  CComPtr<IDiaDataSource> pDiaDataSource;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaDataSource));
-
-  VERIFY_SUCCEEDED(pDiaDataSource->loadDataFromIStream(pNewProgramStream));
-}
-
-TEST_F(PixTest, DiaCompileArgs) {
-  static const char source[] = R"(
-    SamplerState  samp0 : register(s0);
-    Texture2DArray tex0 : register(t0);
-
-    float4 foo(Texture2DArray textures[], int idx, SamplerState samplerState, float3 uvw) {
-      return textures[NonUniformResourceIndex(idx)].Sample(samplerState, uvw);
-    }
-
-    [RootSignature( "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)) " )]
-    float4 main(int index : INDEX, float3 uvw : TEXCOORD) : SV_Target {
-      Texture2DArray textures[] = {
-        tex0,
-      };
-      return foo(textures, index, samp0, uvw);
-    }
-  )";
-
-  CComPtr<IDxcBlob> pPart;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pStream;
-
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-
-  const WCHAR *FlagList[] = {
-    L"/Zi",
-    L"-Zpr",
-    L"/Qembed_debug",
-    L"/Fd", L"F:\\my dir\\",
-    L"-Fo", L"F:\\my dir\\file.dxc",
-  };
-  const WCHAR *DefineList[] = {
-    L"MY_SPECIAL_DEFINE",
-    L"MY_OTHER_SPECIAL_DEFINE=\"MY_STRING\"",
-  };
-
-  std::vector<LPCWSTR> args;
-  for (unsigned i = 0; i < _countof(FlagList); i++) {
-    args.push_back(FlagList[i]);
-  }
-  for (unsigned i = 0; i < _countof(DefineList); i++) {
-    args.push_back(L"/D");
-    args.push_back(DefineList[i]);
-  }
-
-  auto CompileAndGetDebugPart = [&args](dxc::DxcDllSupport &dllSupport, const char *source, wchar_t *profile, IDxcBlob **ppDebugPart) {
-    CComPtr<IDxcBlob> pContainer;
-    CComPtr<IDxcLibrary> pLib;
-    CComPtr<IDxcContainerReflection> pReflection;
-    UINT32 index;
-
-    VerifyCompileOK(dllSupport, source, profile, args, &pContainer);
-    VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-    VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
-    VERIFY_SUCCEEDED(pReflection->Load(pContainer));
-    VERIFY_SUCCEEDED(pReflection->FindFirstPartKind(hlsl::DFCC_ShaderDebugInfoDXIL, &index));
-    VERIFY_SUCCEEDED(pReflection->GetPartContent(index, ppDebugPart));
-  };
-
-  CompileAndGetDebugPart(m_dllSupport, source, L"ps_6_0", &pPart);
-
-  CComPtr<IStream> pNewProgramStream;
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pPart, &pNewProgramStream));
-
-  CComPtr<IDiaDataSource> pDiaDataSource;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaDataSource));
-
-  VERIFY_SUCCEEDED(pDiaDataSource->loadDataFromIStream(pNewProgramStream));
-
-  CComPtr<IDiaSession> pSession;
-  VERIFY_SUCCEEDED(pDiaDataSource->openSession(&pSession));
-
-  CComPtr<IDiaEnumTables> pEnumTables;
-  VERIFY_SUCCEEDED(pSession->getEnumTables(&pEnumTables));
-
-  CComPtr<IDiaTable> pSymbolTable;
-
-  LONG uCount = 0;
-  VERIFY_SUCCEEDED(pEnumTables->get_Count(&uCount));
-  for (int i = 0; i < uCount; i++) {
-    CComPtr<IDiaTable> pTable;
-    VARIANT index = {};
-    index.vt = VT_I4;
-    index.intVal = i;
-    VERIFY_SUCCEEDED(pEnumTables->Item(index, &pTable));
-
-    CComBSTR pName;
-    VERIFY_SUCCEEDED(pTable->get_name(&pName));
-
-    if (pName == "Symbols") {
-      pSymbolTable = pTable;
-      break;
-    }
-  }
-
-  std::wstring Args;
-  std::wstring Entry;
-  std::wstring Target;
-  std::vector<std::wstring> Defines;
-  std::vector<std::wstring> Flags;
-
-  auto ReadNullSeparatedTokens = [](BSTR Str) -> std::vector<std::wstring> {
-    std::vector<std::wstring> Result;
-    while (*Str) {
-      Result.push_back(std::wstring(Str));
-      Str += wcslen(Str)+1;
-    }
-    return Result;
-  };
-
-  VERIFY_SUCCEEDED(pSymbolTable->get_Count(&uCount));
-  for (int i = 0; i < uCount; i++) {
-    CComPtr<IUnknown> pSymbolUnk;
-    CComPtr<IDiaSymbol> pSymbol;
-    CComVariant pValue;
-    CComBSTR pName;
-    VERIFY_SUCCEEDED(pSymbolTable->Item(i, &pSymbolUnk));
-    VERIFY_SUCCEEDED(pSymbolUnk->QueryInterface(&pSymbol));
-    VERIFY_SUCCEEDED(pSymbol->get_name(&pName));
-    VERIFY_SUCCEEDED(pSymbol->get_value(&pValue));
-    if (pName == "hlslTarget") {
-      if (pValue.vt == VT_BSTR)
-        Target = pValue.bstrVal;
-    }
-    else if (pName == "hlslEntry") {
-      if (pValue.vt == VT_BSTR)
-        Entry = pValue.bstrVal;
-    }
-    else if (pName == "hlslFlags") {
-      if (pValue.vt == VT_BSTR)
-        Flags = ReadNullSeparatedTokens(pValue.bstrVal);
-    }
-    else if (pName == "hlslArguments") {
-      if (pValue.vt == VT_BSTR)
-        Args = pValue.bstrVal;
-    }
-    else if (pName == "hlslDefines") {
-      if (pValue.vt == VT_BSTR)
-        Defines = ReadNullSeparatedTokens(pValue.bstrVal);
-    }
-  }
-
-  auto VectorContains = [](std::vector<std::wstring> &Tokens, std::wstring Sub) {
-    for (unsigned i = 0; i < Tokens.size(); i++) {
-      if (Tokens[i].find(Sub) != std::wstring::npos)
-        return true;
-    }
-    return false;
-  };
-
-  VERIFY_IS_TRUE(Target == L"ps_6_0");
-  VERIFY_IS_TRUE(Entry == L"main");
-
-  VERIFY_IS_TRUE(_countof(FlagList) == Flags.size());
-  for (unsigned i = 0; i < _countof(FlagList); i++) {
-    VERIFY_IS_TRUE(Flags[i] == FlagList[i]);
-  }
-  for (unsigned i = 0; i < _countof(DefineList); i++) {
-    VERIFY_IS_TRUE(VectorContains(Defines, DefineList[i]));
-  }
-}
-
-TEST_F(PixTest, DiaLoadBitcodePlusExtraData) {
-  // Test that dia doesn't crash when bitcode has unused extra data at the end
-
-  static const char source[] = R"(
-    SamplerState  samp0 : register(s0);
-    Texture2DArray tex0 : register(t0);
-
-    float4 foo(Texture2DArray textures[], int idx, SamplerState samplerState, float3 uvw) {
-      return textures[NonUniformResourceIndex(idx)].Sample(samplerState, uvw);
-    }
-
-    [RootSignature( "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)) " )]
-    float4 main(int index : INDEX, float3 uvw : TEXCOORD) : SV_Target {
-      Texture2DArray textures[] = {
-        tex0,
-      };
-      return foo(textures, index, samp0, uvw);
-    }
-  )";
-
-  CComPtr<IDxcBlob> pPart;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pStream;
-
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-
-  CompileAndGetDebugPart(m_dllSupport, source, L"ps_6_0", &pPart);
-  const char *pPartData = (char *)pPart->GetBufferPointer();
-  const size_t uPartSize = pPart->GetBufferSize();
-
-  // Get program header
-  const hlsl::DxilProgramHeader *programHeader = (hlsl::DxilProgramHeader *)pPartData;
-
-  const char *pBitcode = nullptr;
-  uint32_t uBitcodeSize = 0;
-  hlsl::GetDxilProgramBitcode(programHeader, &pBitcode, &uBitcodeSize);
-
-  llvm::SmallVector<char, 0> buffer;
-  llvm::raw_svector_ostream OS(buffer);
-
-  // Write the bitcode
-  OS.write(pBitcode, uBitcodeSize);
-  for (unsigned i = 0; i < 12; i++) {
-    OS.write(0xFF);
-  }
-  OS.flush();
-
-  // Try to load this new program, make sure dia is still okay.
-  CComPtr<IDxcBlobEncoding> pNewProgramBlob;
-  VERIFY_SUCCEEDED(pLib->CreateBlobWithEncodingFromPinned(buffer.data(), buffer.size(), CP_ACP, &pNewProgramBlob));
-
-  CComPtr<IStream> pNewProgramStream;
-  VERIFY_SUCCEEDED(pLib->CreateStreamFromBlobReadOnly(pNewProgramBlob, &pNewProgramStream));
-
-  CComPtr<IDiaDataSource> pDiaDataSource;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaDataSource));
-
-  VERIFY_SUCCEEDED(pDiaDataSource->loadDataFromIStream(pNewProgramStream));
-}
-
-TEST_F(PixTest, DiaLoadDebugThenOK) {
-  CompileTestAndLoadDia(m_dllSupport, nullptr);
-}
-
-TEST_F(PixTest, DiaTableIndexThenOK) {
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IDiaSession> pDiaSession;
-  CComPtr<IDiaEnumTables> pEnumTables;
-  CComPtr<IDiaTable> pTable;
-  VARIANT vtIndex;
-  CompileTestAndLoadDia(m_dllSupport, &pDiaSource);
-  VERIFY_SUCCEEDED(pDiaSource->openSession(&pDiaSession));
-  VERIFY_SUCCEEDED(pDiaSession->getEnumTables(&pEnumTables));
-
-  vtIndex.vt = VT_EMPTY;
-  VERIFY_FAILED(pEnumTables->Item(vtIndex, &pTable));
-
-  vtIndex.vt = VT_I4;
-  vtIndex.intVal = 1;
-  VERIFY_SUCCEEDED(pEnumTables->Item(vtIndex, &pTable));
-  VERIFY_IS_NOT_NULL(pTable.p);
-  pTable.Release();
-
-  vtIndex.vt = VT_UI4;
-  vtIndex.uintVal = 1;
-  VERIFY_SUCCEEDED(pEnumTables->Item(vtIndex, &pTable));
-  VERIFY_IS_NOT_NULL(pTable.p);
-  pTable.Release();
-
-  vtIndex.uintVal = 100;
-  VERIFY_FAILED(pEnumTables->Item(vtIndex, &pTable));
-}
-
-TEST_F(PixTest, PixDebugCompileInfo) {
-  static const char source[] = R"(
-    SamplerState  samp0 : register(s0);
-    Texture2DArray tex0 : register(t0);
-
-    float4 foo(Texture2DArray textures[], int idx, SamplerState samplerState, float3 uvw) {
-      return textures[NonUniformResourceIndex(idx)].Sample(samplerState, uvw);
-    }
-
-    [RootSignature( "DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)) " )]
-    float4 main(int index : INDEX, float3 uvw : TEXCOORD) : SV_Target {
-      Texture2DArray textures[] = {
-        tex0,
-      };
-      return foo(textures, index, samp0, uvw);
-    }
-  )";
-
-  CComPtr<IDxcBlob> pPart;
-  CComPtr<IDiaDataSource> pDiaSource;
-  CComPtr<IStream> pStream;
-
-  CComPtr<IDxcLibrary> pLib;
-  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-
-  const WCHAR *FlagList[] = {
-      L"/Zi",          L"-Zpr", L"/Qembed_debug",        L"/Fd",
-      L"F:\\my dir\\", L"-Fo",  L"F:\\my dir\\file.dxc",
-  };
-  const WCHAR *DefineList[] = {
-      L"MY_SPECIAL_DEFINE",
-      L"MY_OTHER_SPECIAL_DEFINE=\"MY_STRING\"",
-  };
-
-  std::vector<LPCWSTR> args;
-  for (unsigned i = 0; i < _countof(FlagList); i++) {
-    args.push_back(FlagList[i]);
-  }
-  for (unsigned i = 0; i < _countof(DefineList); i++) {
-    args.push_back(L"/D");
-    args.push_back(DefineList[i]);
-  }
-
-  auto CompileAndGetDebugPart = [&args](dxc::DxcDllSupport &dllSupport,
-                                        const char *source, wchar_t *profile,
-                                        IDxcBlob **ppDebugPart) {
-    CComPtr<IDxcBlob> pContainer;
-    CComPtr<IDxcLibrary> pLib;
-    CComPtr<IDxcContainerReflection> pReflection;
-    UINT32 index;
-
-    VerifyCompileOK(dllSupport, source, profile, args, &pContainer);
-    VERIFY_SUCCEEDED(dllSupport.CreateInstance(CLSID_DxcLibrary, &pLib));
-    VERIFY_SUCCEEDED(
-        dllSupport.CreateInstance(CLSID_DxcContainerReflection, &pReflection));
-    VERIFY_SUCCEEDED(pReflection->Load(pContainer));
-    VERIFY_SUCCEEDED(
-        pReflection->FindFirstPartKind(hlsl::DFCC_ShaderDebugInfoDXIL, &index));
-    VERIFY_SUCCEEDED(pReflection->GetPartContent(index, ppDebugPart));
-  };
-
-  constexpr wchar_t *profile = L"ps_6_0";
-  CompileAndGetDebugPart(m_dllSupport, source, profile, &pPart);
-
-  CComPtr<IStream> pNewProgramStream;
-  VERIFY_SUCCEEDED(
-      pLib->CreateStreamFromBlobReadOnly(pPart, &pNewProgramStream));
-
-  CComPtr<IDiaDataSource> pDiaDataSource;
-  VERIFY_SUCCEEDED(
-      m_dllSupport.CreateInstance(CLSID_DxcDiaDataSource, &pDiaDataSource));
-
-  VERIFY_SUCCEEDED(pDiaDataSource->loadDataFromIStream(pNewProgramStream));
-
-  CComPtr<IDiaSession> pSession;
-  VERIFY_SUCCEEDED(pDiaDataSource->openSession(&pSession));
-
-  CComPtr<IDxcPixDxilDebugInfoFactory> factory;
-  VERIFY_SUCCEEDED(pSession->QueryInterface(IID_PPV_ARGS(&factory)));
-
-  CComPtr<IDxcPixCompilationInfo> compilationInfo;
-  VERIFY_SUCCEEDED(factory->NewDxcPixCompilationInfo(&compilationInfo));
-
-  CComBSTR arguments;
-  VERIFY_SUCCEEDED(compilationInfo->GetArguments(&arguments));
-  for (unsigned i = 0; i < _countof(FlagList); i++) {
-    VERIFY_IS_TRUE(nullptr != wcsstr(arguments, FlagList[i]));
-  }
-
-  CComBSTR macros;
-  VERIFY_SUCCEEDED(compilationInfo->GetMacroDefinitions(&macros));
-  for (unsigned i = 0; i < _countof(DefineList); i++) {
-    std::wstring MacroDef = std::wstring(L"-D") + DefineList[i];
-    VERIFY_IS_TRUE(nullptr != wcsstr(macros, MacroDef.c_str()));
-  }
-
-  CComBSTR entryPointFile;
-  VERIFY_SUCCEEDED(compilationInfo->GetEntryPointFile(&entryPointFile));
-  VERIFY_ARE_EQUAL(std::wstring(L"source.hlsl"), std::wstring(entryPointFile));
-
-  CComBSTR entryPointFunction;
-  VERIFY_SUCCEEDED(compilationInfo->GetEntryPoint(&entryPointFunction));
-  VERIFY_ARE_EQUAL(std::wstring(L"main"), std::wstring(entryPointFunction));
-
-  CComBSTR hlslTarget;
-  VERIFY_SUCCEEDED(compilationInfo->GetHlslTarget(&hlslTarget));
-  VERIFY_ARE_EQUAL(std::wstring(profile), std::wstring(hlslTarget));
+  VERIFY_SUCCEEDED(CreateCompiler(m_dllSupport, &pCompiler));
+  CComPtr<IDxcBlobEncoding> pDisassembly;
+  VERIFY_SUCCEEDED(pCompiler->Disassemble(pProgram, &pDisassembly));
+  return BlobToUtf8(pDisassembly);
 }
 
 // This function lives in lib\DxilPIXPasses\DxilAnnotateWithVirtualRegister.cpp
 // Declared here so we can test it.
-uint32_t CountStructMembers(llvm::Type const* pType);
+uint32_t CountStructMembers(llvm::Type const *pType);
 
 PixTest::TestableResults PixTest::TestStructAnnotationCase(
-    const char* hlsl, 
-    const wchar_t * optimizationLevel,
-    bool validateCoverage)
-{
-    auto pOperationResult = Compile(hlsl, L"as_6_5", { optimizationLevel } );
-  CComPtr<IDxcBlob> pBlob;
-  CheckOperationSucceeded(pOperationResult, &pBlob);
+    const char *hlsl, const wchar_t *optimizationLevel, bool validateCoverage,
+    const wchar_t *profile) {
+  CComPtr<IDxcBlob> pBlob =
+      Compile(m_dllSupport, hlsl, profile,
+              {optimizationLevel, L"-HV", L"2018", L"-enable-16bit-types"});
 
   CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
 
-  PassOutput passOutput = RunAnnotationPasses(pDxil);
+  PassOutput passOutput = RunAnnotationPasses(m_dllSupport, pDxil);
 
   auto pAnnotated = passOutput.blob;
 
   CComPtr<IDxcBlob> pAnnotatedContainer;
-  ReplaceDxilBlobPart(
-    pBlob->GetBufferPointer(),
-    pBlob->GetBufferSize(),
-    pAnnotated,
-    &pAnnotatedContainer);
+  ReplaceDxilBlobPart(pBlob->GetBufferPointer(), pBlob->GetBufferSize(),
+                      pAnnotated, &pAnnotatedContainer);
 
 #if 0 // handy for debugging
   auto disTextW = Disassemble(pAnnotatedContainer);
-  WEX::Logging::Log::Comment(disTextW.c_str());
 #endif
 
   ModuleAndHangersOn moduleEtc(pAnnotatedContainer);
-  
-  llvm::Function *entryFunction = moduleEtc.GetDxilModule().GetEntryFunction();
-
   PixTest::TestableResults ret;
 
   // For every dbg.declare, run the member iterator and record what it finds:
-  for (auto& block : entryFunction->getBasicBlockList())
-  {
-    for (auto& instruction : block.getInstList())
-    {
-      if (auto* dbgDeclare = llvm::dyn_cast<llvm::DbgDeclareInst>(&instruction))
-      {
-        llvm::Value* Address = dbgDeclare->getAddress();
-        auto* AddressAsAlloca = llvm::dyn_cast<llvm::AllocaInst>(Address);
-        if (AddressAsAlloca != nullptr)
-        {
-            auto* Expression = dbgDeclare->getExpression();
+  auto entryPoints = moduleEtc.GetDxilModule().GetExportedFunctions();
+  for (auto &entryFunction : entryPoints) {
+    for (auto &block : entryFunction->getBasicBlockList()) {
+      for (auto &instruction : block.getInstList()) {
+        if (auto *dbgDeclare =
+                llvm::dyn_cast<llvm::DbgDeclareInst>(&instruction)) {
+          llvm::Value *Address = dbgDeclare->getAddress();
+          auto *AddressAsAlloca = llvm::dyn_cast<llvm::AllocaInst>(Address);
+          if (AddressAsAlloca != nullptr) {
+            auto *Expression = dbgDeclare->getExpression();
 
-            std::unique_ptr<dxil_debug_info::MemberIterator> iterator = dxil_debug_info::CreateMemberIterator(
-                dbgDeclare,
-                moduleEtc.GetDxilModule().GetModule()->getDataLayout(),
-                AddressAsAlloca,
-                Expression);
+            std::unique_ptr<dxil_debug_info::MemberIterator> iterator =
+                dxil_debug_info::CreateMemberIterator(
+                    dbgDeclare,
+                    moduleEtc.GetDxilModule().GetModule()->getDataLayout(),
+                    AddressAsAlloca, Expression);
 
             unsigned int startingBit = 0;
             unsigned int coveredBits = 0;
             unsigned int memberIndex = 0;
             unsigned int memberCount = 0;
-            while (iterator->Next(&memberIndex))
-            {
-                memberCount++;
-                if (memberIndex == 0)
-                {
-                    startingBit = iterator->OffsetInBits(memberIndex);
-                    coveredBits = iterator->SizeInBits(memberIndex);
-                }
-                else
-                {
-                    coveredBits = std::max<unsigned int>(coveredBits, iterator->OffsetInBits(memberIndex) + iterator->SizeInBits(memberIndex));
-                }
-            }
-
-            ret.OffsetAndSizes.push_back({ memberCount, startingBit, coveredBits });
-
-            // Use this independent count of number of struct members to test the 
-            // function that operates on the alloca type:
-            llvm::Type* pAllocaTy = AddressAsAlloca->getType()->getElementType();
-            if (auto* AT = llvm::dyn_cast<llvm::ArrayType>(pAllocaTy))
-            {
-                // This is the case where a struct is passed to a function, and in 
-                // these tests there should be only one struct behind the pointer.
-                VERIFY_ARE_EQUAL(AT->getNumElements(), 1);
-                pAllocaTy = AT->getArrayElementType();
-            }
-
-            if (auto* ST = llvm::dyn_cast<llvm::StructType>(pAllocaTy))
-            {
-                uint32_t countOfMembers = CountStructMembers(ST);
-                // memberIndex might be greater, because the fragment iterator also includes contained derived types as
-                // fragments, in addition to the members of that contained derived types. CountStructMembers only counts
-                // the leaf-node types.
-                VERIFY_ARE_EQUAL(countOfMembers, memberCount);
-            }
-            else if (pAllocaTy->isFloatingPointTy() || pAllocaTy->isIntegerTy())
-            {
-                // If there's only one member in the struct in the pass-to-function (by pointer)
-                // case, then the underlying type will have been reduced to the contained type.
-                VERIFY_ARE_EQUAL(1, memberCount);
-            }
-            else
-            {
-                VERIFY_IS_TRUE(false);
-            }
-        }
-      }
-    }
-  }
-
-  // The member iterator should find a solid run of bits that is exactly covered
-  // by exactly one of the members found by the annotation pass:
-  if (validateCoverage)
-  {
-      for (auto const& cover : ret.OffsetAndSizes)
-      {
-          bool found = false;
-          for (auto const& valueLocation : passOutput.valueLocations)
-          {
-              constexpr unsigned int eightBitsPerByte = 8;
-              if (valueLocation.base * eightBitsPerByte == cover.offset)
-              {
-                  VERIFY_IS_FALSE(found);
-                  found = true;
-                  VERIFY_ARE_EQUAL(valueLocation.count, cover.countOfMembers);
+            while (iterator->Next(&memberIndex)) {
+              memberCount++;
+              if (memberIndex == 0) {
+                startingBit = iterator->OffsetInBits(memberIndex);
+                coveredBits = iterator->SizeInBits(memberIndex);
+              } else {
+                coveredBits = std::max<unsigned int>(
+                    coveredBits, iterator->OffsetInBits(memberIndex) +
+                                     iterator->SizeInBits(memberIndex));
               }
+            }
+
+            AggregateOffsetAndSize OffsetAndSize = {};
+            OffsetAndSize.countOfMembers = memberCount;
+            OffsetAndSize.offset = startingBit;
+            OffsetAndSize.size = coveredBits;
+            ret.OffsetAndSizes.push_back(OffsetAndSize);
+
+            // Use this independent count of number of struct members to test
+            // the function that operates on the alloca type:
+            llvm::Type *pAllocaTy =
+                AddressAsAlloca->getType()->getElementType();
+            if (auto *AT = llvm::dyn_cast<llvm::ArrayType>(pAllocaTy)) {
+              // This is the case where a struct is passed to a function, and
+              // in these tests there should be only one struct behind the
+              // pointer.
+              VERIFY_ARE_EQUAL(AT->getNumElements(), 1u);
+              pAllocaTy = AT->getArrayElementType();
+            }
+
+            if (auto *ST = llvm::dyn_cast<llvm::StructType>(pAllocaTy)) {
+              uint32_t countOfMembers = CountStructMembers(ST);
+              // memberIndex might be greater, because the fragment iterator
+              // also includes contained derived types as fragments, in
+              // addition to the members of that contained derived types.
+              // CountStructMembers only counts the leaf-node types.
+              VERIFY_ARE_EQUAL(countOfMembers, memberCount);
+            } else if (pAllocaTy->isFloatingPointTy() ||
+                       pAllocaTy->isIntegerTy()) {
+              // If there's only one member in the struct in the
+              // pass-to-function (by pointer) case, then the underlying type
+              // will have been reduced to the contained type.
+              VERIFY_ARE_EQUAL(1u, memberCount);
+            } else {
+              VERIFY_IS_TRUE(false);
+            }
           }
-          VERIFY_IS_TRUE(found);
+        }
       }
-  }
+    }
 
-  // For every store operation to the struct alloca, check that the annotation pass correctly determined which alloca
-  for (auto& block : entryFunction->getBasicBlockList()) {
-    for (auto& instruction : block.getInstList()) {
-      if (auto* store =
-        llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
-
-        if (auto* pGEP = llvm::dyn_cast<llvm::GetElementPtrInst>(store->getPointerOperand()))
+    // The member iterator should find a solid run of bits that is exactly
+    // covered by exactly one of the members found by the annotation pass:
+    if (validateCoverage) {
+      unsigned CurRegIdx = 0;
+      for (AggregateOffsetAndSize const &cover :
+           ret.OffsetAndSizes) // For each entry read from member iterators
+                               // and dbg.declares
+      {
+        bool found = false;
+        for (ValueLocation const &valueLocation :
+             passOutput.valueLocations) // For each allocas and dxil values
         {
-          ret.AllocaWrites.push_back({});
-          auto& NewAllocaWrite = ret.AllocaWrites.back();
-          llvm::Value* pPointerOperand = pGEP->getPointerOperand();
-          if (auto* pGEP2 = llvm::dyn_cast<llvm::GetElementPtrInst>(pPointerOperand))
-          {
-            auto *pMemberIndex = llvm::dyn_cast<llvm::ConstantInt>(
-                pGEP->getOperand(2));
-            uint64_t memberIndex = pMemberIndex->getLimitedValue();
-            // Until we have debugging info for floatN, matrixNxM etc., we can't get the name:
-            // auto *secondPointer = pGEP2->getPointerOperandType();
-            // auto* pStruct =
-            // llvm::dyn_cast<llvm::StructType>(secondPointer->getVectorElementType());
-            NewAllocaWrite.memberName =
-                "member" + std::to_string(memberIndex);
+          if (CurRegIdx == (unsigned)valueLocation.base &&
+              (unsigned)valueLocation.count == cover.countOfMembers) {
+            VERIFY_IS_FALSE(found);
+            found = true;
           }
-          else
-          {
-            NewAllocaWrite.memberName = pGEP->getName();
-          }
+        }
+        VERIFY_IS_TRUE(found);
+        CurRegIdx += cover.countOfMembers;
+      }
+    }
 
-          llvm::Value* index;
-          if (pix_dxil::PixAllocaRegWrite::FromInst(
-            store, 
-            &NewAllocaWrite.regBase, 
-            &NewAllocaWrite.regSize,
-            &index)) {
-            auto* asInt = llvm::dyn_cast<llvm::ConstantInt>(index);
-            NewAllocaWrite.index = asInt->getLimitedValue();
+    // For every store operation to the struct alloca, check that the
+    // annotation pass correctly determined which alloca
+    for (auto &block : entryFunction->getBasicBlockList()) {
+      for (auto &instruction : block.getInstList()) {
+        if (auto *store = llvm::dyn_cast<llvm::StoreInst>(&instruction)) {
+
+          AllocaWrite NewAllocaWrite = {};
+          if (FindStructMemberFromStore(store, &NewAllocaWrite.memberName)) {
+            llvm::Value *index;
+            if (pix_dxil::PixAllocaRegWrite::FromInst(
+                    store, &NewAllocaWrite.regBase, &NewAllocaWrite.regSize,
+                    &index)) {
+              auto *asInt = llvm::dyn_cast<llvm::ConstantInt>(index);
+              NewAllocaWrite.index = asInt->getLimitedValue();
+              ret.AllocaWrites.push_back(NewAllocaWrite);
+            }
           }
         }
       }
     }
   }
-
   return ret;
 }
 
 void PixTest::ValidateAllocaWrite(std::vector<AllocaWrite> const &allocaWrites,
                                   size_t index, const char *name) {
-  VERIFY_ARE_EQUAL(index, allocaWrites[index].regBase + allocaWrites[index].index);
-#if DBG
+  VERIFY_ARE_EQUAL(index,
+                   allocaWrites[index].regBase + allocaWrites[index].index);
+#ifndef NDEBUG
   // Compilation may add a prefix to the struct member name:
-  VERIFY_IS_TRUE(0 == strncmp(name, allocaWrites[index].memberName.c_str(), strlen(name)));
+  VERIFY_IS_TRUE(
+      0 == strncmp(name, allocaWrites[index].memberName.c_str(), strlen(name)));
 #endif
 }
 
-std::vector<const wchar_t*> OptimizationChoices ({ L"-Od", L"-O1" });
+struct OptimizationChoice {
+  const wchar_t *Flag;
+  bool IsOptimized;
+};
+static const OptimizationChoice OptimizationChoices[] = {
+    {L"-Od", false},
+    {L"-O1", true},
+};
+
+TEST_F(PixTest, PixStructAnnotation_Lib_DualRaygen) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
+
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
+
+RaytracingAccelerationStructure Scene : register(t0, space0);
+RWTexture2D<float4> RenderTarget : register(u0);
+
+struct SceneConstantBuffer
+{
+    float4x4 projectionToWorld;
+    float4 cameraPosition;
+    float4 lightPosition;
+    float4 lightAmbientColor;
+    float4 lightDiffuseColor;
+};
+
+ConstantBuffer<SceneConstantBuffer> g_sceneCB : register(b0);
+
+struct RayPayload
+{
+    float4 color;
+};
+
+inline void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
+{
+    float2 xy = index + 0.5f; // center in the middle of the pixel.
+    float2 screenPos = xy;// / DispatchRaysDimensions().xy * 2.0 - 1.0;
+
+    // Invert Y for DirectX-style coordinates.
+    screenPos.y = -screenPos.y;
+
+    // Unproject the pixel coordinate into a ray.
+    float4 world = /*mul(*/float4(screenPos, 0, 1)/*, g_sceneCB.projectionToWorld)*/;
+
+    //world.xyz /= world.w;
+    origin = world.xyz; //g_sceneCB.cameraPosition.xyz;
+    direction = float3(1,0,0);//normalize(world.xyz - origin);
+}
+
+void RaygenCommon()
+{
+    float3 rayDir;
+    float3 origin;
+    
+    // Generate a ray for a camera pixel corresponding to an index from the dispatched 2D grid.
+    GenerateCameraRay(DispatchRaysIndex().xy, origin, rayDir);
+
+    // Trace the ray.
+    // Set the ray's extents.
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = rayDir;
+    // Set TMin to a non-zero small value to avoid aliasing issues due to floating - point errors.
+    // TMin should be kept small to prevent missing geometry at close contact areas.
+    ray.TMin = 0.001;
+    ray.TMax = 10000.0;
+    RayPayload payload = { float4(0, 0, 0, 0) };
+    TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+
+    // Write the raytraced color to the output texture.
+   // RenderTarget[DispatchRaysIndex().xy] = payload.color;
+}
+
+[shader("raygeneration")]
+void Raygen0()
+{
+    RaygenCommon();
+}
+
+[shader("raygeneration")]
+void Raygen1()
+{
+    RaygenCommon();
+}
+)";
+
+    // This is just a crash test until we decide what the right way forward
+    CComPtr<IDxcBlob> pBlob =
+        Compile(m_dllSupport, hlsl, L"lib_6_6", {optimization});
+    CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
+    RunAnnotationPasses(m_dllSupport, pDxil);
+  }
+}
 
 TEST_F(PixTest, PixStructAnnotation_Simple) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices)
-  {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 struct smallPayload
 {
     uint dummy;
@@ -1848,27 +1500,27 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty())
-      {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(32, Testables.OffsetAndSizes[0].size);
-      }
+    if (!Testables.OffsetAndSizes.empty()) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[0].size);
+    }
 
-      VERIFY_ARE_EQUAL(1, Testables.AllocaWrites.size());
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "dummy");
+    VERIFY_ARE_EQUAL(1u, Testables.AllocaWrites.size());
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "dummy");
   }
 }
 
-
 TEST_F(PixTest, PixStructAnnotation_CopiedStruct) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
-  for (auto const* optimization : OptimizationChoices) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-      const char* hlsl = R"(
+    const char *hlsl = R"(
 struct smallPayload
 {
     uint dummy;
@@ -1891,21 +1543,24 @@ void main()
     // 1 in optimized case (cuz p2 aliases over p)
     VERIFY_IS_TRUE(Testables.OffsetAndSizes.size() >= 1);
 
-    for (const auto& os : Testables.OffsetAndSizes) {
-      VERIFY_ARE_EQUAL(1, os.countOfMembers);
-      VERIFY_ARE_EQUAL(0, os.offset);
-      VERIFY_ARE_EQUAL(32, os.size);
+    for (const auto &os : Testables.OffsetAndSizes) {
+      VERIFY_ARE_EQUAL(1u, os.countOfMembers);
+      VERIFY_ARE_EQUAL(0u, os.offset);
+      VERIFY_ARE_EQUAL(32u, os.size);
     }
 
-    VERIFY_ARE_EQUAL(1, Testables.AllocaWrites.size());
+    VERIFY_ARE_EQUAL(1u, Testables.AllocaWrites.size());
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_MixedSizes) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
-    for (auto const* optimization : OptimizationChoices) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-        const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+
+    const char *hlsl = R"(
 struct smallPayload
 {
     bool b1;
@@ -1927,31 +1582,53 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-        if (!Testables.OffsetAndSizes.empty()) {
-            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-            VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes[0].countOfMembers);
-            VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-            // 8 bytes align for uint64_t:
-            VERIFY_ARE_EQUAL(32 + 16 + 16 /*alignment for next field*/ + 32 + 32/*alignment for max align*/ + 64,
-                Testables.OffsetAndSizes[0].size);
-        }
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(4u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      // 8 bytes align for uint64_t:
+      VERIFY_ARE_EQUAL(32u + 16u + 16u /*alignment for next field*/ + 32u +
+                           32u /*alignment for max align*/ + 64u,
+                       Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(4u, Testables.OffsetAndSizes.size());
 
-        VERIFY_ARE_EQUAL(4, Testables.AllocaWrites.size());
-        ValidateAllocaWrite(Testables.AllocaWrites, 0, "b1");
-        ValidateAllocaWrite(Testables.AllocaWrites, 1, "sixteen");
-        ValidateAllocaWrite(Testables.AllocaWrites, 2, "thirtytwo");
-        ValidateAllocaWrite(Testables.AllocaWrites, 3, "sixtyfour");
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[0].size);
+
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[1].countOfMembers);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[1].offset);
+      VERIFY_ARE_EQUAL(16u, Testables.OffsetAndSizes[1].size);
+
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[2].countOfMembers);
+      VERIFY_ARE_EQUAL(32u + 32u, Testables.OffsetAndSizes[2].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[2].size);
+
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[3].countOfMembers);
+      VERIFY_ARE_EQUAL(32u + 32u + 32u + /*padding for alignment*/ 32u,
+                       Testables.OffsetAndSizes[3].offset);
+      VERIFY_ARE_EQUAL(64u, Testables.OffsetAndSizes[3].size);
     }
+
+    VERIFY_ARE_EQUAL(4u, Testables.AllocaWrites.size());
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "b1");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "sixteen");
+    ValidateAllocaWrite(Testables.AllocaWrites, 2, "thirtytwo");
+    ValidateAllocaWrite(Testables.AllocaWrites, 3, "sixtyfour");
+  }
 }
 
 TEST_F(PixTest, PixStructAnnotation_StructWithinStruct) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-      const char* hlsl = R"(
+    const char *hlsl = R"(
 
 struct Contained
 {
@@ -1979,28 +1656,37 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty()) {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(4, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(4 * 32, Testables.OffsetAndSizes[0].size);
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(4u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(4u * 32u, Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(4u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 4; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
       }
+    }
 
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, "one");
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, "two");
-      ValidateAllocaWrite(Testables.AllocaWrites, 3, "after");
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "contained.one");
+    ValidateAllocaWrite(Testables.AllocaWrites, 2, "contained.two");
+    ValidateAllocaWrite(Testables.AllocaWrites, 3, "after");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_1DArray) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-      const char* hlsl = R"(
+    const char *hlsl = R"(
 struct smallPayload
 {
     uint32_t Array[2];
@@ -2017,22 +1703,35 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
-      if (!Testables.OffsetAndSizes.empty()) {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(2 * 32, Testables.OffsetAndSizes[0].size);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(2u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(2u * 32u, Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(2u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 2; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
       }
-      VERIFY_ARE_EQUAL(2, Testables.AllocaWrites.size());
+    }
+    VERIFY_ARE_EQUAL(2u, Testables.AllocaWrites.size());
+
+    int Idx = 0;
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "Array[0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "Array[1]");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_2DArray) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 struct smallPayload
 {
     uint32_t TwoDArray[2][3];
@@ -2053,22 +1752,39 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
-      if (!Testables.OffsetAndSizes.empty()) {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(2 * 3 * 32, Testables.OffsetAndSizes[0].size);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(6u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(2u * 3u * 32u, Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(6u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 6; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
       }
-      VERIFY_ARE_EQUAL(6, Testables.AllocaWrites.size());
+    }
+    VERIFY_ARE_EQUAL(6u, Testables.AllocaWrites.size());
+
+    int Idx = 0;
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][1]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[0][2]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][1]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Idx++, "TwoDArray[1][2]");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_EmbeddedArray) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 
 struct Contained
 {
@@ -2096,28 +1812,38 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      if (!Testables.OffsetAndSizes.empty()) {
-          VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-          VERIFY_ARE_EQUAL(5, Testables.OffsetAndSizes[0].countOfMembers);
-          VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-          VERIFY_ARE_EQUAL(5 * 32, Testables.OffsetAndSizes[0].size);
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(5u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(5u * 32u, Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(5u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 5; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
       }
+    }
 
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, "array");
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, "array");
-      ValidateAllocaWrite(Testables.AllocaWrites, 3, "array");
-      ValidateAllocaWrite(Testables.AllocaWrites, 4, "after");
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "before");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "contained.array[0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, 2, "contained.array[1]");
+    ValidateAllocaWrite(Testables.AllocaWrites, 3, "contained.array[2]");
+    ValidateAllocaWrite(Testables.AllocaWrites, 4, "after");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_FloatN) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    auto IsOptimized = choice.IsOptimized;
+    const char *hlsl = R"(
 struct smallPayload
 {
     float2 f2;
@@ -2133,28 +1859,36 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(2, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 + 32, Testables.OffsetAndSizes[0].size);
+    if (IsOptimized) {
+      VERIFY_ARE_EQUAL(2u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[1].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[0].size);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[1].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[1].size);
+    } else {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(2u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u + 32u, Testables.OffsetAndSizes[0].size);
+    }
 
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      VERIFY_ARE_EQUAL(2, Testables.AllocaWrites.size());
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, (IsOptimized ? "" : "member0")); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member1")); // "memberN" until dbg.declare works
-
-      break; // don't run -O1 test until pointer types are dealt with by value-to-declare pass
+    VERIFY_ARE_EQUAL(Testables.AllocaWrites.size(), 2u);
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "f2.x");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "f2.y");
   }
 }
 
-
 TEST_F(PixTest, PixStructAnnotation_SequentialFloatN) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 struct smallPayload
 {
     float3 color;
@@ -2173,32 +1907,39 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(6, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 * 6, Testables.OffsetAndSizes[0].size);
+    if (choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(6u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 6; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
+      }
+    } else {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(6u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u * 6u, Testables.OffsetAndSizes[0].size);
+    }
 
-      VERIFY_ARE_EQUAL(6, Testables.AllocaWrites.size());
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, (IsOptimized ? "" : "member0") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member1") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, (IsOptimized ? "" : "member2") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 3, (IsOptimized ? "" : "member0") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 4, (IsOptimized ? "" : "member1") ); // "memberN" until dbg.declare works
-      ValidateAllocaWrite(Testables.AllocaWrites, 5, (IsOptimized ? "" : "member2") ); // "memberN" until dbg.declare works
-
-      break; // don't run -O1 test until pointer types are dealt with by
-             // value-to-declare pass
+    VERIFY_ARE_EQUAL(6u, Testables.AllocaWrites.size());
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "color.x");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "color.y");
+    ValidateAllocaWrite(Testables.AllocaWrites, 2, "color.z");
+    ValidateAllocaWrite(Testables.AllocaWrites, 3, "dir.x");
+    ValidateAllocaWrite(Testables.AllocaWrites, 4, "dir.y");
+    ValidateAllocaWrite(Testables.AllocaWrites, 5, "dir.z");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_EmbeddedFloatN) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 
 struct Embedded
 {
@@ -2222,29 +1963,36 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-      VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-      VERIFY_ARE_EQUAL(3, Testables.OffsetAndSizes[0].countOfMembers);
-      VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-      VERIFY_ARE_EQUAL(32 * 3, Testables.OffsetAndSizes[0].size);
+    if (choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(3u, Testables.OffsetAndSizes.size());
+      for (unsigned i = 0; i < 3; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
+      }
+    } else {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(3u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      VERIFY_ARE_EQUAL(32u * 3u, Testables.OffsetAndSizes[0].size);
+    }
 
-      VERIFY_ARE_EQUAL(3, Testables.AllocaWrites.size());
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      ValidateAllocaWrite(Testables.AllocaWrites, 0, "");
-      ValidateAllocaWrite(Testables.AllocaWrites, 1, (IsOptimized ? "" : "member0"));
-      ValidateAllocaWrite(Testables.AllocaWrites, 2, (IsOptimized ? "" : "member1"));
-
-      break; // don't run -O1 test until pointer types are dealt with by
-             // value-to-declare pass
+    VERIFY_ARE_EQUAL(3u, Testables.AllocaWrites.size());
+    ValidateAllocaWrite(Testables.AllocaWrites, 0, "i32");
+    ValidateAllocaWrite(Testables.AllocaWrites, 1, "e.f2.x");
+    ValidateAllocaWrite(Testables.AllocaWrites, 2, "e.f2.y");
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_Matrix) {
-  if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 struct smallPayload
 {
   float4x4 mat;
@@ -2260,14 +2008,18 @@ void main()
 }
 )";
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization);
-      // Can't test member iterator until dbg.declare instructions are emitted when structs
-      // contain pointers-to-pointers
-      VERIFY_ARE_EQUAL(16, Testables.AllocaWrites.size());
-      for (int i = 0; i < 16; ++i)
-      {
-          ValidateAllocaWrite(Testables.AllocaWrites, i, "");
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    // Can't test member iterator until dbg.declare instructions are emitted
+    // when structs contain pointers-to-pointers
+    VERIFY_ARE_EQUAL(16u, Testables.AllocaWrites.size());
+    for (int i = 0; i < 4; ++i) {
+      for (int j = 0; j < 4; ++j) {
+        std::string expected = std::string("mat._") + std::to_string(i + 1) +
+                               std::to_string(j + 1);
+        ValidateAllocaWrite(Testables.AllocaWrites, i * 4 + j,
+                            expected.c_str());
       }
+    }
   }
 }
 
@@ -2275,8 +2027,9 @@ TEST_F(PixTest, PixStructAnnotation_MemberFunction) {
   if (m_ver.SkipDxilVersion(1, 5))
     return;
 
-  for (auto const* optimization : OptimizationChoices) {
-      const char* hlsl = R"(
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
 
 RWStructuredBuffer<float> floatRWUAV: register(u0);
 
@@ -2316,38 +2069,24 @@ struct Gbuffer
 {
 	float3 worldNormal;
 	float3 objectNormal; //offset:12
-	
 	float linearZ; //24
 	float prevLinearZ; //28
-	
-	
 	float fwidthLinearZ; //32
 	float fwidthObjectNormal; //36
-	
-	
 	uint materialType; //40
 	uint2 materialParams0; //44
 	uint4 materialParams1; //52  <--------- this is the variable that's being covered twice (52*8 = 416 416)
-	
 	uint instanceId;  //68  <------- and there's one dword left over, as expected
-	
-	
 	void load(int2 pixelPos, Texture2DArray<uint4> gbTex)
 	{
 	uint4 data0 = gbTex.Load(int4(pixelPos, 0, 0));
 	uint4 data1 = gbTex.Load(int4(pixelPos, 1, 0));
 	uint4 data2 = gbTex.Load(int4(pixelPos, 2, 0));
-	
-	
 	worldNormal = unpackOctahedralUnorm(unpackUnorm2(data0.x));
 	linearZ = f16tof32((data0.y >> 8) & 0xffff);
 	materialType = (data0.y & 0xff);
 	materialParams0 = data0.zw;
-	
-	
 	materialParams1 = data1.xyzw;
-	
-	
 	instanceId = data2.x;
 	prevLinearZ = asfloat(data2.y);
 	objectNormal = unpackOctahedralUnorm(unpackUnorm2(data2.z));
@@ -2377,30 +2116,29 @@ void main()
 
 
 )";
-      // Probably related to PIX bug #29512388. Coverage validation awaiting that fix for optimized shaders
-      bool validateCoverage = (wcscmp(optimization, L"-Od") == 0);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization, true);
 
-      auto Testables = TestStructAnnotationCase(hlsl, optimization, validateCoverage);
-      // Can't test member iterator until dbg.declare instructions are emitted when structs
-      // contain pointers-to-pointers
+    // TODO: Make 'this' work
 
-      // Can't validate # of writes: rel and dbg are different
-      //VERIFY_ARE_EQUAL(43, Testables.AllocaWrites.size());
+    // Can't validate # of writes: rel and dbg are different
+    // VERIFY_ARE_EQUAL(43, Testables.AllocaWrites.size());
 
-      // Can't test individual writes until struct member names are returned:
-      //for (int i = 0; i < 51; ++i)
-      //{
-      //  ValidateAllocaWrite(Testables.AllocaWrites, i, "");
-      //}
+    // Can't test individual writes until struct member names are returned:
+    // for (int i = 0; i < 51; ++i)
+    //{
+    //  ValidateAllocaWrite(Testables.AllocaWrites, i, "");
+    //}
   }
 }
 
 TEST_F(PixTest, PixStructAnnotation_BigMess) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-    for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-        const char* hlsl = R"(
+    const char *hlsl = R"(
 
 struct BigStruct
 {
@@ -2457,25 +2195,87 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
-        if (!Testables.OffsetAndSizes.empty()) {
-            VERIFY_ARE_EQUAL(1, Testables.OffsetAndSizes.size());
-            VERIFY_ARE_EQUAL(15, Testables.OffsetAndSizes[0].countOfMembers);
-            VERIFY_ARE_EQUAL(0, Testables.OffsetAndSizes[0].offset);
-            constexpr uint32_t BigStructBitSize = 64 * 2;
-            constexpr uint32_t EmbeddedStructBitSize = 32 * 5;
-            VERIFY_ARE_EQUAL(3 * 32 + EmbeddedStructBitSize + 64 + 16 + 16/*alignment for next field*/ + BigStructBitSize * 2 + 32 + 32/*align to max align*/, Testables.OffsetAndSizes[0].size);
-        }
-        VERIFY_ARE_EQUAL(15, Testables.AllocaWrites.size());
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    if (!choice.IsOptimized) {
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes.size());
+      VERIFY_ARE_EQUAL(15u, Testables.OffsetAndSizes[0].countOfMembers);
+      VERIFY_ARE_EQUAL(0u, Testables.OffsetAndSizes[0].offset);
+      constexpr uint32_t BigStructBitSize = 64 * 2;
+      constexpr uint32_t EmbeddedStructBitSize = 32 * 5;
+      VERIFY_ARE_EQUAL(3u * 32u + EmbeddedStructBitSize + 64u + 16u +
+                           16u /*alignment for next field*/ +
+                           BigStructBitSize * 2u + 32u +
+                           32u /*align to max align*/,
+                       Testables.OffsetAndSizes[0].size);
+    } else {
+      VERIFY_ARE_EQUAL(15u, Testables.OffsetAndSizes.size());
+
+      // First 8 members
+      for (unsigned i = 0; i < 8; i++) {
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[i].countOfMembers);
+        VERIFY_ARE_EQUAL(i * 32u, Testables.OffsetAndSizes[i].offset);
+        VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[i].size);
+      }
+
+      // bigOne
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[8].countOfMembers);
+      VERIFY_ARE_EQUAL(256u, Testables.OffsetAndSizes[8].offset);
+      VERIFY_ARE_EQUAL(64u, Testables.OffsetAndSizes[8].size);
+
+      // littleOne
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[9].countOfMembers);
+      VERIFY_ARE_EQUAL(320u, Testables.OffsetAndSizes[9].offset);
+      VERIFY_ARE_EQUAL(16u, Testables.OffsetAndSizes[9].size);
+
+      // Each member of BigStruct[2]
+      for (unsigned i = 0; i < 4; i++) {
+        int idx = i + 10;
+        VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[idx].countOfMembers);
+        VERIFY_ARE_EQUAL(384 + i * 64u, Testables.OffsetAndSizes[idx].offset);
+        VERIFY_ARE_EQUAL(64u, Testables.OffsetAndSizes[idx].size);
+      }
+
+      VERIFY_ARE_EQUAL(1u, Testables.OffsetAndSizes[14].countOfMembers);
+      VERIFY_ARE_EQUAL(640u, Testables.OffsetAndSizes[14].offset);
+      VERIFY_ARE_EQUAL(32u, Testables.OffsetAndSizes[14].size);
     }
+
+    VERIFY_ARE_EQUAL(15u, Testables.AllocaWrites.size());
+
+    size_t Index = 0;
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "dummy");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "vertexCount");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "primitiveCount");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "embeddedStruct.OneInt");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "embeddedStruct.TwoDArray[0][0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "embeddedStruct.TwoDArray[0][1]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "embeddedStruct.TwoDArray[1][0]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "embeddedStruct.TwoDArray[1][1]");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigOne");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "littleOne");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[0].bigInt");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "bigStruct[0].bigDouble");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "bigStruct[1].bigInt");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++,
+                        "bigStruct[1].bigDouble");
+    ValidateAllocaWrite(Testables.AllocaWrites, Index++, "lastCheck");
+  }
 }
 
 TEST_F(PixTest, PixStructAnnotation_AlignedFloat4Arrays) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-    for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-        const char* hlsl = R"(
+    const char *hlsl = R"(
 
 struct LinearSHSampleData
 {
@@ -2499,31 +2299,29 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
-        // Can't test offsets and sizes until dbg.declare instructions are emitted when floatn is used (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
-        //VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
-    }
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    // Can't test offsets and sizes until dbg.declare instructions are emitted
+    // when floatn is used
+    // (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
+    // VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
+  }
 }
 
 TEST_F(PixTest, PixStructAnnotation_Inheritance) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-    for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-      // don't run -Od test until -Od inheritance is fixed (#3274:
-      // https://github.com/microsoft/DirectXShaderCompiler/issues/3274)
-      bool IsOptimized = (wcscmp(optimization, L"-Od") != 0);
-      if (!IsOptimized)
-        continue;
-
-
-        const char* hlsl = R"(
+    const char *hlsl = R"(
 struct Base
 {
     float floatValue;
 };
+typedef Base BaseTypedef;
 
-struct Derived : Base
+struct Derived : BaseTypedef
 {
 	int intValue;
 };
@@ -2538,19 +2336,23 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
 
-        // Can't test offsets and sizes until dbg.declare instructions are emitted when floatn is used (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
-        //VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
-    }
+    // Can't test offsets and sizes until dbg.declare instructions are emitted
+    // when floatn is used
+    // (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
+    // VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
+  }
 }
 
 TEST_F(PixTest, PixStructAnnotation_ResourceAsMember) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-    for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-        const char* hlsl = R"(
+    const char *hlsl = R"(
 
 Buffer g_texture;
 
@@ -2580,18 +2382,22 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
-        // Can't test offsets and sizes until dbg.declare instructions are emitted when floatn is used (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
-        //VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
-    }
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    // Can't test offsets and sizes until dbg.declare instructions are emitted
+    // when floatn is used
+    // (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
+    // VERIFY_ARE_EQUAL(20, Testables.AllocaWrites.size());
+  }
 }
 
 TEST_F(PixTest, PixStructAnnotation_WheresMyDbgValue) {
-    if (m_ver.SkipDxilVersion(1, 5)) return;
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
 
-    for (auto const* optimization : OptimizationChoices) {
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
 
-        const char* hlsl = R"(
+    const char *hlsl = R"(
 
 struct smallPayload
 {
@@ -2610,11 +2416,1054 @@ void main()
 }
 )";
 
-        auto Testables = TestStructAnnotationCase(hlsl, optimization);
-        // Can't test offsets and sizes until dbg.declare instructions are emitted when floatn is used (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
-        VERIFY_ARE_EQUAL(3, Testables.AllocaWrites.size());
-    }
+    auto Testables = TestStructAnnotationCase(hlsl, optimization);
+    // Can't test offsets and sizes until dbg.declare instructions are emitted
+    // when floatn is used
+    // (https://github.com/microsoft/DirectXShaderCompiler/issues/2920)
+    VERIFY_ARE_EQUAL(3u, Testables.AllocaWrites.size());
+  }
+}
+
+TEST_F(PixTest, VirtualRegisters_InstructionCounts) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
+
+  for (auto choice : OptimizationChoices) {
+    auto optimization = choice.Flag;
+    const char *hlsl = R"(
+
+RaytracingAccelerationStructure Scene : register(t0, space0);
+RWTexture2D<float4> RenderTarget : register(u0);
+
+struct SceneConstantBuffer
+{
+    float4x4 projectionToWorld;
+    float4 cameraPosition;
+    float4 lightPosition;
+    float4 lightAmbientColor;
+    float4 lightDiffuseColor;
+};
+
+ConstantBuffer<SceneConstantBuffer> g_sceneCB : register(b0);
+
+struct RayPayload
+{
+    float4 color;
+};
+
+inline void GenerateCameraRay(uint2 index, out float3 origin, out float3 direction)
+{
+    float2 xy = index + 0.5f; // center in the middle of the pixel.
+    float2 screenPos = xy;// / DispatchRaysDimensions().xy * 2.0 - 1.0;
+
+    // Invert Y for DirectX-style coordinates.
+    screenPos.y = -screenPos.y;
+
+    // Unproject the pixel coordinate into a ray.
+    float4 world = /*mul(*/float4(screenPos, 0, 1)/*, g_sceneCB.projectionToWorld)*/;
+
+    //world.xyz /= world.w;
+    origin = world.xyz; //g_sceneCB.cameraPosition.xyz;
+    direction = float3(1,0,0);//normalize(world.xyz - origin);
+}
+
+void RaygenCommon()
+{
+    float3 rayDir;
+    float3 origin;
+    
+    // Generate a ray for a camera pixel corresponding to an index from the dispatched 2D grid.
+    GenerateCameraRay(DispatchRaysIndex().xy, origin, rayDir);
+
+    // Trace the ray.
+    // Set the ray's extents.
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = rayDir;
+    // Set TMin to a non-zero small value to avoid aliasing issues due to floating - point errors.
+    // TMin should be kept small to prevent missing geometry at close contact areas.
+    ray.TMin = 0.001;
+    ray.TMax = 10000.0;
+    RayPayload payload = { float4(0, 0, 0, 0) };
+    TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+
+    // Write the raytraced color to the output texture.
+   // RenderTarget[DispatchRaysIndex().xy] = payload.color;
+}
+
+[shader("raygeneration")]
+void Raygen0()
+{
+    RaygenCommon();
+}
+
+[shader("raygeneration")]
+void Raygen1()
+{
+    RaygenCommon();
+}
+
+typedef BuiltInTriangleIntersectionAttributes MyAttributes;
+
+[shader("closesthit")]
+void InnerClosestHitShader(inout RayPayload payload, in MyAttributes attr)
+{
+    payload.color = float4(0,1,0,0);
 }
 
 
-#endif
+[shader("miss")]
+void MyMissShader(inout RayPayload payload)
+{
+    payload.color = float4(1, 0, 0, 0);
+})";
+
+    CComPtr<IDxcBlob> pBlob =
+        Compile(m_dllSupport, hlsl, L"lib_6_6", {optimization});
+    CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
+    auto outputLines = RunAnnotationPasses(m_dllSupport, pDxil).lines;
+
+    const char instructionRangeLabel[] = "InstructionRange:";
+
+    // The numbering pass should have counted  instructions for each
+    // "interesting" (to PIX) function and output its start and (end+1)
+    // instruction ordinal. End should always be a reasonable number of
+    // instructions (>10) and end should always be higher than start, and all
+    // four functions above should be represented.
+    int countOfInstructionRangeLines = 0;
+    for (auto const &line : outputLines) {
+      auto tokens = Tokenize(line, " ");
+      if (tokens.size() >= 4) {
+        if (tokens[0] == instructionRangeLabel) {
+          countOfInstructionRangeLines++;
+          int instructionStart = atoi(tokens[1].c_str());
+          int instructionEnd = atoi(tokens[2].c_str());
+          VERIFY_IS_TRUE(instructionEnd > 10);
+          VERIFY_IS_TRUE(instructionEnd > instructionStart);
+          auto found1 = tokens[3].find("Raygen0@@YAXXZ") != std::string::npos;
+          auto found2 = tokens[3].find("Raygen1@@YAXXZ") != std::string::npos;
+          auto foundClosest =
+              tokens[3].find("InnerClosestHit") != std::string::npos;
+          auto foundMiss = tokens[3].find("MyMiss") != std::string::npos;
+          VERIFY_IS_TRUE(found1 || found2 || foundClosest || foundMiss);
+        }
+      }
+    }
+    VERIFY_ARE_EQUAL(4, countOfInstructionRangeLines);
+
+    // Non-library target:
+    const char *PixelShader = R"(
+    [RootSignature("")]
+    float main(float pos : A) : SV_Target {
+      float x = abs(pos);
+      float y = sin(pos);
+      float z = x + y;
+      return z;
+    }
+  )";
+    pBlob = Compile(m_dllSupport, PixelShader, L"ps_6_6", {optimization});
+    pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
+    outputLines = RunAnnotationPasses(m_dllSupport, pDxil).lines;
+
+    countOfInstructionRangeLines = 0;
+    for (auto const &line : outputLines) {
+      auto tokens = Tokenize(line, " ");
+      if (tokens.size() >= 4) {
+        if (tokens[0] == instructionRangeLabel) {
+          countOfInstructionRangeLines++;
+          int instructionStart = atoi(tokens[1].c_str());
+          int instructionEnd = atoi(tokens[2].c_str());
+          VERIFY_IS_TRUE(instructionStart == 0);
+          VERIFY_IS_TRUE(instructionEnd > 10);
+          VERIFY_IS_TRUE(instructionEnd > instructionStart);
+          auto foundMain = tokens[3].find("main") != std::string::npos;
+          VERIFY_IS_TRUE(foundMain);
+        }
+      }
+    }
+    VERIFY_ARE_EQUAL(1, countOfInstructionRangeLines);
+
+    // Now check that the initial value parameter works:
+    const int startingInstructionOrdinal = 1234;
+    outputLines =
+        RunAnnotationPasses(m_dllSupport, pDxil, startingInstructionOrdinal)
+            .lines;
+
+    countOfInstructionRangeLines = 0;
+    for (auto const &line : outputLines) {
+      auto tokens = Tokenize(line, " ");
+      if (tokens.size() >= 4) {
+        if (tokens[0] == instructionRangeLabel) {
+          countOfInstructionRangeLines++;
+          int instructionStart = atoi(tokens[1].c_str());
+          int instructionEnd = atoi(tokens[2].c_str());
+          VERIFY_IS_TRUE(instructionStart == startingInstructionOrdinal);
+          VERIFY_IS_TRUE(instructionEnd > instructionStart);
+          auto foundMain = tokens[3].find("main") != std::string::npos;
+          VERIFY_IS_TRUE(foundMain);
+        }
+      }
+    }
+    VERIFY_ARE_EQUAL(1, countOfInstructionRangeLines);
+  }
+}
+
+TEST_F(PixTest, VirtualRegisters_AlignedOffsets) {
+  if (m_ver.SkipDxilVersion(1, 5))
+    return;
+
+  {
+    const char *hlsl = R"(
+cbuffer cbEveryFrame : register(b0)
+{
+    int i32;
+    float f32;
+};
+
+struct VS_OUTPUT_ENV
+{
+    float4 Pos        : SV_Position;
+    float2 Tex        : TEXCOORD0;
+};
+
+float4 main(VS_OUTPUT_ENV input) : SV_Target
+{
+    // (BTW we load from i32 and f32 (which are resident in a cb) so that these local variables aren't optimized away)
+    bool i1 = i32 != 0;
+    min16uint u16 = (min16uint)(i32 / 4);
+    min16int s16 = (min16int)(i32/4) * -1; // signed s16 gets -8
+    min12int s12 = (min12int)(i32/8) * -1; // signed s12 gets -4
+    half h = (half) f32 / 2.f; // f32 is initialized to 32.0 in8he CB, so the 16-bit type now has "16.0" in it
+    min16float mf16 = (min16float) f32 / -2.f;
+    min10float mf10 = (min10float) f32 / -4.f;
+    return float4((float)(i1 + u16) / 2.f, (float)(s16 + s12) / -128.f, h / 128.f, mf16 / 128.f + mf10 / 256.f);
+}
+)";
+
+    // This is little more than a crash test, designed to exercise a previously
+    // over-active assert..
+    std::vector<std::pair<const wchar_t *, std::vector<const wchar_t *>>>
+        argSets = {
+            {L"ps_6_0", {L"-Od"}},
+            {L"ps_6_2", {L"-Od", L"-HV", L"2018", L"-enable-16bit-types"}}};
+    for (auto const &args : argSets) {
+
+      CComPtr<IDxcBlob> pBlob =
+          Compile(m_dllSupport, hlsl, args.first, args.second);
+      CComPtr<IDxcBlob> pDxil = FindModule(DFCC_ShaderDebugInfoDXIL, pBlob);
+      RunAnnotationPasses(m_dllSupport, pDxil);
+    }
+  }
+}
+
+static void VerifyOperationSucceeded(IDxcOperationResult *pResult) {
+  HRESULT result;
+  VERIFY_SUCCEEDED(pResult->GetStatus(&result));
+  if (FAILED(result)) {
+    CComPtr<IDxcBlobEncoding> pErrors;
+    VERIFY_SUCCEEDED(pResult->GetErrorBuffer(&pErrors));
+    CA2W errorsWide(BlobToUtf8(pErrors).c_str());
+    WEX::Logging::Log::Comment(errorsWide);
+  }
+  VERIFY_SUCCEEDED(result);
+}
+
+TEST_F(PixTest, RootSignatureUpgrade_SubObjects) {
+
+  const char *source = R"x(
+GlobalRootSignature so_GlobalRootSignature =
+{
+	"RootConstants(num32BitConstants=1, b8), "
+};
+
+StateObjectConfig so_StateObjectConfig = 
+{ 
+    STATE_OBJECT_FLAGS_ALLOW_LOCAL_DEPENDENCIES_ON_EXTERNAL_DEFINITONS
+};
+
+LocalRootSignature so_LocalRootSignature1 = 
+{
+	"RootConstants(num32BitConstants=3, b2), "
+	"UAV(u6),RootFlags(LOCAL_ROOT_SIGNATURE)" 
+};
+
+LocalRootSignature so_LocalRootSignature2 = 
+{
+	"RootConstants(num32BitConstants=3, b2), "
+	"UAV(u8, flags=DATA_STATIC), " 
+	"RootFlags(LOCAL_ROOT_SIGNATURE)"
+};
+
+RaytracingShaderConfig  so_RaytracingShaderConfig =
+{
+    128, // max payload size
+    32   // max attribute size
+};
+
+RaytracingPipelineConfig so_RaytracingPipelineConfig =
+{
+    2 // max trace recursion depth
+};
+
+TriangleHitGroup MyHitGroup =
+{
+    "MyAnyHit",       // AnyHit
+    "MyClosestHit",   // ClosestHit
+};
+
+SubobjectToExportsAssociation so_Association1 =
+{
+	"so_LocalRootSignature1", // subobject name
+	"MyRayGen"                // export association 
+};
+
+SubobjectToExportsAssociation so_Association2 =
+{
+	"so_LocalRootSignature2", // subobject name
+	"MyAnyHit"                // export association 
+};
+
+struct MyPayload
+{
+    float4 color;
+};
+
+[shader("raygeneration")]
+void MyRayGen()
+{
+}
+
+[shader("closesthit")]
+void MyClosestHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{  
+}
+
+[shader("anyhit")]
+void MyAnyHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+}
+
+[shader("miss")]
+void MyMiss(inout MyPayload payload)
+{
+}
+
+)x";
+
+  CComPtr<IDxcCompiler> pCompiler;
+  VERIFY_SUCCEEDED(m_dllSupport.CreateInstance(CLSID_DxcCompiler, &pCompiler));
+
+  CComPtr<IDxcBlobEncoding> pSource;
+  Utf8ToBlob(m_dllSupport, source, &pSource);
+
+  CComPtr<IDxcOperationResult> pResult;
+  VERIFY_SUCCEEDED(pCompiler->Compile(pSource, L"source.hlsl", L"", L"lib_6_6",
+                                      nullptr, 0, nullptr, 0, nullptr,
+                                      &pResult));
+  VerifyOperationSucceeded(pResult);
+  CComPtr<IDxcBlob> compiled;
+  VERIFY_SUCCEEDED(pResult->GetResult(&compiled));
+
+  auto optimizedContainer = RunShaderAccessTrackingPass(compiled).blob;
+
+  const char *pBlobContent =
+      reinterpret_cast<const char *>(optimizedContainer->GetBufferPointer());
+  unsigned blobSize = optimizedContainer->GetBufferSize();
+  const hlsl::DxilContainerHeader *pContainerHeader =
+      hlsl::IsDxilContainerLike(pBlobContent, blobSize);
+
+  const hlsl::DxilPartHeader *pPartHeader =
+      GetDxilPartByType(pContainerHeader, hlsl::DFCC_RuntimeData);
+  VERIFY_ARE_NOT_EQUAL(pPartHeader, nullptr);
+
+  hlsl::RDAT::DxilRuntimeData rdat(GetDxilPartData(pPartHeader),
+                                   pPartHeader->PartSize);
+
+  auto const subObjectTableReader = rdat.GetSubobjectTable();
+
+  // There are 9 subobjects in the HLSL above:
+  VERIFY_ARE_EQUAL(subObjectTableReader.Count(), 9u);
+
+  bool foundGlobalRS = false;
+  for (uint32_t i = 0; i < subObjectTableReader.Count(); ++i) {
+    auto subObject = subObjectTableReader[i];
+    hlsl::DXIL::SubobjectKind subobjectKind = subObject.getKind();
+    switch (subobjectKind) {
+    case hlsl::DXIL::SubobjectKind::GlobalRootSignature: {
+      foundGlobalRS = true;
+      VERIFY_IS_TRUE(0 ==
+                     strcmp(subObject.getName(), "so_GlobalRootSignature"));
+
+      auto rootSigReader = subObject.getRootSignature();
+      DxilVersionedRootSignatureDesc const *rootSignature = nullptr;
+      DeserializeRootSignature(rootSigReader.getData(),
+                               rootSigReader.sizeData(), &rootSignature);
+      VERIFY_ARE_EQUAL(rootSignature->Version,
+                       DxilRootSignatureVersion::Version_1_1);
+      VERIFY_ARE_EQUAL(rootSignature->Desc_1_1.NumParameters, 2u);
+      VERIFY_ARE_EQUAL(rootSignature->Desc_1_1.pParameters[1].ParameterType,
+                       DxilRootParameterType::UAV);
+      VERIFY_ARE_EQUAL(rootSignature->Desc_1_1.pParameters[1].ShaderVisibility,
+                       DxilShaderVisibility::All);
+      VERIFY_ARE_EQUAL(
+          rootSignature->Desc_1_1.pParameters[1].Descriptor.RegisterSpace,
+          static_cast<uint32_t>(-2));
+      VERIFY_ARE_EQUAL(
+          rootSignature->Desc_1_1.pParameters[1].Descriptor.ShaderRegister, 0u);
+      DeleteRootSignature(rootSignature);
+      break;
+    }
+    }
+  }
+  VERIFY_IS_TRUE(foundGlobalRS);
+}
+
+TEST_F(PixTest, RootSignatureUpgrade_Annotation) {
+
+  const char *dynamicTextureAccess = R"x(
+Texture1D<float4> tex[5] : register(t3);
+SamplerState SS[3] : register(s2);
+
+[RootSignature("DescriptorTable(SRV(t3, numDescriptors=5)),\
+                DescriptorTable(Sampler(s2, numDescriptors=3))")]
+float4 main(int i : A, float j : B) : SV_TARGET
+{
+  float4 r = tex[i].Sample(SS[i], i);
+  return r;
+}
+  )x";
+
+  auto compiled = Compile(m_dllSupport, dynamicTextureAccess, L"ps_6_6");
+  auto pOptimizedContainer = RunShaderAccessTrackingPass(compiled).blob;
+
+  const char *pBlobContent =
+      reinterpret_cast<const char *>(pOptimizedContainer->GetBufferPointer());
+  unsigned blobSize = pOptimizedContainer->GetBufferSize();
+  const hlsl::DxilContainerHeader *pContainerHeader =
+      hlsl::IsDxilContainerLike(pBlobContent, blobSize);
+
+  const hlsl::DxilPartHeader *pPartHeader =
+      GetDxilPartByType(pContainerHeader, hlsl::DFCC_RootSignature);
+  VERIFY_ARE_NOT_EQUAL(pPartHeader, nullptr);
+
+  hlsl::RootSignatureHandle RSH;
+  RSH.LoadSerialized((const uint8_t *)GetDxilPartData(pPartHeader),
+                     pPartHeader->PartSize);
+
+  RSH.Deserialize();
+
+  auto const *desc = RSH.GetDesc();
+
+  bool foundGlobalRS = false;
+
+  VERIFY_ARE_EQUAL(desc->Version, hlsl::DxilRootSignatureVersion::Version_1_1);
+  VERIFY_ARE_EQUAL(desc->Desc_1_1.NumParameters, 3u);
+  for (unsigned int i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
+    hlsl::DxilRootParameter1 const *param = desc->Desc_1_1.pParameters + i;
+    switch (param->ParameterType) {
+    case hlsl::DxilRootParameterType::UAV:
+      VERIFY_ARE_EQUAL(param->Descriptor.RegisterSpace,
+                       static_cast<uint32_t>(-2));
+      VERIFY_ARE_EQUAL(param->Descriptor.ShaderRegister, 0u);
+      foundGlobalRS = true;
+      break;
+    }
+  }
+
+  VERIFY_IS_TRUE(foundGlobalRS);
+}
+
+TEST_F(PixTest, DxilPIXDXRInvocationsLog_SanityTest) {
+
+  const char *source = R"x(
+struct MyPayload
+{
+    float4 color;
+};
+
+[shader("raygeneration")]
+void MyRayGen()
+{
+}
+
+[shader("closesthit")]
+void MyClosestHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+}
+
+[shader("anyhit")]
+void MyAnyHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+}
+
+[shader("miss")]
+void MyMiss(inout MyPayload payload)
+{
+}
+
+)x";
+
+  auto compiledLib = Compile(m_dllSupport, source, L"lib_6_6", {});
+  RunDxilPIXDXRInvocationsLog(compiledLib);
+}
+
+TEST_F(PixTest, DxilPIXDXRInvocationsLog_EmbeddedRootSigs) {
+
+  const char *source = R"x(
+
+GlobalRootSignature grs = {"CBV(b0)"};
+struct MyPayload
+{
+    float4 color;
+};
+
+[shader("raygeneration")]
+void MyRayGen()
+{
+}
+
+[shader("closesthit")]
+void MyClosestHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+}
+
+[shader("anyhit")]
+void MyAnyHit(inout MyPayload payload, in BuiltInTriangleIntersectionAttributes attr)
+{
+}
+
+[shader("miss")]
+void MyMiss(inout MyPayload payload)
+{
+}
+
+)x";
+
+  auto compiledLib = Compile(m_dllSupport, source, L"lib_6_3",
+                             {L"-Qstrip_reflect"}, L"RootSig");
+  RunDxilPIXDXRInvocationsLog(compiledLib);
+}
+
+uint32_t NuriGetWaveInstructionCount(const std::vector<std::string> &lines) {
+  // This is the instruction we'll insert into the shader if we detect dynamic
+  // resource indexing
+  const char *const waveActiveAllEqual = "call i1 @dx.op.waveActiveAllEqual";
+
+  uint32_t instCount = 0;
+  for (const std::string &line : lines) {
+    instCount += line.find(waveActiveAllEqual) != std::string::npos;
+  }
+  return instCount;
+}
+
+void PixTest::TestNuriCase(const char *source, const wchar_t *target,
+                           uint32_t expectedResult) {
+
+  for (const OptimizationChoice &choice : OptimizationChoices) {
+    const std::vector<LPCWSTR> compilationOptions = {choice.Flag};
+
+    CComPtr<IDxcBlob> compiledLib =
+        Compile(m_dllSupport, source, target, compilationOptions);
+
+    std::string outputText;
+    const std::vector<std::string> dxilLines =
+        RunDxilNonUniformResourceIndexInstrumentation(compiledLib, outputText);
+
+    VERIFY_ARE_EQUAL(NuriGetWaveInstructionCount(dxilLines), expectedResult);
+
+    bool foundDynamicIndexingNoNuri = false;
+    const std::vector<std::string> outputTextLines = Tokenize(outputText, "\n");
+    for (const std::string &line : outputTextLines) {
+      if (line.find("FoundDynamicIndexingNoNuri") != std::string::npos) {
+        foundDynamicIndexingNoNuri = true;
+        break;
+      }
+    }
+
+    VERIFY_ARE_EQUAL((expectedResult != 0), foundDynamicIndexingNoNuri);
+  }
+}
+
+TEST_F(PixTest, NonUniformResourceIndex_Resource) {
+
+  const char *source = R"x(
+Texture2D tex[] : register(t0);
+float4 main(float2 uv : TEXCOORD0) : SV_TARGET
+{
+    uint index = uv.x * uv.y;
+    return tex[index].Load(int3(0, 0, 0));
+})x";
+
+  const char *sourceWithNuri = R"x(
+Texture2D tex[] : register(t0);
+float4 main(float2 uv : TEXCOORD0) : SV_TARGET
+{
+    uint i = uv.x * uv.y;
+    return tex[NonUniformResourceIndex(i)].Load(int3(0, 0, 0));
+})x";
+
+  TestNuriCase(source, L"ps_6_0", 1);
+  TestNuriCase(sourceWithNuri, L"ps_6_0", 0);
+
+  if (m_ver.SkipDxilVersion(1, 6)) {
+    return;
+  }
+
+  TestNuriCase(source, L"ps_6_6", 1);
+  TestNuriCase(sourceWithNuri, L"ps_6_6", 0);
+}
+
+TEST_F(PixTest, NonUniformResourceIndex_DescriptorHeap) {
+
+  if (m_ver.SkipDxilVersion(1, 6)) {
+    return;
+  }
+
+  const char *source = R"x(
+Texture2D tex[] : register(t0);
+float4 main(float2 uv : TEXCOORD0) : SV_TARGET
+{
+    uint i = uv.x + uv.y;
+    Texture2D<float4> dynResTex = 
+        ResourceDescriptorHeap[i];
+    SamplerState dynResSampler = 
+        SamplerDescriptorHeap[i];
+    return dynResTex.Sample(dynResSampler, uv);
+})x";
+
+  const char *sourceWithNuri = R"x(
+Texture2D tex[] : register(t0);
+float4 main(float2 uv : TEXCOORD0) : SV_TARGET
+{
+    uint i = uv.x + uv.y;
+    Texture2D<float4> dynResTex = 
+        ResourceDescriptorHeap[NonUniformResourceIndex(i)];
+    SamplerState dynResSampler = 
+        SamplerDescriptorHeap[NonUniformResourceIndex(i)];
+    return dynResTex.Sample(dynResSampler, uv);
+})x";
+
+  TestNuriCase(source, L"ps_6_6", 2);
+  TestNuriCase(sourceWithNuri, L"ps_6_6", 0);
+}
+
+TEST_F(PixTest, NonUniformResourceIndex_Raytracing) {
+
+  if (m_ver.SkipDxilVersion(1, 5)) {
+    return;
+  }
+
+  const char *source = R"x(
+RWTexture2D<float4> RT[] : register(u0);
+
+[noinline]
+void FuncNoInline(uint index)
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+    uint i = index + rayIndex.x * rayIndex.y;
+    float4 c = float4(0.5, 0.5, 0.5, 0);
+    RT[i][rayIndex.xy] += c;
+}
+
+void Func(uint index)
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+    uint i = index + rayIndex.y;
+    float4 c = float4(0, 1, 0, 0);
+    RT[i][rayIndex.xy] += c;
+}
+
+[shader("raygeneration")]
+void Main()
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+
+    uint i1 = rayIndex.x;
+    float4 c1 = float4(1, 0, 1, 1);
+    RT[i1][rayIndex.xy] += c1;
+
+    uint i2 = rayIndex.x * rayIndex.y * 0.25;
+    float4 c2 = float4(0.25, 0, 0.25, 0);
+    RT[i2][rayIndex.xy] += c2;
+
+    Func(i1);
+    FuncNoInline(i2);
+})x";
+
+  const char *sourceWithNuri = R"x(
+RWTexture2D<float4> RT[] : register(u0);
+
+[noinline]
+void FuncNoInline(uint index)
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+    uint i = index + rayIndex.x * rayIndex.y;
+    float4 c = float4(0.5, 0.5, 0.5, 0);
+    RT[NonUniformResourceIndex(i)][rayIndex.xy] += c;
+}
+
+void Func(uint index)
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+    uint i = index + rayIndex.y;
+    float4 c = float4(0, 1, 0, 0);
+    RT[NonUniformResourceIndex(i)][rayIndex.xy] += c;
+}
+
+[shader("raygeneration")]
+void Main()
+{
+    float2 rayIndex = DispatchRaysIndex().xy;
+
+    uint i1 = rayIndex.x;
+    float4 c1 = float4(1, 0, 1, 1);
+    RT[NonUniformResourceIndex(i1)][rayIndex.xy] += c1;
+
+    uint i2 = rayIndex.x * rayIndex.y * 0.25;
+    float4 c2 = float4(0.25, 0, 0.25, 0);
+    RT[NonUniformResourceIndex(i2)][rayIndex.xy] += c2;
+
+    Func(i1);
+    FuncNoInline(i2);
+})x";
+
+  TestNuriCase(source, L"lib_6_5", 4);
+  TestNuriCase(sourceWithNuri, L"lib_6_5", 0);
+}
+
+TEST_F(PixTest, DebugInstrumentation_TextOutput) {
+
+  const char *source = R"x(
+float4 main() : SV_Target {
+    return float4(0,0,0,0);
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"ps_6_0", {});
+  auto output = RunDebugPass(compiled, 8 /*ludicrously low UAV size limit*/);
+  bool foundStaticOverflow = false;
+  bool foundCounterOffset = false;
+  bool foundThreshold = false;
+  for (auto const &line : output.lines) {
+    if (line.find("StaticOverflow:12") != std::string::npos)
+      foundStaticOverflow = true;
+    if (line.find("InterestingCounterOffset:3") != std::string::npos)
+      foundCounterOffset = true;
+    if (line.find("OverflowThreshold:1") != std::string::npos)
+      foundThreshold = true;
+  }
+  VERIFY_IS_TRUE(foundStaticOverflow);
+}
+
+TEST_F(PixTest, DebugInstrumentation_BlockReport) {
+
+  const char *source = R"x(
+RWStructuredBuffer<int> UAV: register(u0);
+float4 main() : SV_Target {
+    // basic int variable
+    int v = UAV[0];
+    if(v == 0)
+        UAV[1] = v;
+    else
+        UAV[2] = v;
+    // float with indexed alloca
+    float f[2];
+    f[0] = UAV[4];
+    f[1] = UAV[5];
+    if(v == 2)
+        f[0] = v;
+    else
+        f[1] = v;
+    float farray2[2];
+    farray2[0] = UAV[4];
+    farray2[1] = UAV[5];
+    if(v == 4)
+        farray2[0] = v;
+    else
+        farray2[1] = v;
+    double d = UAV[8];
+    int64_t i64 = UAV[9];
+    return float4(d,i64,0,0);
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"ps_6_0", {L"-Od"});
+  auto output = RunDebugPass(compiled);
+  bool foundBlock = false;
+  bool foundRet = false;
+  bool foundUnnumberedVoidProllyADXNothing = false;
+  bool found32BitAssignment = false;
+  bool foundFloatAssignment = false;
+  bool foundDoubleAssignment = false;
+  bool found64BitAssignment = false;
+  bool found32BitAllocaStore = false;
+  for (auto const &line : output.lines) {
+    if (line.find("Block#") != std::string::npos) {
+      if (line.find("r,0,r;") != std::string::npos)
+        foundRet = true;
+      if (line.find("v,0,v;") != std::string::npos)
+        foundUnnumberedVoidProllyADXNothing = true;
+      if (line.find("3,3,a;") != std::string::npos)
+        found32BitAssignment = true;
+      if (line.find("d,13,a;") != std::string::npos)
+        foundDoubleAssignment = true;
+      if (line.find("f,19,a;") != std::string::npos)
+        foundFloatAssignment = true;
+      if (line.find("6,16,a;") != std::string::npos)
+        found64BitAssignment = true;
+      if (line.find("3,3,s,2+0;") != std::string::npos)
+        found32BitAllocaStore = true;
+      foundBlock = true;
+    }
+  }
+  VERIFY_IS_TRUE(foundBlock);
+  VERIFY_IS_TRUE(foundRet);
+  VERIFY_IS_TRUE(foundUnnumberedVoidProllyADXNothing);
+  VERIFY_IS_TRUE(found32BitAssignment);
+  VERIFY_IS_TRUE(found64BitAssignment);
+  VERIFY_IS_TRUE(foundFloatAssignment);
+  VERIFY_IS_TRUE(foundDoubleAssignment);
+  VERIFY_IS_TRUE(found32BitAllocaStore);
+}
+
+std::string ExtractBracedSubstring(std::string const &line) {
+  auto open = line.find('{');
+  auto close = line.find('}');
+  if (open != std::string::npos && close != std::string::npos &&
+      open + 1 < close) {
+    return line.substr(open + 1, close - open - 1);
+  }
+  return {};
+}
+
+int ExtractMetaInt32Value(std::string const &token) {
+  auto findi32 = token.find("i32 ");
+  if (findi32 != std::string_view::npos) {
+    return atoi(
+        std::string(token.data() + findi32 + 4, token.length() - (findi32 + 4))
+            .c_str());
+  }
+  return -1;
+}
+
+std::vector<std::string> Split(std::string str, char delimeter) {
+  std::vector<std::string> lines;
+
+  auto const *p = str.data();
+  auto const *justPastPreviousDelimiter = p;
+  while (p < str.data() + str.length()) {
+    if (*p == delimeter) {
+      lines.emplace_back(std::string(justPastPreviousDelimiter,
+                                     p - justPastPreviousDelimiter));
+      justPastPreviousDelimiter = p + 1;
+      p = justPastPreviousDelimiter;
+    } else {
+      p++;
+    }
+  }
+
+  lines.emplace_back(
+      std::string(justPastPreviousDelimiter, p - justPastPreviousDelimiter));
+
+  return lines;
+}
+
+struct MetadataAllocaDefinition {
+  int base;
+  int count;
+};
+using AllocaDefinitions = std::map<int, MetadataAllocaDefinition>;
+struct MetadataAllocaWrite {
+  int allocaDefMetadataKey;
+  int offset;
+  int size;
+};
+using AllocaWrites = std::map<int, MetadataAllocaWrite>;
+
+struct AllocaMetadata {
+  AllocaDefinitions allocaDefinitions;
+  AllocaWrites allocaWrites;
+  std::vector<int> allocaWritesMetaKeys;
+};
+
+AllocaMetadata
+FindAllocaRelatedMetadata(std::vector<std::string> const &lines) {
+
+  const char *allocaMetaDataAssignment = "= !{i32 1, ";
+  const char *allocaRegWRiteAssignment = "= !{i32 2, !";
+  const char *allocaRegWriteTag = "!pix-alloca-reg-write !";
+
+  AllocaMetadata ret;
+  for (auto const &line : lines) {
+    if (line[0] == '!') {
+      auto key = atoi(std::string(line.data() + 1, line.length() - 1).c_str());
+      if (key != -1) {
+        if (line.find(allocaMetaDataAssignment) != std::string::npos) {
+          std::string bitInBraces = ExtractBracedSubstring(line);
+          if (bitInBraces != "") {
+            auto tokens = Split(bitInBraces, ',');
+            if (tokens.size() == 3) {
+              auto value0 = ExtractMetaInt32Value(tokens[1]);
+              auto value1 = ExtractMetaInt32Value(tokens[2]);
+              if (value0 != -1 && value1 != -1) {
+                MetadataAllocaDefinition def;
+                def.base = value0;
+                def.count = value1;
+                ret.allocaDefinitions[key] = def;
+              }
+            }
+          }
+        } else if (line.find(allocaRegWRiteAssignment) != std::string::npos) {
+          std::string bitInBraces = ExtractBracedSubstring(line);
+          if (bitInBraces != "") {
+            auto tokens = Split(bitInBraces, ',');
+            if (tokens.size() == 4 && tokens[1][1] == '!') {
+              auto allocaKey = atoi(tokens[1].c_str() + 2);
+              auto value0 = ExtractMetaInt32Value(tokens[2]);
+              auto value1 = ExtractMetaInt32Value(tokens[3]);
+              if (value0 != -1 && value1 != -1) {
+                MetadataAllocaWrite aw;
+                aw.allocaDefMetadataKey = allocaKey;
+                aw.size = value0;
+                aw.offset = value1;
+                ret.allocaWrites[key] = aw;
+              }
+            }
+          }
+        }
+      }
+    } else {
+      auto findAw = line.find(allocaRegWriteTag);
+      if (findAw != std::string::npos) {
+        ret.allocaWritesMetaKeys.push_back(
+            atoi(line.c_str() + findAw + strlen(allocaRegWriteTag)));
+      }
+    }
+  }
+  return ret;
+}
+
+TEST_F(PixTest, DebugInstrumentation_VectorAllocaWrite_Structs) {
+  const char *source = R"x(
+RaytracingAccelerationStructure Scene : register(t0, space0);
+struct RayPayload
+{
+    float4 color;
+};
+RWStructuredBuffer<float> UAV: register(u0);
+[shader("raygeneration")]
+void RaygenInternalName()
+{
+    RayDesc ray;
+    ray.Origin = float3(UAV[0], UAV[1],UAV[3]);
+    ray.Direction = float3(4.4,5.5,6.6);
+    ray.TMin = 0.001;
+    ray.TMax = 10000.0;
+    RayPayload payload = { float4(0, 1, 0, 1) };
+    TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"lib_6_6", {L"-Od"});
+  auto output = RunDebugPass(compiled);
+  auto disassembly = Disassemble(output.blob);
+  auto lines = Split(disassembly, '\n');
+  auto metaDataKeyToValue = FindAllocaRelatedMetadata(lines);
+  // To validate that the RayDesc and RayPayload instances were fully covered,
+  // check that there are alloca writes that cover all of them. RayPayload
+  // has four elements, and RayDesc has eight.
+  std::array<bool, 4> RayPayloadElementCoverage;
+
+  for (auto const &write : metaDataKeyToValue.allocaWrites) {
+    // the whole point of the changes with this test is to separate vector
+    // writes into individual elements:
+    VERIFY_ARE_EQUAL(1, write.second.size);
+    auto findAlloca = metaDataKeyToValue.allocaDefinitions.find(
+        write.second.allocaDefMetadataKey);
+    if (findAlloca != metaDataKeyToValue.allocaDefinitions.end()) {
+      if (findAlloca->second.count == 4) {
+        RayPayloadElementCoverage[write.second.offset] = true;
+      }
+    }
+  }
+  // Check that coverage for every element was emitted:
+  for (auto const &b : RayPayloadElementCoverage)
+    VERIFY_IS_TRUE(b);
+}
+
+TEST_F(PixTest, DebugBreakInstrumentation_Basic) {
+  if (m_ver.SkipDxilVersion(1, 10))
+    return;
+
+  const char *source = R"x(
+[numthreads(1, 1, 1)]
+void main() {
+    DebugBreak();
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"cs_6_10", {});
+  auto output = RunDebugBreakPass(compiled);
+  bool foundDebugBreak = false;
+  for (auto const &line : output.lines) {
+    if (line.find("FoundDebugBreak") != std::string::npos)
+      foundDebugBreak = true;
+  }
+  VERIFY_IS_TRUE(foundDebugBreak);
+}
+
+TEST_F(PixTest, DebugBreakInstrumentation_NoDebugBreak) {
+
+  const char *source = R"x(
+RWByteAddressBuffer buf : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    buf.Store(0, 1);
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"cs_6_0", {});
+  auto output = RunDebugBreakPass(compiled);
+  bool foundDebugBreak = false;
+  for (auto const &line : output.lines) {
+    if (line.find("FoundDebugBreak") != std::string::npos)
+      foundDebugBreak = true;
+  }
+  VERIFY_IS_FALSE(foundDebugBreak);
+}
+
+TEST_F(PixTest, DebugBreakInstrumentation_Multiple) {
+  if (m_ver.SkipDxilVersion(1, 10))
+    return;
+
+  const char *source = R"x(
+RWByteAddressBuffer buf : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x == 0)
+        DebugBreak();
+    buf.Store(0, tid.x);
+    if (tid.x == 1)
+        DebugBreak();
+})x";
+
+  auto compiled = Compile(m_dllSupport, source, L"cs_6_10", {});
+  auto output = RunDebugBreakPass(compiled);
+  bool foundDebugBreak = false;
+  for (auto const &line : output.lines) {
+    if (line.find("FoundDebugBreak") != std::string::npos)
+      foundDebugBreak = true;
+  }
+  VERIFY_IS_TRUE(foundDebugBreak);
+
+  // Verify the disassembly contains the expected AtomicBinOp calls
+  // and no remaining DebugBreak calls
+  auto disassembly = Disassemble(output.blob);
+  VERIFY_IS_TRUE(disassembly.find("dx.op.debugBreak") == std::string::npos);
+
+  // Count the number of DebugBreakBitSet calls to verify both
+  // DebugBreak() calls were instrumented
+  int debugBreakBitSetCount = 0;
+  std::string::size_type pos = 0;
+  while ((pos = disassembly.find("DebugBreakBitSet", pos)) !=
+         std::string::npos) {
+    debugBreakBitSetCount++;
+    pos += strlen("DebugBreakBitSet");
+  }
+  VERIFY_ARE_EQUAL(debugBreakBitSetCount, 2);
+}

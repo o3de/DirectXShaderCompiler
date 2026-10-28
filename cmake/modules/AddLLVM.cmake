@@ -1,5 +1,6 @@
 include(LLVMProcessSources)
 include(LLVM-Config)
+find_package(Python3 REQUIRED)
 
 function(llvm_update_compile_flags name)
   get_property(sources TARGET ${name} PROPERTY SOURCES)
@@ -9,7 +10,7 @@ function(llvm_update_compile_flags name)
 
   # LLVM_REQUIRES_EH is an internal flag that individual
   # targets can use to force EH
-  if((LLVM_REQUIRES_EH OR LLVM_ENABLE_EH) AND NOT CLANG_CL)
+  if(LLVM_REQUIRES_EH OR LLVM_ENABLE_EH) # HLSL Change - allow CLANG_CL to use EH.
     if(NOT (LLVM_REQUIRES_RTTI OR LLVM_ENABLE_RTTI))
       message(AUTHOR_WARNING "Exception handling requires RTTI. Enabling RTTI for ${name}")
       set(LLVM_REQUIRES_RTTI ON)
@@ -107,7 +108,7 @@ function(add_llvm_symbol_exports target_name export_file)
     set(native_export_file "${target_name}.def")
 
     add_custom_command(OUTPUT ${native_export_file}
-      COMMAND ${PYTHON_EXECUTABLE} -c "import sys;print(''.join(['EXPORTS\\n']+sys.stdin.readlines(),))"
+      COMMAND ${Python3_EXECUTABLE} -c "import sys;print(''.join(['EXPORTS\\n']+sys.stdin.readlines(),))"
         < ${export_file} > ${native_export_file}
       DEPENDS ${export_file}
       VERBATIM
@@ -221,11 +222,35 @@ function(set_output_directory target bindir libdir)
     set(moddir ${libdir})
   endif()
   if(NOT "${CMAKE_CFG_INTDIR}" STREQUAL ".")
+    # HLSL change begin: work around broken MSVC_BUILD_AS_X
+    get_target_property(target_type ${target} TYPE)
+    if(target_type STREQUAL "SHARED_LIBRARY" AND MSVC_BUILD_AS_X EQUAL 1)
+      set(arm64x_workaround 1)
+      message(NOTICE "Working around ARM64X / MSVC_BUILD_AS_X bug for ${target}")
+    else()
+      set(arm64x_workaround 0)
+    endif()
+    # HLSL change end
+
     foreach(build_mode ${CMAKE_CONFIGURATION_TYPES})
       string(TOUPPER "${build_mode}" CONFIG_SUFFIX)
       string(REPLACE ${CMAKE_CFG_INTDIR} ${build_mode} bi ${bindir})
       string(REPLACE ${CMAKE_CFG_INTDIR} ${build_mode} li ${libdir})
       string(REPLACE ${CMAKE_CFG_INTDIR} ${build_mode} mi ${moddir})
+
+      # HLSL change begin: work around broken MSVC_BUILD_AS_X
+      #
+      # MSVC_BUILD_AS_X generates a vcxproj that builds for both ARM64 and
+      # ARM64EC, but these two platforms are only visible in msbuild. It also
+      # currently configures the import libraries to all be output to the same
+      # location, which means it's a race for if we get the ARM64 or ARM64X
+      # version there.  The appended $(PLATFORM) is evaluated by msbuild at
+      # build time to separate the ARM64EC from ARM64 builds.
+      if(arm64x_workaround EQUAL 1)
+        string(APPEND li "/$(PLATFORM)")
+      endif()
+      # HLSL change end
+
       set_target_properties(${target} PROPERTIES "RUNTIME_OUTPUT_DIRECTORY_${CONFIG_SUFFIX}" ${bi})
       set_target_properties(${target} PROPERTIES "ARCHIVE_OUTPUT_DIRECTORY_${CONFIG_SUFFIX}" ${li})
       set_target_properties(${target} PROPERTIES "LIBRARY_OUTPUT_DIRECTORY_${CONFIG_SUFFIX}" ${mi})
@@ -244,14 +269,14 @@ endfunction()
 #
 function(add_windows_version_resource_file OUT_VAR)
   set(sources ${ARGN})
-  if (MSVC)
+  if (WIN32)
     set(resource_file ${LLVM_SOURCE_DIR}/resources/windows_version_resource.rc)
     if(EXISTS ${resource_file})
       set(sources ${sources} ${resource_file})
       source_group("Resource Files" ${resource_file})
       set(windows_resource_file ${resource_file} PARENT_SCOPE)
     endif()
-  endif(MSVC)
+  endif(WIN32)
 
   set(${OUT_VAR} ${sources} PARENT_SCOPE)
 endfunction(add_windows_version_resource_file)
@@ -295,8 +320,10 @@ function(set_windows_version_resource_properties name resource_file)
     set(ARG_PRODUCT_NAME "LLVM")
   endif()
 
+  if (MSVC)
   set_property(SOURCE ${resource_file}
                PROPERTY COMPILE_FLAGS /nologo)
+  endif()
   set_property(SOURCE ${resource_file}
                PROPERTY COMPILE_DEFINITIONS
                "RC_VERSION_FIELD_1=${ARG_VERSION_MAJOR}"
@@ -317,7 +344,7 @@ function(set_windows_version_resource_properties name resource_file)
                   "INCLUDE_HLSL_VERSION_FILE=1")
       set_property(SOURCE ${resource_file}
                   PROPERTY COMPILE_OPTIONS
-                  "/I" "${HLSL_VERSION_LOCATION}")
+                  "-I" "${HLSL_VERSION_LOCATION}")
     endif (DEFINED resource_file)
   endif(${HLSL_EMBED_VERSION})
   # HLSL change ends
@@ -446,10 +473,20 @@ function(llvm_add_library name)
         )
     endif()
 
+    # HLSL Change Begin - Don't generate so versioned files.
     set_target_properties(${name}
       PROPERTIES
       SOVERSION ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}
-      VERSION ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}${LLVM_VERSION_SUFFIX})
+      VERSION ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}${LLVM_VERSION_SUFFIX}
+      NO_SONAME On)
+    if (APPLE)
+      set_property(TARGET ${name} APPEND_STRING PROPERTY
+                   LINK_FLAGS " -Wl,-install_name,@rpath/${CMAKE_SHARED_LIBRARY_PREFIX}${name}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    elseif(UNIX)
+      set_property(TARGET ${name} APPEND_STRING PROPERTY
+                   LINK_FLAGS " -Wl,-soname,${CMAKE_SHARED_LIBRARY_PREFIX}${name}${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    endif()
+    # HLSL Change End - Don't generate so versioned files.
   endif()
 
   if(ARG_MODULE OR ARG_SHARED)
@@ -770,8 +807,8 @@ function(add_unittest test_suite test_name)
     set(EXCLUDE_FROM_ALL ON)
   endif()
 
-  include_directories(${DXC_GTEST_DIR}/googletest/include) # SPIRV change
-  include_directories(${DXC_GTEST_DIR}/googlemock/include) # SPIRV change
+  include_directories(${LLVM_MAIN_SRC_DIR}/utils/unittest/googletest/include)
+  include_directories(${LLVM_MAIN_SRC_DIR}/utils/unittest/googlemock/include) # HLSL Change - Pulled in from LLVM 4.0
   if (NOT LLVM_ENABLE_THREADS)
     list(APPEND LLVM_COMPILE_DEFINITIONS GTEST_HAS_PTHREAD=0)
   endif ()
@@ -787,7 +824,7 @@ function(add_unittest test_suite test_name)
   set_output_directory(${test_name} ${outdir} ${outdir})
   target_link_libraries(${test_name}
     gtest
-    # gtest_main # SPIRV change
+    gtest_main
     LLVMSupport # gtest needs it for raw_ostream.
     )
 
@@ -857,7 +894,6 @@ function(configure_lit_site_cfg input output)
   # SHLIBDIR points the build tree.
   string(REPLACE ${CMAKE_CFG_INTDIR} ${LLVM_BUILD_MODE} SHLIBDIR "${LLVM_SHLIB_OUTPUT_INTDIR}")
 
-  set(PYTHON_EXECUTABLE ${PYTHON_EXECUTABLE})
   # FIXME: "ENABLE_SHARED" doesn't make sense, since it is used just for
   # plugins. We may rename it.
   if(LLVM_ENABLE_PLUGINS)
@@ -892,7 +928,7 @@ function(add_lit_target target comment)
     list(APPEND LIT_ARGS --param build_mode=${CMAKE_CFG_INTDIR})
   endif ()
   if (LLVM_MAIN_SRC_DIR)
-    set (LIT_COMMAND ${PYTHON_EXECUTABLE} ${LLVM_MAIN_SRC_DIR}/utils/lit/lit.py)
+    set (LIT_COMMAND ${Python3_EXECUTABLE} ${LLVM_MAIN_SRC_DIR}/utils/lit/lit.py)
   else()
     find_program(LIT_COMMAND llvm-lit)
   endif ()
@@ -943,26 +979,39 @@ endfunction()
 
 function(add_lit_testsuites project directory)
   if (NOT CMAKE_CONFIGURATION_TYPES)
-    cmake_parse_arguments(ARG "" "" "PARAMS;DEPENDS;ARGS" ${ARGN})
-    file(GLOB_RECURSE litCfg ${directory}/lit*.cfg)
-    set(lit_suites)
-    foreach(f ${litCfg})
-      get_filename_component(dir ${f} DIRECTORY)
-      set(lit_suites ${lit_suites} ${dir})
-    endforeach()
-    list(REMOVE_DUPLICATES lit_suites)
-    foreach(dir ${lit_suites})
-      string(REPLACE ${directory} "" name_slash ${dir})
+    cmake_parse_arguments(ARG "EXCLUDE_FROM_CHECK_ALL" "FOLDER" "PARAMS;DEPENDS;ARGS" ${ARGN})
+
+    if (NOT ARG_FOLDER)
+      set(ARG_FOLDER "Test Subdirectories")
+    endif()
+
+    # Search recursively for test directories by assuming anything not
+    # in a directory called Inputs contains tests.
+    file(GLOB_RECURSE to_process LIST_DIRECTORIES true ${directory}/*)
+    foreach(lit_suite ${to_process})
+      if(NOT IS_DIRECTORY ${lit_suite})
+        continue()
+      endif()
+      string(FIND ${lit_suite} Inputs is_inputs)
+      string(FIND ${lit_suite} Output is_output)
+      if (NOT (is_inputs EQUAL -1 AND is_output EQUAL -1))
+        continue()
+      endif()
+
+      # Create a check- target for the directory.
+      string(REPLACE ${directory} "" name_slash ${lit_suite})
       if (name_slash)
         string(REPLACE "/" "-" name_slash ${name_slash})
         string(REPLACE "\\" "-" name_dashes ${name_slash})
         string(TOLOWER "${project}${name_dashes}" name_var)
-        add_lit_target("check-${name_var}" "Running lit suite ${dir}"
-          ${dir}
+        add_lit_target("check-${name_var}" "Running lit suite ${lit_suite}"
+          ${lit_suite}
+          ${EXCLUDE_FROM_CHECK_ALL}
           PARAMS ${ARG_PARAMS}
           DEPENDS ${ARG_DEPENDS}
           ARGS ${ARG_ARGS}
         )
+        set_target_properties(check-${name_var} PROPERTIES FOLDER ${ARG_FOLDER})
       endif()
     endforeach()
   endif()

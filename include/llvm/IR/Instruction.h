@@ -20,6 +20,8 @@
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/SymbolTableListTraits.h"
 #include "llvm/IR/User.h"
+#include <memory>  // HLSL Change
+#include <utility> // HLSL Change
 
 namespace llvm {
 
@@ -37,15 +39,25 @@ struct ilist_traits<Instruction>
   ///
   /// The sentinel is relative to this instance, so we use a non-static
   /// method.
-  Instruction *createSentinel() const;
+  // HLSL Change Starts
+  Instruction *createSentinel() const { return Sentinel.get(); }
   static void destroySentinel(Instruction *) {}
 
-  Instruction *provideInitialHead() const { return createSentinel(); }
-  Instruction *ensureHead(Instruction *) const { return createSentinel(); }
+  Instruction *provideInitialHead() const { return Sentinel.get(); }
+  Instruction *ensureHead(Instruction *) const { return Sentinel.get(); }
   static void noteHead(Instruction *, Instruction *) {}
 
+public:
+  // Saves and takes ownership of the sentinel.
+  // Must be called before the other accessors above.
+  // HLSL Change start: definition moved out-of-line because Instruction must be
+  // a complete type when ~unique_ptr<Instruction> is instantiated in C++23.
+  inline void setSentinel(std::unique_ptr<Instruction> &&s);
+  // HLSL Change Ends
+
 private:
-  mutable ilist_half_node<Instruction> Sentinel;
+  std::unique_ptr<Instruction> Sentinel;
+  // HLSL Change Ends
 };
 
 class Instruction : public User, public ilist_node<Instruction> {
@@ -515,7 +527,19 @@ private:
   Instruction *cloneImpl() const;
 };
 
-inline Instruction *ilist_traits<Instruction>::createSentinel() const {
+// HLSL Change start: definition moved out-of-line because Instruction must be
+// a complete type when ~unique_ptr<Instruction> is instantiated in C++23.
+void ilist_traits<Instruction>::setSentinel(std::unique_ptr<Instruction> &&s) {
+  Sentinel = std::move(s);
+}
+// HLSL Change end
+
+// HLSL Change Starts
+// Temporarily disable "downcast of address" UBSAN runtime error
+// https://github.com/microsoft/DirectXShaderCompiler/issues/6446
+#if 0
+inline Instruction *
+ilist_traits<Instruction>::createSentinel() const {
   // Since i(p)lists always publicly derive from their corresponding traits,
   // placing a data member in this class will augment the i(p)list.  But since
   // the NodeTy is expected to be publicly derive from ilist_node<NodeTy>,
@@ -525,6 +549,8 @@ inline Instruction *ilist_traits<Instruction>::createSentinel() const {
   // ilist_node<NodeTy>), so no one will ever notice the superposition.
   return static_cast<Instruction *>(&Sentinel);
 }
+#endif
+// HLSL Change Ends
 
 // Instruction* is only 4-byte aligned.
 template<>

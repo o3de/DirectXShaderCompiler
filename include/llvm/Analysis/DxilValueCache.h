@@ -10,8 +10,8 @@
 #ifndef LLVM_ANALYSIS_DXILVALUECACHE_H
 #define LLVM_ANALYSIS_DXILVALUECACHE_H
 
-#include "llvm/Pass.h"
 #include "llvm/IR/ValueMap.h"
+#include "llvm/Pass.h"
 
 namespace llvm {
 
@@ -19,6 +19,7 @@ class Module;
 class DominatorTree;
 class Constant;
 class ConstantInt;
+class PHINode;
 
 struct DxilValueCache : public ImmutablePass {
   static char ID;
@@ -30,10 +31,13 @@ struct DxilValueCache : public ImmutablePass {
       void allUsesReplacedWith(Value *) override { setValPtr(nullptr); }
     };
     struct ValueEntry {
-      WeakVH Value;
+      WeakTrackingVH Value;
       ValueVH Self;
       ValueEntry() : Value(nullptr), Self(nullptr) {}
-      inline void Set(llvm::Value *Key, llvm::Value *V) { Self = Key; Value = V; }
+      inline void Set(llvm::Value *Key, llvm::Value *V) {
+        Self = Key;
+        Value = V;
+      }
       inline bool IsStale() const { return Self == nullptr; }
     };
     ValueMap<const Value *, ValueEntry> Map;
@@ -42,19 +46,19 @@ struct DxilValueCache : public ImmutablePass {
     bool Seen(Value *v);
     void SetSentinel(Value *V);
     void ResetUnknowns();
+    void ResetAll();
     void dump() const;
+
   private:
     Value *GetSentinel(LLVMContext &Ctx);
-    std::unique_ptr<Value> Sentinel;
+    std::unique_ptr<PHINode> Sentinel;
   };
 
 private:
+  WeakValueMap Map;
+  bool (*ShouldSkipCallback)(Value *V) = nullptr;
 
-  WeakValueMap ValueMap;
-
-  void MarkAlwaysReachable(BasicBlock *BB);
   void MarkUnreachable(BasicBlock *BB);
-  bool IsAlwaysReachable_(BasicBlock *BB);
   bool IsUnreachable_(BasicBlock *BB);
   bool MayBranchTo(BasicBlock *A, BasicBlock *B);
   Value *TryGetCachedValue(Value *V);
@@ -62,27 +66,30 @@ private:
 
   Value *ProcessAndSimplify_PHI(Instruction *I, DominatorTree *DT);
   Value *ProcessAndSimplify_Br(Instruction *I, DominatorTree *DT);
+  Value *ProcessAndSimplify_Switch(Instruction *I, DominatorTree *DT);
   Value *ProcessAndSimplify_Load(Instruction *LI, DominatorTree *DT);
   Value *SimplifyAndCacheResult(Instruction *I, DominatorTree *DT);
 
 public:
-
-  const char *getPassName() const override;
+  StringRef getPassName() const override;
   DxilValueCache();
   void getAnalysisUsage(AnalysisUsage &) const override;
 
   void dump() const;
-  Value *GetValue(Value *V, DominatorTree *DT=nullptr);
+  Value *GetValue(Value *V, DominatorTree *DT = nullptr);
   Constant *GetConstValue(Value *V, DominatorTree *DT = nullptr);
   ConstantInt *GetConstInt(Value *V, DominatorTree *DT = nullptr);
-  void ResetUnknowns() { ValueMap.ResetUnknowns(); }
-  bool IsAlwaysReachable(BasicBlock *BB, DominatorTree *DT=nullptr);
-  bool IsUnreachable(BasicBlock *BB, DominatorTree *DT=nullptr);
+  void ResetUnknowns() { Map.ResetUnknowns(); }
+  void ResetAll() { Map.ResetAll(); }
+  bool IsUnreachable(BasicBlock *BB, DominatorTree *DT = nullptr);
+  void SetShouldSkipCallback(bool (*Callback)(Value *V)) {
+    ShouldSkipCallback = Callback;
+  };
 };
 
 void initializeDxilValueCachePass(class llvm::PassRegistry &);
 Pass *createDxilValueCachePass();
 
-}
+} // namespace llvm
 
 #endif

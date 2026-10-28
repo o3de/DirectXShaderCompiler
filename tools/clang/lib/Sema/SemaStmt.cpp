@@ -245,7 +245,11 @@ void Sema::DiagnoseUnusedExprResult(const Stmt *S) {
       const FunctionDecl *Func = dyn_cast<FunctionDecl>(FD);
       if (Func ? Func->hasUnusedResultAttr()
                : FD->hasAttr<WarnUnusedResultAttr>()) {
-        Diag(Loc, diag::warn_unused_result) << R1 << R2;
+        // HLSL Change Begin - allow attribute spelling to come in.
+        Attr *NoDiscardAttr = Func ? Func->getNoDiscardAttr()
+                                   : FD->getAttr<WarnUnusedResultAttr>();
+        Diag(Loc, diag::warn_unused_result) << NoDiscardAttr << R1 << R2;
+        // HLSL Change End
         return;
       }
       if (ShouldSuppress)
@@ -270,7 +274,10 @@ void Sema::DiagnoseUnusedExprResult(const Stmt *S) {
     const ObjCMethodDecl *MD = ME->getMethodDecl();
     if (MD) {
       if (MD->hasAttr<WarnUnusedResultAttr>()) {
-        Diag(Loc, diag::warn_unused_result) << R1 << R2;
+        // HLSL Change Begin - allow attribute spelling to come in.
+        Diag(Loc, diag::warn_unused_result)
+            << MD->getAttr<WarnUnusedResultAttr>() << R1 << R2;
+        // HLSL Change End
         return;
       }
     }
@@ -392,7 +399,8 @@ Sema::ActOnCaseStmt(SourceLocation CaseLoc, Expr *LHSVal,
     return StmtError();
   LHSVal = LHS.get();
 
-  if (!getLangOpts().CPlusPlus11 && getLangOpts().HLSLVersion < 2017) {
+  if (!getLangOpts().CPlusPlus11 &&
+      getLangOpts().HLSLVersion < hlsl::LangStd::v2017) {
     // C99 6.8.4.2p3: The expression shall be an integer constant.
     // However, GCC allows any evaluatable integer expression.
     if (!LHSVal->isTypeDependent() && !LHSVal->isValueDependent()) {
@@ -860,7 +868,8 @@ Sema::ActOnFinishSwitchStmt(SourceLocation SwitchLoc, Stmt *Switch,
 
       llvm::APSInt LoVal;
 
-      if (getLangOpts().CPlusPlus11 || getLangOpts().HLSLVersion >= 2017) {
+      if (getLangOpts().CPlusPlus11 ||
+          getLangOpts().HLSLVersion >= hlsl::LangStd::v2017) {
         // C++11 [stmt.switch]p2: the constant-expression shall be a converted
         // constant expression of the promoted type of the switch condition.
         ExprResult ConvLo =
@@ -2699,6 +2708,11 @@ VarDecl *Sema::getCopyElisionCandidate(QualType ReturnType,
   if (!VD)
     return nullptr;
 
+  // HLSL Change Begins: NRVO unsafe for a variety of cases in HLSL
+  if (getLangOpts().HLSL && hlsl::ShouldSkipNRVO(*this, ReturnType, VD, getCurFunctionDecl()))
+    return nullptr;
+  // HLSL Change Ends
+
   if (isCopyElisionCandidate(ReturnType, VD, AllowFunctionParameter))
     return VD;
   return nullptr;
@@ -2712,12 +2726,6 @@ bool Sema::isCopyElisionCandidate(QualType ReturnType, const VarDecl *VD,
   if (!ReturnType.isNull() && !ReturnType->isDependentType()) {
     if (!ReturnType->isRecordType())
       return false;
-    // HLSL Change Begins: exclude vectors/matrix (not treated as record type)
-    // NRVO breaks on bool component type due to diff between
-    // i32 memory and i1 register representation
-    if (hlsl::IsHLSLVecMatType(ReturnType))
-      return false;
-    // HLSL Change Ends
     // ... the same cv-unqualified type as the function return type ...
     if (!VDType->isDependentType() &&
         !Context.hasSameUnqualifiedType(ReturnType, VDType))
@@ -3180,6 +3188,11 @@ StmtResult Sema::BuildReturnStmt(SourceLocation ReturnLoc, Expr *RetValExp) {
       }
     }
   }
+
+  // HLSL Change begin - Diagnose mismatched globallycoherent attrs on return.
+  if (RetValExp)
+    DiagnoseCoherenceMismatch(RetValExp, FnRetType, ReturnLoc);
+  // HLSL Change end
 
   bool HasDependentReturnType = FnRetType->isDependentType();
 

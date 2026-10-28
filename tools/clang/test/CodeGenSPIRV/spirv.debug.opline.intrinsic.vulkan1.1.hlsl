@@ -1,9 +1,9 @@
-// Run: %dxc -T cs_6_0 -E main -Zi -fspv-target-env=vulkan1.1
+// RUN: %dxc -T cs_6_0 -E main -Zi -fspv-target-env=vulkan1.1 -fcgl  %s -spirv | FileCheck %s
 
-// CHECK:      [[file:%\d+]] = OpString
+// CHECK:      [[file:%[0-9]+]] = OpString
 // CHECK-SAME: spirv.debug.opline.intrinsic.vulkan1.1.hlsl
 
-[numthreads(1,1,1)]void main() {
+[numthreads(2,2,1)]void main() {
 // CHECK:      OpLine [[file]] 11 11
 // CHECK:      OpLoad %uint %SubgroupSize
 // CHECK-NEXT: OpLine [[file]] 11 32

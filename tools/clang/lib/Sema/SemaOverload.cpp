@@ -146,8 +146,8 @@ ImplicitConversionRank clang::GetConversionRank(ImplicitConversionKind Kind) {
   };
   static_assert(_countof(Rank) == ICK_Num_Conversion_Kinds,
       "Otherwise, GetConversionRank is out of sync with ImplicitConversionKind"); // HLSL Change
-  assert((int)Kind < (int)ICK_Num_Conversion_Kinds); // HLSL Change
-  return Rank[(int)Kind];
+  assert(Kind < _countof(Rank)); // HLSL Change
+  return Rank[Kind];             // HLSL Change
 }
 
 /// GetImplicitConversionName - Return the name of this kind of
@@ -4869,16 +4869,20 @@ TryObjectArgumentInitialization(Sema &S, QualType FromType,
 
   // First check the qualifiers.
   QualType FromTypeCanon = S.Context.getCanonicalType(FromType);
-  // HLSL Change Starts - for calls other than subscript overloads, disregard const
+  // HLSL Change Starts
+  // HLSL Note: For calls that aren't compiler-generated C++ overloads, we 
+  // disregard const qualifiers so that member functions can be called on
+  // `const` objects from constant buffer types. This should change in the
+  // future if we support const instance methods.
   FromTypeCanon.removeLocalRestrict(); // HLSL Change - disregard restrict.
   if (!S.getLangOpts().HLSL ||
-     (Method != nullptr && Method->getDeclName() == S.Context.DeclarationNames.getCXXOperatorName(OO_Subscript))) {
-  // HLSL Change Ends
-    if (ImplicitParamType.getCVRQualifiers()
-                                      != FromTypeCanon.getLocalCVRQualifiers() &&
+      (Method != nullptr && Method->hasAttr<HLSLCXXOverloadAttr>())) {
+    // HLSL Change Ends
+    if (ImplicitParamType.getCVRQualifiers() !=
+            FromTypeCanon.getLocalCVRQualifiers() &&
         !ImplicitParamType.isAtLeastAsQualifiedAs(FromTypeCanon)) {
-      ICS.setBad(BadConversionSequence::bad_qualifiers,
-                 FromType, ImplicitParamType);
+      ICS.setBad(BadConversionSequence::bad_qualifiers, FromType,
+                 ImplicitParamType);
       return ICS;
     }
   } // HLSL Change - end branch
@@ -4949,6 +4953,26 @@ InitCallParamConversions(Sema &S, const FunctionProtoType *Proto,
                          ImplicitConversionSequence &OutConversion) {
   hlsl::ParameterModifier paramMods = Proto->getParamMods()[ArgIdx];
   QualType ParamType = Proto->getParamType(ArgIdx);
+
+  // must be a Ref; don't allow any conversions
+  if (!(paramMods.isAnyIn() || paramMods.isAnyOut())) {
+    if (!S.getASTContext().hasSameUnqualifiedType(
+            ParamType.getNonReferenceType(), Arg->getType()) ||
+        Arg->getType().getQualifiers().getAddressSpace() !=
+            hlsl::DXIL::kTGSMAddrSpace) {
+      InConversion.setBad(BadConversionSequence::no_conversion, Arg->getType(),
+                          ParamType.getNonReferenceType());
+      InConversion.Bad.FromExpr = Arg;
+      return;
+    }
+  }
+
+  if (S.getLangOpts().HLSLVersion >= hlsl::LangStd::v202x &&
+      paramMods.isAnyIn() && paramMods.isAnyOut() &&
+      Arg->getType().getQualifiers().getAddressSpace() ==
+          hlsl::DXIL::kTGSMAddrSpace)
+    S.Diag(Arg->getLocStart(), diag::warn_hlsl_groupshared_inout);
+
   if (paramMods.isAnyIn()) {
     InConversion =
         TryCopyInitialization(S, Arg, ParamType, SuppressUserConversions,
@@ -4983,8 +5007,8 @@ Sema::PerformObjectArgumentInitialization(Expr *From,
                                           NamedDecl *FoundDecl,
                                           CXXMethodDecl *Method) {
   QualType FromRecordType, DestType;
-  QualType ImplicitParamRecordType  =
-    Method->getThisType(Context)->getAs<PointerType>()->getPointeeType();
+  // HLSL Change - this is a reference.
+  QualType ImplicitParamRecordType = Method->getThisObjectType(Context);
 
   Expr::Classification FromClassification;
   if (const PointerType *PT = From->getType()->getAs<PointerType>()) {
@@ -5137,7 +5161,8 @@ static ExprResult CheckConvertedConstantExpression(Sema &S, Expr *From,
                                                    QualType T, APValue &Value,
                                                    Sema::CCEKind CCE,
                                                    bool RequireInt) {
-  assert((S.getLangOpts().CPlusPlus11 || S.getLangOpts().HLSLVersion >= 2017) &&
+  assert((S.getLangOpts().CPlusPlus11 ||
+          S.getLangOpts().HLSLVersion >= hlsl::LangStd::v2017) &&
          "converted constant expression outside C++11");
 
   if (checkPlaceholderForOverload(S, From))
@@ -5630,6 +5655,7 @@ ExprResult Sema::PerformContextualImplicitConversion(
                                      ExplicitConversions))
         return ExprError();
     // fall through 'OR_Deleted' case.
+      LLVM_FALLTHROUGH; // HLSL Change
     case OR_Deleted:
       // We'll complain below about a non-integral condition type.
       break;
@@ -8329,7 +8355,7 @@ void Sema::AddBuiltinOperatorCandidates(OverloadedOperatorKind Op,
   case OO_Plus: // '+' is either unary or binary
     if (Args.size() == 1)
       OpBuilder.addUnaryPlusPointerOverloads();
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case OO_Minus: // '-' is either unary or binary
     if (Args.size() == 1) {
@@ -8360,7 +8386,7 @@ void Sema::AddBuiltinOperatorCandidates(OverloadedOperatorKind Op,
   case OO_EqualEqual:
   case OO_ExclaimEqual:
     OpBuilder.addEqualEqualOrNotEqualMemberPointerOverloads();
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case OO_Less:
   case OO_Greater:
@@ -8394,12 +8420,12 @@ void Sema::AddBuiltinOperatorCandidates(OverloadedOperatorKind Op,
 
   case OO_Equal:
     OpBuilder.addAssignmentMemberPointerOrEnumeralOverloads();
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case OO_PlusEqual:
   case OO_MinusEqual:
     OpBuilder.addAssignmentPointerOverloads(Op == OO_Equal);
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case OO_StarEqual:
   case OO_SlashEqual:
@@ -8662,12 +8688,12 @@ OverloadCandidateSet::BestViableFunction(Sema &S, SourceLocation Loc,
                                          iterator &Best,
                                          bool UserDefinedConversion) {
   // HLSL Change Starts
-  // Function calls should use HLSL-style overloading. operator[] overloads
-  // (used for const support) aren't supported by the defined rules, so
-  // use C++ overload resolution for those.
+  // Function calls should use HLSL-style overloading. Except for compiler
+  // generated functions which are annotated as requiring C++ overload
+  // resolution like operator[] overloads where `const` methods are aren't
+  // supported by HLSL's defined rules.
   if (S.getLangOpts().HLSL && !empty() && begin()->Function != nullptr &&
-      (begin()->Function->getDeclName() !=
-            S.Context.DeclarationNames.getCXXOperatorName(OO_Subscript))) {
+      !begin()->Function->hasAttr<HLSLCXXOverloadAttr>()) {
     return ::hlsl::GetBestViableFunction(S, Loc, *this, Best);
   }
   // HLSL Change Ends
@@ -9044,7 +9070,7 @@ static void DiagnoseBadConversion(Sema &S, OverloadCandidate *Cand,
         return;
       }
   }
-  
+
   // Emit the generic diagnostic and, optionally, add the hints to it.
   PartialDiagnostic FDiag = S.PDiag(diag::note_ovl_candidate_bad_conv);
   FDiag << (unsigned) FnKind << FnDesc
@@ -9484,13 +9510,19 @@ static void NoteFunctionCandidate(Sema &S, OverloadCandidate *Cand,
     return S.NoteOverloadCandidate(Fn);
 
   case ovl_fail_bad_conversion: {
-    unsigned I = (Cand->IgnoreObjectArgument ? 1 : 0);
-    for (unsigned N = Cand->NumConversions; I != N; ++I)
-      if (Cand->Conversions[I].isInitialized() && Cand->Conversions[I].isBad()) // HLSL Change: check in and out, check out conversions
-        return DiagnoseBadConversion(S, Cand, I, Cand->Conversions[I], OpLoc); // HLSL Change: add OpLoc
-    if (Cand->OutConversions[I].isInitialized() && Cand->OutConversions[I].isBad()) // HLSL Change: check in and out, check out conversions
-      return DiagnoseBadConversion(S, Cand, I, Cand->OutConversions[I], OpLoc); // HLSL Change: add OpLoc
-
+    for (unsigned I = (Cand->IgnoreObjectArgument ? 1 : 0),
+                  N = Cand->NumConversions;
+         I != N; ++I) {
+      // HLSL Change: check in and out, check out conversions
+      if (Cand->Conversions[I].isInitialized() && Cand->Conversions[I].isBad())
+        return DiagnoseBadConversion(S, Cand, I, Cand->Conversions[I],
+                                     OpLoc); // HLSL Change: add OpLoc
+      // HLSL Change: check in and out, check out conversions
+      if (Cand->OutConversions[I].isInitialized() &&
+          Cand->OutConversions[I].isBad())
+        return DiagnoseBadConversion(S, Cand, I, Cand->OutConversions[I],
+                                     OpLoc); // HLSL Change: add OpLoc
+    }
     // FIXME: this currently happens when we're called from SemaInit
     // when user-conversion overload fails.  Figure out how to handle
     // those conditions and diagnose them well.
@@ -10615,6 +10647,7 @@ static void AddOverloadedCallCandidate(Sema &S,
 void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
                                        ArrayRef<Expr *> Args,
                                        OverloadCandidateSet &CandidateSet,
+                                       Scope *S, // HLSL Change
                                        bool PartialOverloading) {
 
 #ifndef NDEBUG
@@ -10647,8 +10680,8 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
 #endif
 
   // HLSL Change - allow ExternalSource the ability to add the overloads for a call.
-  if (ExternalSource &&
-    ExternalSource->AddOverloadedCallCandidates(ULE, Args, CandidateSet, PartialOverloading)) {
+  if (ExternalSource && ExternalSource->AddOverloadedCallCandidates(
+                            ULE, Args, CandidateSet, S, PartialOverloading)) {
     return;
   }
 
@@ -10924,13 +10957,23 @@ bool Sema::buildOverloadedCallSet(Scope *S, Expr *Fn,
         ULE->getQualifier()->getKind() == NestedNameSpecifier::Namespace &&
         ULE->getQualifier()->getAsNamespace()->getName() == "vk";
 
-    assert((!ULE->getQualifier() || isVkNamespace) && "non-vk qualified name with ADL");
+    bool isDxNamespace =
+        ULE->getQualifier() &&
+        ULE->getQualifier()->getKind() == NestedNameSpecifier::Namespace &&
+        ULE->getQualifier()->getAsNamespace()->getName() == "dx";
+
+    assert((!ULE->getQualifier() || isVkNamespace || isDxNamespace) &&
+           "expected vk or dx qualified name with ADL");
     // HLSL Change Ends
 
     // We don't perform ADL for implicit declarations of builtins.
     // Verify that this was correctly set up.
     FunctionDecl *F;
-    if (ULE->decls_begin() + 1 == ULE->decls_end() &&
+    if (
+        // HLSL change begin
+        (ULE->getNumDecls() > 0) &&
+        // HLSL change end
+        ULE->decls_begin() + 1 == ULE->decls_end() &&
         (F = dyn_cast<FunctionDecl>(*ULE->decls_begin())) &&
         F->getBuiltinID() && F->isImplicit())
       llvm_unreachable("performing ADL for builtin");
@@ -10948,7 +10991,7 @@ bool Sema::buildOverloadedCallSet(Scope *S, Expr *Fn,
 
   // Add the functions denoted by the callee to the set of candidate
   // functions, including those from argument-dependent lookup.
-  AddOverloadedCallCandidates(ULE, Args, *CandidateSet);
+  AddOverloadedCallCandidates(ULE, Args, *CandidateSet, S); // HLSL Change
 
   if (getLangOpts().MSVCCompat &&
       CurContext->isDependentContext() && !isSFINAEContext() &&
@@ -11019,7 +11062,7 @@ static ExprResult FinishOverloadedCallExpr(Sema &SemaRef, Scope *S, Expr *Fn,
     SemaRef.Diag(Fn->getLocStart(),
          diag::err_ovl_no_viable_function_in_call)
       << ULE->getName() << Fn->getSourceRange();
-    CandidateSet->NoteCandidates(SemaRef, OCD_AllCandidates, Args);
+    CandidateSet->NoteCandidates(SemaRef, OCD_AllCandidates, Args, StringRef(), ULE->getLocStart()); // HLSL Change - add loc
     break;
   }
 
@@ -11493,6 +11536,11 @@ Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
       if (Opc == BO_Comma)
         break;
 
+      // HLSL Change Starts
+      if (getLangOpts().HLSL)
+        return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
+      // HLSL Change Ends
+
       // For class as left operand for assignment or compound assigment
       // operator do not fall through to handling in built-in, but report that
       // no overloaded assignment operator found
@@ -11528,6 +11576,11 @@ Sema::CreateOverloadedBinOp(SourceLocation OpLoc,
     }
 
     case OR_Ambiguous:
+      // HLSL Change Starts
+      if (getLangOpts().HLSL)
+        return CreateBuiltinBinOp(OpLoc, Opc, Args[0], Args[1]);
+      // HLSL Change Ends
+
       Diag(OpLoc,  diag::err_ovl_ambiguous_oper_binary)
           << BinaryOperator::getOpcodeStr(Opc)
           << Args[0]->getType() << Args[1]->getType()
@@ -11825,9 +11878,12 @@ Sema::BuildCallToMemberFunction(Scope *S, Expr *MemExprE,
     Qualifier = UnresExpr->getQualifier();
 
     QualType ObjectType = UnresExpr->getBaseType();
-    Expr::Classification ObjectClassification
-      = UnresExpr->isArrow()? Expr::Classification::makeSimpleLValue()
-                            : UnresExpr->getBase()->Classify(Context);
+    // HLSL Change Begin - This is a reference
+    Expr::Classification ObjectClassification =
+        (getLangOpts().HLSL || UnresExpr->isArrow())
+            ? Expr::Classification::makeSimpleLValue()
+            : UnresExpr->getBase()->Classify(Context);
+    // HLSL Change End - This is a reference
 
     // Add overload candidates
     OverloadCandidateSet CandidateSet(UnresExpr->getMemberLoc(),
@@ -12681,9 +12737,14 @@ Expr *Sema::FixOverloadedFunctionReference(Expr *E, DeclAccessPair Found,
         if (MemExpr->getQualifier())
           Loc = MemExpr->getQualifierLoc().getBeginLoc();
         CheckCXXThisCapture(Loc);
-        Base = new (Context) CXXThisExpr(Loc,
-                                         MemExpr->getBaseType(),
-                                         /*isImplicit=*/true);
+        // HLSL Change Begin - This is a reference
+        if (getLangOpts().HLSL)
+          Base = genereateHLSLThis(Loc, MemExpr->getBaseType(),
+                                   /*isImplicit=*/true);
+        else
+          Base = new (Context) CXXThisExpr(Loc, MemExpr->getBaseType(),
+                                           /*isImplicit=*/true);
+        // HLSL Change End - This is a reference
       }
     } else
       Base = MemExpr->getBase();

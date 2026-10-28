@@ -150,6 +150,7 @@ if( HAVE_SYS_UIO_H )
 endif()
 check_symbol_exists(mallctl malloc_np.h HAVE_MALLCTL)
 check_symbol_exists(mallinfo malloc.h HAVE_MALLINFO)
+check_symbol_exists(mallinfo2 malloc.h HAVE_MALLINFO2)
 check_symbol_exists(malloc_zone_statistics malloc/malloc.h
                     HAVE_MALLOC_ZONE_STATISTICS)
 check_symbol_exists(mkdtemp "stdlib.h;unistd.h" HAVE_MKDTEMP)
@@ -318,8 +319,10 @@ endif()
 
 # By default, we target the host, but this can be overridden at CMake
 # invocation time.
-include(GetHostTriple)
-get_host_triple(LLVM_INFERRED_HOST_TRIPLE)
+if (NOT DEFINED LLVM_INFERRED_HOST_TRIPLE)
+  include(GetHostTriple)
+  get_host_triple(LLVM_INFERRED_HOST_TRIPLE)
+endif()
 
 set(LLVM_HOST_TRIPLE "${LLVM_INFERRED_HOST_TRIPLE}" CACHE STRING
     "Host on which LLVM binaries will run")
@@ -362,6 +365,12 @@ elseif (LLVM_NATIVE_ARCH MATCHES "wasm32")
   set(LLVM_NATIVE_ARCH WebAssembly)
 elseif (LLVM_NATIVE_ARCH MATCHES "wasm64")
   set(LLVM_NATIVE_ARCH WebAssembly)
+elseif (LLVM_NATIVE_ARCH MATCHES "riscv64")
+  set(LLVM_NATIVE_ARCH RISCV)
+elseif (LLVM_NATIVE_ARCH MATCHES "loongarch64")
+  set(LLVM_NATIVE_ARCH LoongArch)
+elseif (LLVM_NATIVE_ARCH MATCHES "e2k")
+  set(LLVM_NATIVE_ARCH E2K)
 else ()
   message(FATAL_ERROR "Unknown architecture ${LLVM_NATIVE_ARCH}")
 endif ()
@@ -561,3 +570,12 @@ else()
 endif()
 
 string(REPLACE " " ";" LLVM_BINDINGS_LIST "${LLVM_BINDINGS}")
+
+# HLSL Change Begin - Metal IR Converter
+find_package(MetalIRConverter)
+if (MetalIRConverter_FOUND)
+  set(ENABLE_METAL_CODEGEN On)
+  message(STATUS "Enabling Metal Support")
+  add_definitions(-DENABLE_METAL_CODEGEN)
+endif()
+# HLSL Change End - Metal IR Converter

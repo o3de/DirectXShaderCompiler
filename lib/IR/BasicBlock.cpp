@@ -37,10 +37,17 @@ LLVMContext &BasicBlock::getContext() const {
 // are not in the public header file...
 template class llvm::SymbolTableListTraits<Instruction, BasicBlock>;
 
-
 BasicBlock::BasicBlock(LLVMContext &C, const Twine &Name, Function *NewParent,
                        BasicBlock *InsertBefore)
-  : Value(Type::getLabelTy(C), Value::BasicBlockVal), Parent(nullptr) {
+    : Value(Type::getLabelTy(C), Value::BasicBlockVal),
+      // HLSL Change Starts
+      // Use a real instruction as the sentinel. Transfer ownership to InstList.
+      // The sentinel only needs to participate in the intrusive list of
+      // instructions. Any instruction kind will do, but UnreachableInst is
+      // small and simple.
+      InstList(std::unique_ptr<Instruction>(new UnreachableInst(C))),
+      // HLSL Change Ends
+      Parent(nullptr) {
 
   // HLSL Change Begin
   // Do everything that can throw before inserting into the
@@ -284,7 +291,7 @@ BasicBlock *BasicBlock::getUniqueSuccessor() {
 void BasicBlock::removePredecessor(BasicBlock *Pred,
                                    bool DontDeleteUselessPHIs) {
   assert((hasNUsesOrMore(16)||// Reduce cost of this assertion for complex CFGs.
-          find(pred_begin(this), pred_end(this), Pred) != pred_end(this)) &&
+          std::find(pred_begin(this), pred_end(this), Pred) != pred_end(this)) &&
          "removePredecessor: BB is not a predecessor!");
 
   if (InstList.empty()) return;

@@ -7,15 +7,15 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "dxc/HlslIntrinsicOp.h"
 #include "dxc/DXIL/DxilModule.h"
 #include "dxc/HLSL/DxilGenerationPass.h"
 #include "dxc/HLSL/HLOperations.h"
-#include "llvm/Pass.h"
+#include "dxc/HlslIntrinsicOp.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include <unordered_set>
 #include <vector>
@@ -35,14 +35,14 @@ public:
   static char ID; // Pass identification, replacement for typeid
   explicit DxilLegalizeEvalOperations() : ModulePass(ID) {}
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "DXIL Legalize EvalOperations";
   }
 
   bool runOnModule(Module &M) override {
     for (Function &F : M.getFunctionList()) {
       hlsl::HLOpcodeGroup group = hlsl::GetHLOpcodeGroup(&F);
-      if (group != HLOpcodeGroup::NotHL) {
+      if (group == HLOpcodeGroup::HLIntrinsic) {
         std::vector<CallInst *> EvalFunctionCalls;
         // Find all EvaluateAttribute calls
         for (User *U : F.users()) {

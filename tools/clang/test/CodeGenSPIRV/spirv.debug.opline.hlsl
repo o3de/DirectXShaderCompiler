@@ -1,6 +1,6 @@
-// Run: %dxc -T ps_6_0 -E main -Zi
+// RUN: %dxc -T ps_6_0 -E main -Zi -fcgl  %s -spirv | FileCheck %s
 
-// CHECK:      [[file:%\d+]] = OpString
+// CHECK:      [[file:%[0-9]+]] = OpString
 // CHECK-SAME: spirv.debug.opline.hlsl
 
 Texture2D    MyTexture;
@@ -59,7 +59,7 @@ float4 main(uint val : A) : SV_Target {
 // CHECK:      OpLine [[file]] 63 7
 // CHECK-NEXT: OpAccessChain %_ptr_Function_float %c %int_0
 // CHECK:      OpLine [[file]] 63 3
-// CHECK-NEXT: pStore %a
+// CHECK-NEXT: OpStore %a
   a = c.x;
 
   return b * c;

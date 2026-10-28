@@ -1,31 +1,38 @@
 # DirectX Shader Compiler
 
-[![Build status](https://ci.appveyor.com/api/projects/status/6sx47j66g4dbyem9/branch/master?svg=true)](https://ci.appveyor.com/project/dnovillo/directxshadercompiler/branch/master)
+The DirectX Shader Compiler project includes a compiler and related tools used to compile High-Level Shader Language (HLSL) programs into DirectX Intermediate Language (DXIL) for DirectX and the Standard Portable Intermediate Representation (SPIR-V) for Vulkan.
 
-The DirectX Shader Compiler project includes a compiler and related tools used to compile High-Level Shader Language (HLSL) programs into DirectX Intermediate Language (DXIL) representation. Applications that make use of DirectX for graphics, games, and computation can use it to generate shader programs.
+Applications that make use of DirectX or Vulkan for graphics, games, and computation can use it to generate shader program binaries.
 
 For more information, see the [Wiki](https://github.com/microsoft/DirectXShaderCompiler/wiki).
 
-## Downloads
-You can download the latest successful build's artifacts (built by Appveyor) for the master branch:
-| Downloads |        |
-|-----------|--------|
-| Windows   | [⬇](https://ci.appveyor.com/api/projects/dnovillo/directxshadercompiler/artifacts/build%2FRelease%2Fdxc-artifacts.zip?branch=master&pr=false&job=image%3A%20Visual%20Studio%202019) |
-| Ubuntu    | [⬇](https://ci.appveyor.com/api/projects/dnovillo/directxshadercompiler/artifacts/build%2Fdxc-artifacts.tar.gz?branch=master&pr=false&job=image%3A%20Ubuntu) |
+Visit the [DirectX Landing Page](https://devblogs.microsoft.com/directx/landing-page/) for more resources for DirectX developers, or the [Vulkan homepage](https://www.vulkan.org) for resources for Vulkan developers.
+
+## Pre-built binaries
+
+Officially supported binary release for the DirectX Shader Compiler are available:
+- On this repository's [Releases](https://github.com/microsoft/DirectXShaderCompiler/releases) page
+- as a [NuGet package](https://www.nuget.org/packages/Microsoft.Direct3D.DXC)
+- in the [Windows SDK](https://learn.microsoft.com/en-us/windows/apps/windows-sdk/downloads)(DXIL-only), and
+- in the [Vulkan SDK](https://www.lunarg.com/products/vulkan-sdk/)
 
 ## Features and Goals
 
-The starting point of the project is a fork of the [LLVM](http://llvm.org/) and [Clang](http://clang.llvm.org/) projects, modified to accept HLSL and emit a validated container that can be consumed by GPU drivers.
+The starting point of the project is a fork of the [LLVM](http://llvm.org/) and [Clang](http://clang.llvm.org/) projects, modified to accept HLSL and emit a validated shader binary that can be consumed by GPU drivers.
 
-At the moment, the DirectX HLSL Compiler provides the following components:
+At the moment, the DirectX Shader Compiler releases provide the following components:
 
 - dxc.exe, a command-line tool that can compile HLSL programs for shader model 6.0 or higher
 
-- dxcompiler.dll, a DLL providing a componentized compiler, assembler, disassembler, and validator
+- dxcompiler.\[dll|so\], a DLL providing a componentized compiler, assembler, disassembler, and validator
 
-- dxilconv.dll, a DLL providing a converter from DXBC (older shader bytecode format)
+- dxil.\[dll|so\], a DLL providing the DXIL validation and hashing support
 
-- various other tools based on the above components
+- dxv.exe, a command-line tool that validates DXIL IR (compiled HLSL programs)
+
+- A collection of C++ headers for working with the contained dynamic libraries
+
+- A collection of HLSL headers exposing useful high level abstractions
 
 The Microsoft Windows SDK releases include a supported version of the compiler and validator.
 
@@ -33,47 +40,25 @@ The goal of the project is to allow the broader community of shader developers t
 
 ### Pre-built Releases
 
-Binary packages containing the output of this project are available from appveyor. Development kits containing only the dxc.exe driver app, the dxcompiler.dll, and the dxil.dll signing binary are available [here](https://github.com/microsoft/DirectXShaderCompiler/wiki/Releases), or in the [releases tab](https://github.com/microsoft/DirectXShaderCompiler/releases).
+Development kits containing only the dxc.exe driver app, the dxcompiler.dll, and the dxil.dll signing binary are available [here](https://github.com/microsoft/DirectXShaderCompiler/wiki/Releases), or in the [releases tab](https://github.com/microsoft/DirectXShaderCompiler/releases).
 
 ### SPIR-V CodeGen
 
 As an example of community contribution, this project can also target the [SPIR-V](https://www.khronos.org/registry/spir-v/) intermediate representation. Please see the [doc](docs/SPIR-V.rst) for how HLSL features are mapped to SPIR-V, and the [wiki](https://github.com/microsoft/DirectXShaderCompiler/wiki/SPIR%E2%80%90V-CodeGen) page for how to build, use, and contribute to the SPIR-V CodeGen.
 
+### Metal CodeGen
+
+When built from source DXC can utilize the [Metal Shader
+Converter](https://developer.apple.com/metal/shader-converter/) if it is
+available during build and configuration time. This allows DXC to generate Metal
+shader libraries directly using the `-metal` flag.
+
+Note: DXC cannot currently disassemble Metal shaders so the `-Fc` flag cannot be
+used in conjunction with the `-Fo` flag.
+
 ## Building Sources
-Note: If you intend to build from sources on Linux/macOS, follow [these instructions](docs/DxcOnUnix.rst).
 
-Before you build, you will need to have some additional software installed. This is the most straightforward path - see [Building Sources](https://github.com/microsoft/DirectXShaderCompiler/wiki/Building-Sources) on the Wiki for more options, including Visual Studio 2015 and Ninja support.
-
-* [Git](http://git-scm.com/downloads).
-* [Python](https://www.python.org/downloads/) - version 3.x is required
-* [Visual Studio 2017](https://www.visualstudio.com/downloads) - select the following workloads: 
-    * Universal Windows Platform Development
-    * Desktop Development with C++
-* [Windows SDK](https://developer.microsoft.com/en-US/windows/downloads/windows-10-sdk) - version 10.0.18362.0 or newer
-* [Windows Driver Kit](https://docs.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk) - same version as the SDK
-
-After cloning the project, you can set up a build environment shortcut by double-clicking the `utils\hct\hctshortcut.js` file. This will create a shortcut on your desktop with a default configuration. If your system doesn't have the requisite association for .js files, this may not work. If so, open a cmd window and invoke: `wscript.exe utils\hct\hctshortcut.js`.
-
-Tests are built using the TAEF framework which is included in the Windows Driver Kit.
-
-To build, run this command on the HLSL Console.
-
-    hctbuild
-
-You can also clean, build and run tests with this command.
-
-    hctcheckin
-
-
-To see a list of additional commands available, run `hcthelp`
-
-## Running Tests
-
-To run tests, open the HLSL Console and run this command after a successful build.
-
-    hcttest
-
-Some tests will run shaders and verify their behavior. These tests also involve a driver that can run these execute these shaders. See the next section on how this should be currently set up.
+See the full documentation for [Building and testing DXC](docs/BuildingAndTestingDXC.rst) for detailed instructions.
 
 ## Running Shaders
 
@@ -100,7 +85,7 @@ release mode for DXIL 1.1 and Shader Model 6.1 (View Instancing support only).
 
 Drivers can be downloaded from the following link [Intel Graphics Drivers](https://downloadcenter.intel.com/product/80939/Graphics-Drivers)
 
-Direct access to 15.60 driver (latest as of of this update) is provided below:
+Direct access to 15.60 driver (latest as of this update) is provided below:
 
 [Installer](https://downloadmirror.intel.com/27412/a08/win64_15.60.2.4901.exe)
 

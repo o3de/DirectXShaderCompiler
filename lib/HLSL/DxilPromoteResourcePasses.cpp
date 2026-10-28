@@ -7,17 +7,19 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
+#include "dxc/DXIL/DxilCBuffer.h"
+#include "dxc/DXIL/DxilModule.h"
+#include "dxc/DXIL/DxilOperations.h"
+#include "dxc/DXIL/DxilResource.h"
+#include "dxc/DXIL/DxilResourceBase.h"
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxc/HLSL/DxilGenerationPass.h"
 #include "dxc/HLSL/HLModule.h"
-#include "dxc/DXIL/DxilResourceBase.h"
-#include "dxc/DXIL/DxilResource.h"
-#include "dxc/DXIL/DxilCBuffer.h"
-#include "dxc/DXIL/DxilOperations.h"
-#include "dxc/DXIL/DxilModule.h"
-#include "llvm/Pass.h"
-#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instruction.h"
@@ -25,9 +27,8 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/Attributes.h"
-#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Pass.h"
 
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
@@ -43,15 +44,15 @@ using namespace hlsl;
 
 namespace {
 
-static const StringRef kStaticResourceLibErrorMsg = "static global resource use is disallowed in library exports.";
+static const StringRef kStaticResourceLibErrorMsg =
+    "non const static global resource use is disallowed in library exports.";
 
 class DxilPromoteStaticResources : public ModulePass {
 public:
   static char ID; // Pass identification, replacement for typeid
-  explicit DxilPromoteStaticResources()
-      : ModulePass(ID) {}
+  explicit DxilPromoteStaticResources() : ModulePass(ID) {}
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "DXIL Legalize Static Resource Use";
   }
 
@@ -71,10 +72,9 @@ class DxilPromoteLocalResources : public FunctionPass {
 
 public:
   static char ID; // Pass identification, replacement for typeid
-  explicit DxilPromoteLocalResources()
-      : FunctionPass(ID) {}
+  explicit DxilPromoteLocalResources() : FunctionPass(ID) {}
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "DXIL Legalize Resource Use";
   }
 
@@ -89,7 +89,7 @@ private:
 
 char DxilPromoteLocalResources::ID = 0;
 
-}
+} // namespace
 
 void DxilPromoteLocalResources::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<AssumptionCacheTracker>();
@@ -113,7 +113,8 @@ bool DxilPromoteLocalResources::PromoteLocalResource(Function &F) {
     // the entry node
     for (BasicBlock::iterator I = BB.begin(), E = --BB.end(); I != E; ++I)
       if (AllocaInst *AI = dyn_cast<AllocaInst>(I)) { // Is it an alloca?
-        if (dxilutil::IsHLSLObjectType(dxilutil::GetArrayEltTy(AI->getAllocatedType()))) {
+        if (dxilutil::IsHLSLObjectType(
+                dxilutil::GetArrayEltTy(AI->getAllocatedType()))) {
           if (isAllocaPromotable(AI))
             Allocas.push_back(AI);
         }
@@ -124,7 +125,11 @@ bool DxilPromoteLocalResources::PromoteLocalResource(Function &F) {
     // No update.
     // Report error and break.
     if (allocaSize == Allocas.size()) {
-      F.getContext().emitError(dxilutil::kResourceMapErrorMsg);
+      //  TODO: Add test for this instance of the error: "local resource not
+      //  guaranteed to map to unique global resource." No test currently
+      //  exists.
+      dxilutil::EmitErrorOnContext(F.getContext(),
+                                   dxilutil::kResourceMapErrorMsg);
       break;
     }
     allocaSize = Allocas.size();
@@ -149,8 +154,7 @@ INITIALIZE_PASS_END(DxilPromoteLocalResources,
                     "hlsl-dxil-promote-local-resources",
                     "DXIL promote local resource use", false, true)
 
-bool DxilPromoteStaticResources::PromoteStaticGlobalResources(
-    Module &M) {
+bool DxilPromoteStaticResources::PromoteStaticGlobalResources(Module &M) {
   if (M.GetOrCreateHLModule().GetShaderModel()->IsLib()) {
     // Read/write to global static resource is disallowed for libraries:
     // Resource use needs to be resolved to a single real global resource,
@@ -166,7 +170,8 @@ bool DxilPromoteStaticResources::PromoteStaticGlobalResources(
     //  optimized away for the exported function.
     for (auto &GV : M.globals()) {
       if (GV.getLinkage() == GlobalVariable::LinkageTypes::InternalLinkage &&
-        dxilutil::IsHLSLObjectType(dxilutil::GetArrayEltTy(GV.getType()))) {
+          !GV.isConstant() &&
+          dxilutil::IsHLSLObjectType(dxilutil::GetArrayEltTy(GV.getType()))) {
         if (!GV.user_empty()) {
           if (Instruction *I = dyn_cast<Instruction>(*GV.user_begin())) {
             dxilutil::EmitErrorOnInstruction(I, kStaticResourceLibErrorMsg);
@@ -218,7 +223,11 @@ bool DxilPromoteStaticResources::PromoteStaticGlobalResources(
       Insts.clear();
     }
     if (!bUpdated) {
-      M.getContext().emitError(dxilutil::kResourceMapErrorMsg);
+      //  TODO: Add test for this instance of the error: "local resource not
+      //  guaranteed to map to unique global resource." No test currently
+      //  exists.
+      dxilutil::EmitErrorOnContext(M.getContext(),
+                                   dxilutil::kResourceMapErrorMsg);
       break;
     }
     bModified = true;
@@ -253,7 +262,7 @@ public:
   static char ID; // Pass identification, replacement for typeid
   explicit DxilMutateResourceToHandle() : ModulePass(ID) {}
 
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "DXIL Mutate resource to handle";
   }
 
@@ -263,26 +272,33 @@ public:
       if (!HLM.GetShaderModel()->IsSM66Plus())
         return false;
 
-      hdlTy = HLM.GetOP()->GetHandleType();
+      hlslOP = HLM.GetOP();
       pTypeSys = &HLM.GetTypeSystem();
     } else if (M.HasDxilModule()) {
       auto &DM = M.GetDxilModule();
       if (!DM.GetShaderModel()->IsSM66Plus())
         return false;
 
-      hdlTy = DM.GetOP()->GetHandleType();
+      hlslOP = DM.GetOP();
       pTypeSys = &DM.GetTypeSystem();
     } else {
       return false;
     }
+
+    hdlTy = hlslOP->GetHandleType();
+    if (hlslOP->IsDxilOpUsed(DXIL::OpCode::CreateHandleForLib)) {
+      createHandleForLibOnHandle =
+          hlslOP->GetOpFunc(DXIL::OpCode::CreateHandleForLib, hdlTy);
+    }
+
     collectCandidates(M);
     mutateCandidates(M);
-    // Remvoe cast to handle.
+    // Remove cast to handle.
     return !MutateValSet.empty();
   }
 
 private:
-  Type *mutateToHandleTy(Type *Ty);
+  Type *mutateToHandleTy(Type *Ty, bool bResType = false);
   bool mutateTypesToHandleTy(SmallVector<Type *, 4> &Tys);
 
   void collectGlobalResource(DxilResourceBase *Res,
@@ -294,15 +310,17 @@ private:
   void collectCandidates(Module &M);
   void mutateCandidates(Module &M);
 
-  Type *hdlTy;
+  Type *hdlTy = nullptr;
+  hlsl::OP *hlslOP = nullptr;
+  Function *createHandleForLibOnHandle = nullptr;
   DxilTypeSystem *pTypeSys;
-  DenseSet<Value *> MutateValSet;
+  SetVector<Value *> MutateValSet;
   DenseMap<Type *, Type *> MutateTypeMap;
 };
 
 char DxilMutateResourceToHandle::ID = 0;
 
-Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty) {
+Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty, bool bResType) {
   auto it = MutateTypeMap.find(Ty);
   if (it != MutateTypeMap.end())
     return it->second;
@@ -315,7 +333,7 @@ Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty) {
       nestedSize.emplace_back(NestAT->getNumElements());
       EltTy = NestAT->getElementType();
     }
-    Type *mutatedTy = mutateToHandleTy(EltTy);
+    Type *mutatedTy = mutateToHandleTy(EltTy, bResType);
     if (mutatedTy == EltTy) {
       ResultTy = Ty;
     } else {
@@ -326,7 +344,7 @@ Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty) {
     }
   } else if (PointerType *PT = dyn_cast<PointerType>(Ty)) {
     Type *EltTy = PT->getElementType();
-    Type *mutatedTy = mutateToHandleTy(EltTy);
+    Type *mutatedTy = mutateToHandleTy(EltTy, bResType);
     if (mutatedTy == EltTy)
       ResultTy = Ty;
     else
@@ -334,7 +352,11 @@ Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty) {
   } else if (dxilutil::IsHLSLResourceType(Ty)) {
     ResultTy = hdlTy;
   } else if (StructType *ST = dyn_cast<StructType>(Ty)) {
-    if (!ST->isOpaque()) {
+    if (bResType) {
+      // For top-level resource GV type, the first struct type is the resource
+      // type to be changed into handle.
+      ResultTy = hdlTy;
+    } else if (!ST->isOpaque()) {
       SmallVector<Type *, 4> Elts(ST->element_begin(), ST->element_end());
       if (!mutateTypesToHandleTy(Elts)) {
         ResultTy = Ty;
@@ -342,6 +364,13 @@ Type *DxilMutateResourceToHandle::mutateToHandleTy(Type *Ty) {
         ResultTy = StructType::create(Elts, ST->getName().str() + ".hdl");
       }
     } else {
+
+      // FIXME: Opaque type "ConstantBuffer" is only used for an empty cbuffer.
+      // We should never use an empty cbuffer, and we should try to get rid of
+      // the need for this type in the first place, like using nullptr for the
+      // DxilResourceBase::m_pSymbol, since this resource should get deleted
+      // before final dxil in all cases.
+
       if (ST->getName() == "ConstantBuffer")
         ResultTy = hdlTy;
       else
@@ -380,10 +409,18 @@ bool DxilMutateResourceToHandle::mutateTypesToHandleTy(
 void DxilMutateResourceToHandle::collectGlobalResource(
     DxilResourceBase *Res, SmallVector<Value *, 8> &WorkList) {
   Value *GV = Res->GetGlobalSymbol();
-  // Save hlsl type before mutate to handle.
-  Res->SetHLSLType(GV->getType());
-  mutateToHandleTy(GV->getType());
-  WorkList.emplace_back(GV);
+  // If already handle, don't overwrite HLSL type.
+  // It's still posible that load users have a wrong type (invalid IR) due to
+  // linking mixed targets.  But in that case, we need to start at the
+  // non-handle overloads of CreateHandleForLib and mutate/rewrite from there.
+  // That's because we may have an already translated GV, but some load and
+  // CreateHandleForLib calls use the wrong type from linked code.
+  Type *MTy = mutateToHandleTy(GV->getType(), /*bResType*/ true);
+  if (GV->getType() != MTy) {
+    // Save hlsl type before mutate to handle.
+    Res->SetHLSLType(GV->getType());
+    WorkList.emplace_back(GV);
+  }
 }
 void DxilMutateResourceToHandle::collectAlloca(
     Function &F, SmallVector<Value *, 8> &WorkList) {
@@ -401,42 +438,12 @@ void DxilMutateResourceToHandle::collectAlloca(
   }
 }
 
-}
+} // namespace
 
 SmallVector<Value *, 8>
 DxilMutateResourceToHandle::collectHlslObjects(Module &M) {
   // Add all global/function/argument/alloca has resource type.
   SmallVector<Value *, 8> WorkList;
-
-  // Assume this is after SROA so no struct for global/alloca.
-
-  // Functions.
-  for (Function &F : M) {
-    collectAlloca(F, WorkList);
-    FunctionType *FT = F.getFunctionType();
-    FunctionType *MFT = cast<FunctionType>(mutateToHandleTy(FT));
-    if (FT == MFT)
-      continue;
-    WorkList.emplace_back(&F);
-    // Check args.
-    for (Argument &Arg : F.args()) {
-      Type *Ty = Arg.getType();
-      Type *MTy = mutateToHandleTy(Ty);
-      if (Ty == MTy)
-        continue;
-      WorkList.emplace_back(&Arg);
-    }
-  }
-
-  // Static globals.
-  for (GlobalVariable &GV : M.globals()) {
-    if (!dxilutil::IsStaticGlobal(&GV))
-      continue;
-    Type *Ty = dxilutil::GetArrayEltTy(GV.getValueType());
-    if (!dxilutil::IsHLSLObjectType(Ty))
-      continue;
-    WorkList.emplace_back(&GV);
-  }
 
   // Global resources.
   if (M.HasHLModule()) {
@@ -468,6 +475,49 @@ DxilMutateResourceToHandle::collectHlslObjects(Module &M) {
       collectGlobalResource(Res.get(), WorkList);
     }
   }
+
+  // Assume this is after SROA so no struct for global/alloca.
+
+  // Functions.
+  for (Function &F : M) {
+    if (hlslOP && hlslOP->IsDxilOpFunc(&F)) {
+      DXIL::OpCodeClass OpcodeClass;
+      if (hlslOP->GetOpCodeClass(&F, OpcodeClass)) {
+        if (OpcodeClass == DXIL::OpCodeClass::CreateHandleForLib &&
+            &F != createHandleForLibOnHandle) {
+          WorkList.emplace_back(&F);
+          MutateTypeMap[F.getFunctionType()->getFunctionParamType(1)] = hdlTy;
+          continue;
+        }
+      }
+    }
+
+    collectAlloca(F, WorkList);
+    FunctionType *FT = F.getFunctionType();
+    FunctionType *MFT = cast<FunctionType>(mutateToHandleTy(FT));
+    if (FT == MFT)
+      continue;
+    WorkList.emplace_back(&F);
+    // Check args.
+    for (Argument &Arg : F.args()) {
+      Type *Ty = Arg.getType();
+      Type *MTy = mutateToHandleTy(Ty);
+      if (Ty == MTy)
+        continue;
+      WorkList.emplace_back(&Arg);
+    }
+  }
+
+  // Static globals.
+  for (GlobalVariable &GV : M.globals()) {
+    if (!dxilutil::IsStaticGlobal(&GV))
+      continue;
+    Type *Ty = dxilutil::GetArrayEltTy(GV.getValueType());
+    if (!dxilutil::IsHLSLObjectType(Ty))
+      continue;
+    WorkList.emplace_back(&GV);
+  }
+
   return WorkList;
 }
 
@@ -496,8 +546,11 @@ void DxilMutateResourceToHandle::collectCandidates(Module &M) {
         // If result type of GEP not related to resource type, skip.
         Type *Ty = GEP->getType();
         Type *MTy = mutateToHandleTy(Ty);
-        if (MTy == Ty)
+        if (MTy == Ty) {
+          // Don't recurse, but still need to mutate GEP.
+          MutateValSet.insert(GEP);
           continue;
+        }
         newCandidates.emplace_back(GEP);
       } else if (PHINode *Phi = dyn_cast<PHINode>(U)) {
         // Propagate all operands.
@@ -561,7 +614,7 @@ void DxilMutateResourceToHandle::collectCandidates(Module &M) {
 
       for (Value *Val : newCandidates) {
         // New candidate find.
-        if (MutateValSet.insert(Val).second) {
+        if (MutateValSet.insert(Val)) {
           WorkList.emplace_back(Val);
         }
       }
@@ -619,17 +672,6 @@ void DxilMutateResourceToHandle::mutateCandidates(Module &M) {
     V->mutateType(MTy);
   }
 
-  Function *createHandleForLibOnHandle = nullptr;
-  hlsl::OP *hlslOP = nullptr;
-  if (M.HasDxilModule()) {
-    auto &DM = M.GetDxilModule();
-    hlslOP = DM.GetOP();
-    if (hlslOP->IsDxilOpUsed(DXIL::OpCode::CreateHandleForLib)) {
-      createHandleForLibOnHandle =
-          hlslOP->GetOpFunc(DXIL::OpCode::CreateHandleForLib, hdlTy);
-    }
-  }
-
   // Mutate functions.
   for (Function *F : CandidateFns) {
     Function *MF = nullptr;
@@ -642,6 +684,16 @@ void DxilMutateResourceToHandle::mutateCandidates(Module &M) {
           }
         }
       }
+    }
+
+    if (hlsl::GetHLOpcodeGroup(F) == HLOpcodeGroup::HLCast) {
+      // Eliminate pass-through cast
+      for (auto it = F->user_begin(); it != F->user_end();) {
+        CallInst *CI = cast<CallInst>(*(it++));
+        CI->replaceAllUsesWith(CI->getArgOperand(1));
+        CI->eraseFromParent();
+      }
+      continue;
     }
 
     if (!MF) {
@@ -699,6 +751,5 @@ ModulePass *llvm::createDxilMutateResourceToHandlePass() {
   return new DxilMutateResourceToHandle();
 }
 
-INITIALIZE_PASS(DxilMutateResourceToHandle,
-                "hlsl-dxil-resources-to-handle",
+INITIALIZE_PASS(DxilMutateResourceToHandle, "hlsl-dxil-resources-to-handle",
                 "Mutate resource to handle", false, false)

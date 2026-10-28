@@ -4,6 +4,7 @@
 //
 // This file is distributed under the University of Illinois Open Source
 // License. See LICENSE.TXT for details.
+//
 //===----------------------------------------------------------------------===//
 #ifndef LLVM_CLANG_SPIRV_SPIRVVISITOR_H
 #define LLVM_CLANG_SPIRV_SPIRVVISITOR_H
@@ -60,12 +61,13 @@ public:
   DEFINE_VISIT_METHOD(SpirvExtInstImport)
   DEFINE_VISIT_METHOD(SpirvMemoryModel)
   DEFINE_VISIT_METHOD(SpirvEntryPoint)
-  DEFINE_VISIT_METHOD(SpirvExecutionMode)
+  DEFINE_VISIT_METHOD(SpirvExecutionModeBase)
   DEFINE_VISIT_METHOD(SpirvString)
   DEFINE_VISIT_METHOD(SpirvSource)
   DEFINE_VISIT_METHOD(SpirvModuleProcessed)
   DEFINE_VISIT_METHOD(SpirvDecoration)
   DEFINE_VISIT_METHOD(SpirvVariable)
+  DEFINE_VISIT_METHOD(SpirvUntypedVariableKHR)
 
   DEFINE_VISIT_METHOD(SpirvFunctionParameter)
   DEFINE_VISIT_METHOD(SpirvLoopMerge)
@@ -79,8 +81,14 @@ public:
   DEFINE_VISIT_METHOD(SpirvUnreachable)
 
   DEFINE_VISIT_METHOD(SpirvAccessChain)
+  DEFINE_VISIT_METHOD(SpirvUntypedAccessChainKHR)
   DEFINE_VISIT_METHOD(SpirvAtomic)
   DEFINE_VISIT_METHOD(SpirvBarrier)
+  DEFINE_VISIT_METHOD(SpirvIsNodePayloadValid)
+  DEFINE_VISIT_METHOD(SpirvNodePayloadArrayLength)
+  DEFINE_VISIT_METHOD(SpirvAllocateNodePayloads)
+  DEFINE_VISIT_METHOD(SpirvEnqueueNodePayloads)
+  DEFINE_VISIT_METHOD(SpirvFinishWritingNodePayload)
   DEFINE_VISIT_METHOD(SpirvBinaryOp)
   DEFINE_VISIT_METHOD(SpirvBitFieldExtract)
   DEFINE_VISIT_METHOD(SpirvBitFieldInsert)
@@ -88,7 +96,11 @@ public:
   DEFINE_VISIT_METHOD(SpirvConstantInteger)
   DEFINE_VISIT_METHOD(SpirvConstantFloat)
   DEFINE_VISIT_METHOD(SpirvConstantComposite)
+  DEFINE_VISIT_METHOD(SpirvConstantString)
   DEFINE_VISIT_METHOD(SpirvConstantNull)
+  DEFINE_VISIT_METHOD(SpirvConvertPtrToU)
+  DEFINE_VISIT_METHOD(SpirvConvertUToPtr)
+  DEFINE_VISIT_METHOD(SpirvUndef)
   DEFINE_VISIT_METHOD(SpirvCompositeConstruct)
   DEFINE_VISIT_METHOD(SpirvCompositeExtract)
   DEFINE_VISIT_METHOD(SpirvCompositeInsert)
@@ -96,13 +108,12 @@ public:
   DEFINE_VISIT_METHOD(SpirvEndPrimitive)
   DEFINE_VISIT_METHOD(SpirvExtInst)
   DEFINE_VISIT_METHOD(SpirvFunctionCall)
-  DEFINE_VISIT_METHOD(SpirvNonUniformBinaryOp)
-  DEFINE_VISIT_METHOD(SpirvNonUniformElect)
-  DEFINE_VISIT_METHOD(SpirvNonUniformUnaryOp)
+  DEFINE_VISIT_METHOD(SpirvGroupNonUniformOp)
   DEFINE_VISIT_METHOD(SpirvImageOp)
   DEFINE_VISIT_METHOD(SpirvImageQuery)
   DEFINE_VISIT_METHOD(SpirvImageSparseTexelsResident)
   DEFINE_VISIT_METHOD(SpirvImageTexelPointer)
+  DEFINE_VISIT_METHOD(SpirvUntypedImageTexelPointerEXT)
   DEFINE_VISIT_METHOD(SpirvLoad)
   DEFINE_VISIT_METHOD(SpirvCopyObject)
   DEFINE_VISIT_METHOD(SpirvSampledImage)
@@ -110,16 +121,20 @@ public:
   DEFINE_VISIT_METHOD(SpirvSpecConstantBinaryOp)
   DEFINE_VISIT_METHOD(SpirvSpecConstantUnaryOp)
   DEFINE_VISIT_METHOD(SpirvStore)
+  DEFINE_VISIT_METHOD(SpirvNullaryOp)
   DEFINE_VISIT_METHOD(SpirvUnaryOp)
   DEFINE_VISIT_METHOD(SpirvVectorShuffle)
   DEFINE_VISIT_METHOD(SpirvArrayLength)
   DEFINE_VISIT_METHOD(SpirvRayTracingOpNV)
-  DEFINE_VISIT_METHOD(SpirvDemoteToHelperInvocationEXT)
+  DEFINE_VISIT_METHOD(SpirvDemoteToHelperInvocation)
+  DEFINE_VISIT_METHOD(SpirvIsHelperInvocationEXT)
   DEFINE_VISIT_METHOD(SpirvDebugInfoNone)
   DEFINE_VISIT_METHOD(SpirvDebugSource)
   DEFINE_VISIT_METHOD(SpirvDebugCompilationUnit)
   DEFINE_VISIT_METHOD(SpirvDebugFunctionDeclaration)
   DEFINE_VISIT_METHOD(SpirvDebugFunction)
+  DEFINE_VISIT_METHOD(SpirvDebugFunctionDefinition)
+  DEFINE_VISIT_METHOD(SpirvDebugEntryPoint)
   DEFINE_VISIT_METHOD(SpirvDebugLocalVariable)
   DEFINE_VISIT_METHOD(SpirvDebugGlobalVariable)
   DEFINE_VISIT_METHOD(SpirvDebugOperation)
@@ -130,6 +145,7 @@ public:
   DEFINE_VISIT_METHOD(SpirvDebugTypeBasic)
   DEFINE_VISIT_METHOD(SpirvDebugTypeArray)
   DEFINE_VISIT_METHOD(SpirvDebugTypeVector)
+  DEFINE_VISIT_METHOD(SpirvDebugTypeMatrix)
   DEFINE_VISIT_METHOD(SpirvDebugTypeFunction)
   DEFINE_VISIT_METHOD(SpirvDebugTypeComposite)
   DEFINE_VISIT_METHOD(SpirvDebugTypeMember)
@@ -139,13 +155,17 @@ public:
   DEFINE_VISIT_METHOD(SpirvRayQueryOpKHR)
   DEFINE_VISIT_METHOD(SpirvReadClock)
   DEFINE_VISIT_METHOD(SpirvRayTracingTerminateOpKHR)
+  DEFINE_VISIT_METHOD(SpirvIntrinsicInstruction)
+
+  DEFINE_VISIT_METHOD(SpirvEmitMeshTasksEXT)
+  DEFINE_VISIT_METHOD(SpirvSetMeshOutputsEXT)
 #undef DEFINE_VISIT_METHOD
+
+  const SpirvCodeGenOptions &getCodeGenOptions() const { return spvOptions; }
 
 protected:
   explicit Visitor(const SpirvCodeGenOptions &opts, SpirvContext &ctx)
       : spvOptions(opts), context(ctx) {}
-
-  const SpirvCodeGenOptions &getCodeGenOptions() const { return spvOptions; }
 
 protected:
   const SpirvCodeGenOptions &spvOptions;

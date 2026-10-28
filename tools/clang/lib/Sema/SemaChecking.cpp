@@ -522,7 +522,6 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
 
     TheCall->setType(Context.VoidPtrTy);
     break;
-
   }
 
   // Since the target specific builtins for each arch overlap, only check those
@@ -1427,6 +1426,8 @@ bool Sema::CheckFunctionCall(FunctionDecl *FDecl, CallExpr *TheCall,
     CheckMemaccessArguments(TheCall, CMId, FnInfo);
 #endif // HLSL Change Ends
 
+  CheckHLSLFunctionCall(FDecl, TheCall); // HLSL Change
+
   return false;
 }
 
@@ -1584,7 +1585,7 @@ ExprResult Sema::SemaAtomicOpsOverloaded(ExprResult TheCallResult,
   case AtomicExpr::AO__atomic_add_fetch:
   case AtomicExpr::AO__atomic_sub_fetch:
     IsAddSub = true;
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
   case AtomicExpr::AO__c11_atomic_fetch_and:
   case AtomicExpr::AO__c11_atomic_fetch_or:
   case AtomicExpr::AO__c11_atomic_fetch_xor:
@@ -6173,7 +6174,7 @@ static IntRange GetExprRange(ASTContext &C, Expr *E, unsigned MaxWidth) {
           return IntRange(R.Width, /*NonNegative*/ true);
         }
       }
-      // fallthrough
+      LLVM_FALLTHROUGH; // HLSL Change
 
     case BO_ShlAssign:
       return IntRange::forValueOfType(C, GetExprType(E));
@@ -6771,6 +6772,9 @@ static void AnalyzeAssignment(Sema &S, BinaryOperator *E) {
   // Just recurse on the LHS.
   AnalyzeImplicitConversions(S, E->getLHS(), E->getOperatorLoc());
 
+  S.DiagnoseCoherenceMismatch(E->getRHS(), E->getLHS()->getType(),
+                              E->getOperatorLoc());
+
   // We want to recurse on the RHS as normal unless we're assigning to
   // a bitfield.
   if (FieldDecl *Bitfield = E->getLHS()->getSourceBitField()) {
@@ -6872,6 +6876,22 @@ static bool IsImplicitBoolFloatConversion(Sema &S, Expr *Ex, bool ToBool) {
 
 void CheckImplicitArgumentConversions(Sema &S, CallExpr *TheCall,
                                       SourceLocation CC) {
+  // HLSL Change Begin
+  if (FunctionDecl *FD = TheCall->getDirectCallee()) {
+    CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(FD);
+    unsigned ArgIdx = 0;
+    unsigned ParmIdx = 0;
+    if (MD && MD->isInstance())
+      ++ParmIdx;
+    for (; ArgIdx < TheCall->getNumArgs() && ParmIdx < FD->getNumParams();
+         ++ArgIdx, ++ParmIdx) {
+      ParmVarDecl *PD = FD->getParamDecl(ParmIdx);
+      Expr *CurrA = TheCall->getArg(ArgIdx);
+      S.DiagnoseCoherenceMismatch(CurrA, PD->getType(), CC);
+    }
+  }
+  // HLSL CHange End
+
   unsigned NumArgs = TheCall->getNumArgs();
   for (unsigned i = 0; i < NumArgs; ++i) {
     Expr *CurrA = TheCall->getArg(i);
@@ -7115,12 +7135,15 @@ void CheckImplicitConversion(Sema &S, Expr *E, QualType T,
     if (TargetBT && TargetBT->isFloatingPoint()) {
       // ...then warn if we're dropping FP rank.
 
-      // HLSL Change - unless source is literal float
+      // HLSL Change Begin - Warn on both promotions and conversions.
+      // Don't warn on Literal float.
       if (SourceBT->getKind() == BuiltinType::LitFloat)
         return;
+      int Order = S.getASTContext().getFloatingTypeOrder(QualType(SourceBT, 0),
+                                                         QualType(TargetBT, 0));
 
       // Builtin FP kinds are ordered by increasing FP rank.
-      if (SourceBT->getKind() > TargetBT->getKind()) {
+      if (Order > 0) {
         // Don't warn about float constants that are precisely
         // representable in the target type.
         Expr::EvalResult result;
@@ -7136,7 +7159,10 @@ void CheckImplicitConversion(Sema &S, Expr *E, QualType T,
           return;
 
         DiagnoseImpCast(S, E, T, CC, diag::warn_impcast_float_precision);
+      } else if (Order < 0) {
+        DiagnoseImpCast(S, E, T, CC, diag::warn_impcast_double_promotion);
       }
+      // HLSL Change End
       return;
     }
 
@@ -8469,7 +8495,7 @@ void Sema::CheckArrayAccess(const Expr *BaseExpr, const Expr *IndexExpr,
     }
 
     // HLSL Change Starts
-    if (getLangOpts().HLSL && getLangOpts().HLSLVersion > 2016) {
+    if (getLangOpts().HLSL && getLangOpts().HLSLVersion > hlsl::LangStd::v2016) {
       DiagRuntimeBehavior(BaseExpr->getLocStart(), BaseExpr,
         PDiag(diag::err_hlsl_array_element_index_out_of_bounds) << index.toString(10, true));
     }
@@ -8488,7 +8514,7 @@ void Sema::CheckArrayAccess(const Expr *BaseExpr, const Expr *IndexExpr,
     } // HLSL Change
   } else {
     // HLSL Change Starts
-    if (getLangOpts().HLSL && getLangOpts().HLSLVersion > 2016) {
+    if (getLangOpts().HLSL && getLangOpts().HLSLVersion > hlsl::LangStd::v2016) {
       DiagRuntimeBehavior(BaseExpr->getLocStart(), BaseExpr,
         PDiag(diag::err_hlsl_array_element_index_out_of_bounds) << index.toString(10, true));
     }
@@ -8562,7 +8588,12 @@ void Sema::CheckArrayAccess(const Expr *expr) {
       // HLSL Change Starts : Access checking for HLSL vector and matrix array subscript
       case Stmt::CXXOperatorCallExprClass : {
         if (getLangOpts().HLSL) {
+          const CXXOperatorCallExpr *OperatorCallExpr =
+              cast<CXXOperatorCallExpr>(expr);
+          if (OperatorCallExpr->getOperator() ==
+              OverloadedOperatorKind::OO_Subscript) {
             CheckHLSLArrayAccess(expr);
+          }
         }
         return;
       }

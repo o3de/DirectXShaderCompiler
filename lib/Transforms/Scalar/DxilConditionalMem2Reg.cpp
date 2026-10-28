@@ -1,4 +1,5 @@
-//===- DxilConditionalMem2Reg.cpp - Mem2Reg that selectively promotes Allocas ----===//
+//===- DxilConditionalMem2Reg.cpp - Mem2Reg that selectively promotes Allocas
+//----===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,20 +8,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Pass.h"
 #include "llvm/Analysis/AssumptionCache.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/IR/Dominators.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/IR/LegacyPassManager.h"
-#include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/DIBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Pass.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
 
 #include "dxc/DXIL/DxilUtil.h"
 #include "dxc/HLSL/HLModule.h"
@@ -33,15 +34,13 @@ using namespace hlsl;
 static bool ContainsFloatingPointType(Type *Ty) {
   if (Ty->isFloatingPointTy()) {
     return true;
-  }
-  else if (Ty->isArrayTy()) {
+  } else if (Ty->isArrayTy()) {
     return ContainsFloatingPointType(Ty->getArrayElementType());
-  }
-  else if (Ty->isVectorTy()) {
+  } else if (Ty->isVectorTy()) {
     return ContainsFloatingPointType(Ty->getVectorElementType());
-  }
-  else if (Ty->isStructTy()) {
-    for (unsigned i = 0, NumStructElms = Ty->getStructNumElements(); i < NumStructElms; i++) {
+  } else if (Ty->isStructTy()) {
+    for (unsigned i = 0, NumStructElms = Ty->getStructNumElements();
+         i < NumStructElms; i++) {
       if (ContainsFloatingPointType(Ty->getStructElementType(i)))
         return true;
     }
@@ -50,21 +49,23 @@ static bool ContainsFloatingPointType(Type *Ty) {
 }
 
 static bool Mem2Reg(Function &F, DominatorTree &DT, AssumptionCache &AC) {
-  BasicBlock &BB = F.getEntryBlock();  // Get the entry node for the function
-  bool Changed  = false;
-  std::vector<AllocaInst*> Allocas;
+  BasicBlock &BB = F.getEntryBlock(); // Get the entry node for the function
+  bool Changed = false;
+  std::vector<AllocaInst *> Allocas;
   while (1) {
     Allocas.clear();
 
     // Find allocas that are safe to promote, by looking at all instructions in
     // the entry node
     for (BasicBlock::iterator I = BB.begin(), E = --BB.end(); I != E; ++I)
-      if (AllocaInst *AI = dyn_cast<AllocaInst>(I))       // Is it an alloca?
+      if (AllocaInst *AI = dyn_cast<AllocaInst>(I)) // Is it an alloca?
         if (isAllocaPromotable(AI) &&
-          (!HLModule::HasPreciseAttributeWithMetadata(AI) || !ContainsFloatingPointType(AI->getAllocatedType())))
+            (!HLModule::HasPreciseAttributeWithMetadata(AI) ||
+             !ContainsFloatingPointType(AI->getAllocatedType())))
           Allocas.push_back(AI);
 
-    if (Allocas.empty()) break;
+    if (Allocas.empty())
+      break;
 
     PromoteMemToReg(Allocas, DT, nullptr, &AC);
     Changed = true;
@@ -99,8 +100,8 @@ public:
   }
 
   bool NoOpt = false;
-  explicit DxilConditionalMem2Reg(bool NoOpt=false) : FunctionPass(ID), NoOpt(NoOpt)
-  {
+  explicit DxilConditionalMem2Reg(bool NoOpt = false)
+      : FunctionPass(ID), NoOpt(NoOpt) {
     initializeDxilConditionalMem2RegPass(*PassRegistry::getPassRegistry());
   }
 
@@ -110,62 +111,142 @@ public:
     AU.setPreservesCFG();
   }
 
-  // Collect and remove all instructions that use AI, but
-  // give up if there are anything other than store, bitcast,
-  // memcpy, or GEP.
-  static bool TryRemoveUnusedAlloca(AllocaInst *AI) {
-    std::vector<Instruction *> WorkList;
+  // Replace simple array allocas with individual scalar allocas.
+  // Only handle if:
+  // - All the alloca's users are geps
+  // - The geps all have only constant indices
+  // - The geps are indexing to just the scalar elements
+  //
+  bool SplitSimpleAllocas(llvm::Function &F) {
+    llvm::SmallVector<AllocaInst *, 10> ScalarAllocas;
 
-    WorkList.push_back(AI);
-
-    for (unsigned i = 0; i < WorkList.size(); i++) {
-      Instruction *I = WorkList[i];
-
-      for (User *U : I->users()) {
-        Instruction *UI = cast<Instruction>(U);
-
-        unsigned Opcode = UI->getOpcode();
-        if (Opcode == Instruction::BitCast ||
-          Opcode == Instruction::GetElementPtr ||
-          Opcode == Instruction::Store)
-        {
-          WorkList.push_back(UI);
-        }
-        else if (MemCpyInst *MC = dyn_cast<MemCpyInst>(UI)) {
-          if (MC->getSource() == I) { // MC reads from our alloca
-            return false;
-          }
-          WorkList.push_back(UI);
-        }
-        else { // Load? PHINode? Assume read.
-          return false;
-        }
-      }
-    }
-
-    // Remove all instructions
-    for (auto It = WorkList.rbegin(), E = WorkList.rend(); It != E; It++) {
-      Instruction *I = *It;
-      I->eraseFromParent();
-    }
-
-    return true;
-  }
-
-  static bool RemoveAllUnusedAllocas(Function &F) {
-    std::vector<AllocaInst *> Allocas;
-    BasicBlock &EntryBB = *F.begin();
-    for (auto It = EntryBB.begin(), E = EntryBB.end(); It != E;) {
-      Instruction &I = *(It++);
-      if (AllocaInst *AI = dyn_cast<AllocaInst>(&I)) {
-        Allocas.push_back(AI);
-      }
-    }
+    if (F.empty())
+      return false;
+    BasicBlock *Entry = &F.getEntryBlock();
 
     bool Changed = false;
-    for (AllocaInst *AI : Allocas) {
-      Changed |= TryRemoveUnusedAlloca(AI);
-    }
+
+    LLVMContext &Ctx = F.getContext();
+    Module *M = F.getParent();
+    IRBuilder<> Builder(Ctx);
+    DIBuilder DIB(*M);
+    const DataLayout &DL = F.getParent()->getDataLayout();
+
+    for (Instruction *it = &Entry->back(); it != nullptr;) {
+      Instruction *I = it;
+      it = (it == &Entry->front()) ? nullptr : it->getPrevNode();
+
+      AllocaInst *AI = dyn_cast<AllocaInst>(I);
+      if (!AI)
+        continue;
+      Type *AllocType = AI->getAllocatedType();
+      if (!AllocType->isArrayTy())
+        continue;
+      Type *ArrayElemType = AllocType->getArrayElementType();
+      if (!ArrayElemType->isSingleValueType())
+        continue;
+
+      unsigned MaxSize = 0;
+      bool Giveup = false;
+      for (User *U : AI->users()) {
+        GEPOperator *Gep = dyn_cast<GEPOperator>(U);
+        if (!Gep) {
+          Giveup = true;
+          break;
+        }
+        if (!Gep->hasAllConstantIndices()) {
+          Giveup = true;
+          break;
+        }
+        if (Gep->getNumIndices() != 2 ||
+            cast<ConstantInt>(Gep->getOperand(1))->getLimitedValue() != 0) {
+          Giveup = true;
+          break;
+        }
+        unsigned RequiredSize =
+            1 + cast<ConstantInt>(Gep->getOperand(2))->getLimitedValue();
+        if (RequiredSize > MaxSize)
+          MaxSize = RequiredSize;
+      }
+
+      if (Giveup)
+        continue;
+
+      // Generate a scalar allocas for the corresponding GEPs.
+      ScalarAllocas.clear();
+      ScalarAllocas.resize(MaxSize);
+      for (auto it = AI->user_begin(); it != AI->user_end();) {
+        User *U = *(it++);
+        GetElementPtrInst *Gep = cast<GetElementPtrInst>(U);
+        unsigned Index =
+            cast<ConstantInt>(Gep->getOperand(2))->getLimitedValue();
+
+        AllocaInst *ScalarAlloca = ScalarAllocas[Index];
+        if (!ScalarAlloca) {
+          Builder.SetInsertPoint(AI);
+          ScalarAlloca = Builder.CreateAlloca(ArrayElemType);
+          ScalarAlloca->setDebugLoc(AI->getDebugLoc());
+          hlsl::DxilMDHelper::CopyMetadata(
+              *ScalarAlloca, *AI); // Propagate precise attributes, if any
+          ScalarAllocas[Index] = ScalarAlloca;
+        }
+
+        Gep->replaceAllUsesWith(ScalarAlloca);
+        Gep->eraseFromParent();
+      }
+
+      // Rewrite any debug info insts.
+      for (auto mdit = dxilutil::mdv_users_begin(AI);
+           mdit != dxilutil::mdv_users_end(AI);) {
+        User *U = *(mdit++);
+        DbgDeclareInst *DI = dyn_cast<DbgDeclareInst>(U);
+        if (!DI)
+          continue;
+
+        DIExpression *Expr = DI->getExpression();
+
+        unsigned ArrayLayoutOffsetInBits = 0;
+        std::vector<DxilDIArrayDim> ArrayDims;
+        const bool HasStrides = DxilMDHelper::GetVariableDebugLayout(
+            DI, ArrayLayoutOffsetInBits, ArrayDims);
+
+        const bool IsBitpiece = Expr->isBitPiece();
+        const uint64_t BaseBitpieceOffSet =
+            IsBitpiece ? Expr->getBitPieceOffset() : 0;
+
+        for (unsigned i = 0; i < ScalarAllocas.size(); i++) {
+          AllocaInst *ScalarAlloca = ScalarAllocas[i];
+          if (!ScalarAlloca) {
+            continue;
+          }
+
+          uint64_t BitpieceOffsetInBits = 0;
+          const uint64_t BitpieceSizeInBits =
+              DL.getTypeStoreSizeInBits(ArrayElemType);
+          if (HasStrides) {
+            BitpieceOffsetInBits = ArrayLayoutOffsetInBits;
+            unsigned FragmentIndex = i;
+            for (DxilDIArrayDim &ArrayDim : ArrayDims) {
+              unsigned IndexIntoArray = FragmentIndex % ArrayDim.NumElements;
+              BitpieceOffsetInBits += IndexIntoArray * ArrayDim.StrideInBits;
+              FragmentIndex /= ArrayDim.NumElements;
+            }
+          } else {
+            BitpieceOffsetInBits = BaseBitpieceOffSet + i * BitpieceSizeInBits;
+          }
+
+          uint64_t Operands[3] = {dwarf::DW_OP_bit_piece, BitpieceOffsetInBits,
+                                  BitpieceSizeInBits};
+          DIB.insertDeclare(ScalarAlloca, DI->getVariable(),
+                            DIExpression::get(Ctx, Operands), DI->getDebugLoc(),
+                            DI);
+        } // For each scalar alloca
+        DI->eraseFromParent();
+      } // For each metadat user
+
+      AI->eraseFromParent();
+      Changed = true;
+    } // For each inst in the entry block
 
     return Changed;
   }
@@ -189,14 +270,19 @@ public:
   static bool ScalarizePreciseVectorAlloca(Function &F) {
     BasicBlock *Entry = &*F.begin();
 
-    bool Changed = false;
+    SmallVector<AllocaInst *, 4> PreciseAllocaInsts;
     for (auto it = Entry->begin(); it != Entry->end();) {
       Instruction *I = &*(it++);
       AllocaInst *AI = dyn_cast<AllocaInst>(I);
-      if (!AI || !AI->getAllocatedType()->isVectorTy()) continue;
-      if (!HLModule::HasPreciseAttributeWithMetadata(AI)) continue;
+      if (!AI || !AI->getAllocatedType()->isVectorTy())
+        continue;
+      if (!HLModule::HasPreciseAttributeWithMetadata(AI))
+        continue;
+      PreciseAllocaInsts.push_back(AI);
+    }
 
-
+    bool Changed = false;
+    for (auto AI : PreciseAllocaInsts) {
       IRBuilder<> B(AI);
       VectorType *VTy = cast<VectorType>(AI->getAllocatedType());
       Type *ScalarTy = VTy->getVectorElementType();
@@ -223,8 +309,7 @@ public:
 
           LI->replaceAllUsesWith(Vec);
           LI->eraseFromParent();
-        }
-        else if (StoreInst *Store = dyn_cast<StoreInst>(U)) {
+        } else if (StoreInst *Store = dyn_cast<StoreInst>(U)) {
           B.SetInsertPoint(Store);
           Value *Vec = Store->getValueOperand();
           for (unsigned i = 0; i < VectorSize; i++) {
@@ -233,18 +318,18 @@ public:
             hlsl::DxilMDHelper::CopyMetadata(*ElemStore, *Store);
           }
           Store->eraseFromParent();
-        }
-        else if (BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
+        } else if (BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
           DXASSERT(onlyUsedByLifetimeMarkers(BCI),
                    "expected bitcast to only be used by lifetime intrinsics");
-          for (auto BCIU = BCI->user_begin(), BCIE = BCI->user_end(); BCIU != BCIE;) {
+          for (auto BCIU = BCI->user_begin(), BCIE = BCI->user_end();
+               BCIU != BCIE;) {
             IntrinsicInst *II = cast<IntrinsicInst>(*(BCIU++));
             II->eraseFromParent();
           }
           BCI->eraseFromParent();
-        }
-        else {
-          llvm_unreachable("Cannot handle non-store/load on precise vector allocas");
+        } else {
+          llvm_unreachable(
+              "Cannot handle non-store/load on precise vector allocas");
         }
       }
 
@@ -258,13 +343,14 @@ public:
     Value *V;
     unsigned Offset;
   };
-  static bool FindAllStores(Module &M, Value *V, SmallVectorImpl<StoreInfo> *Stores) {
+  static bool FindAllStores(Module &M, Value *V,
+                            SmallVectorImpl<StoreInfo> *Stores) {
     SmallVector<StoreInfo, 8> Worklist;
     std::set<Value *> Seen;
 
     auto Add = [&](Value *V, unsigned OffsetInBits) {
       if (Seen.insert(V).second)
-        Worklist.push_back({ V, OffsetInBits });
+        Worklist.push_back({V, OffsetInBits});
     };
 
     Add(V, 0);
@@ -285,17 +371,15 @@ public:
         Type *PtrElemType = GEPPtrType->getPointerElementType();
         if (ArrayType *ArrayTy = dyn_cast<ArrayType>(PtrElemType)) {
           ElemSize = DL.getTypeAllocSizeInBits(ArrayTy->getElementType());
-        }
-        else if (VectorType *VectorTy = dyn_cast<VectorType>(PtrElemType)) {
+        } else if (VectorType *VectorTy = dyn_cast<VectorType>(PtrElemType)) {
           ElemSize = DL.getTypeAllocSizeInBits(VectorTy->getElementType());
-        }
-        else {
+        } else {
           return false;
         }
 
         unsigned OffsetInBits = 0;
         for (unsigned i = 0; i < GEP->getNumIndices(); i++) {
-          auto IdxOp = dyn_cast<ConstantInt>(GEP->getOperand(i+1));
+          auto IdxOp = dyn_cast<ConstantInt>(GEP->getOperand(i + 1));
           if (!IdxOp) {
             return false;
           }
@@ -303,17 +387,15 @@ public:
           if (i == 0) {
             if (Idx != 0)
               return false;
-          }
-          else {
+          } else {
             OffsetInBits = Idx * ElemSize;
           }
         }
 
         for (User *U : Elem->users())
           Add(U, Info.Offset + OffsetInBits);
-      }
-      else if (auto *Store = dyn_cast<StoreInst>(Elem)) {
-        Stores->push_back({ Store, Info.Offset });
+      } else if (auto *Store = dyn_cast<StoreInst>(Elem)) {
+        Stores->push_back({Store, Info.Offset});
       }
     }
 
@@ -321,16 +403,17 @@ public:
   }
 
   // Function to rewrite debug info for output argument.
-  // Sometimes, normal local variables that get returned from functions get rewritten as
-  // a pointer argument.
+  // Sometimes, normal local variables that get returned from functions get
+  // rewritten as a pointer argument.
   //
-  // Right now, we generally have a single dbg.declare for the Argument, but as we lower
-  // it to storeOutput, the dbg.declare and the Argument both get removed, leavning no
-  // debug info for the local variable.
+  // Right now, we generally have a single dbg.declare for the Argument, but as
+  // we lower it to storeOutput, the dbg.declare and the Argument both get
+  // removed, leavning no debug info for the local variable.
   //
-  // Solution here is to rewrite the dbg.declare as dbg.value's by finding all the stores
-  // and writing a dbg.value immediately before the store. Fairly conservative at the moment 
-  // about what cases to rewrite (only scalars and vectors, and arrays of scalars and vectors).
+  // Solution here is to rewrite the dbg.declare as dbg.value's by finding all
+  // the stores and writing a dbg.value immediately before the store. Fairly
+  // conservative at the moment about what cases to rewrite (only scalars and
+  // vectors, and arrays of scalars and vectors).
   //
   bool RewriteOutputArgsDebugInfo(Function &F) {
     bool Changed = false;
@@ -345,9 +428,9 @@ public:
       Type *Ty = Arg.getType()->getPointerElementType();
 
       bool IsSimpleType =
-        Ty->isSingleValueType() ||
-        Ty->isVectorTy() ||
-        (Ty->isArrayTy() && (Ty->getArrayElementType()->isVectorTy() || Ty->getArrayElementType()->isSingleValueType()));
+          Ty->isSingleValueType() || Ty->isVectorTy() ||
+          (Ty->isArrayTy() && (Ty->getArrayElementType()->isVectorTy() ||
+                               Ty->getArrayElementType()->isSingleValueType()));
 
       if (!IsSimpleType)
         continue;
@@ -366,7 +449,8 @@ public:
       DbgDeclareInst *Declare = nullptr;
       if (auto *L = LocalAsMetadata::getIfExists(&Arg)) {
         if (auto *DINode = MetadataAsValue::getIfExists(Ctx, L)) {
-          if (!DINode->user_empty() && std::next(DINode->user_begin()) == DINode->user_end()) {
+          if (!DINode->user_empty() &&
+              std::next(DINode->user_begin()) == DINode->user_end()) {
             Declare = dyn_cast<DbgDeclareInst>(*DINode->user_begin());
           }
         }
@@ -387,17 +471,19 @@ public:
           auto Val = Store->getValueOperand();
           auto Loc = Store->getDebugLoc();
           auto &M = *F.getParent();
-          unsigned ValSize = M.getDataLayout().getTypeAllocSizeInBits(Val->getType());
+          unsigned ValSize =
+              M.getDataLayout().getTypeAllocSizeInBits(Val->getType());
 
           DIExpression *NewExpr = nullptr;
           if (Offset || VarSize > ValSize) {
-            uint64_t Elems[] = { dwarf::DW_OP_bit_piece, Offset + Info.Offset, ValSize };
+            uint64_t Elems[] = {dwarf::DW_OP_bit_piece, Offset + Info.Offset,
+                                ValSize};
             NewExpr = DIExpression::get(Ctx, Elems);
-          }
-          else {
+          } else {
             NewExpr = DIExpression::get(Ctx, {});
           }
-          if (Loc->getScope()->getSubprogram() == Var->getScope()->getSubprogram())
+          if (Loc->getScope()->getSubprogram() ==
+              Var->getScope()->getSubprogram())
             DIB.insertDbgValueIntrinsic(Val, 0, Var, NewExpr, Loc, Store);
         }
 
@@ -411,11 +497,13 @@ public:
 
   bool runOnFunction(Function &F) override {
     DominatorTree *DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-    AssumptionCache *AC = &getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
+    AssumptionCache *AC =
+        &getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
     bool Changed = false;
 
     Changed |= RewriteOutputArgsDebugInfo(F);
-    Changed |= RemoveAllUnusedAllocas(F);
+    Changed |= dxilutil::DeleteDeadAllocas(F);
+    Changed |= SplitSimpleAllocas(F);
     Changed |= ScalarizePreciseVectorAlloca(F);
     Changed |= Mem2Reg(F, *DT, *AC);
 
@@ -428,7 +516,9 @@ Pass *llvm::createDxilConditionalMem2RegPass(bool NoOpt) {
   return new DxilConditionalMem2Reg(NoOpt);
 }
 
-INITIALIZE_PASS_BEGIN(DxilConditionalMem2Reg, "dxil-cond-mem2reg", "Dxil Conditional Mem2Reg", false, false)
+INITIALIZE_PASS_BEGIN(DxilConditionalMem2Reg, "dxil-cond-mem2reg",
+                      "Dxil Conditional Mem2Reg", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(AssumptionCacheTracker)
-INITIALIZE_PASS_END(DxilConditionalMem2Reg, "dxil-cond-mem2reg", "Dxil Conditional Mem2Reg", false, false)
+INITIALIZE_PASS_END(DxilConditionalMem2Reg, "dxil-cond-mem2reg",
+                    "Dxil Conditional Mem2Reg", false, false)

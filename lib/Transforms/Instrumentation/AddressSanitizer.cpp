@@ -393,7 +393,7 @@ struct AddressSanitizer : public FunctionPass {
       : FunctionPass(ID), CompileKernel(CompileKernel || ClEnableKasan) {
     initializeAddressSanitizerPass(*PassRegistry::getPassRegistry());
   }
-  const char *getPassName() const override {
+  StringRef getPassName() const override {
     return "AddressSanitizerFunctionPass";
   }
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -481,7 +481,7 @@ class AddressSanitizerModule : public ModulePass {
       : ModulePass(ID), CompileKernel(CompileKernel || ClEnableKasan) {}
   bool runOnModule(Module &M) override;
   static char ID;  // Pass identification, replacement for typeid
-  const char *getPassName() const override { return "AddressSanitizerModule"; }
+  StringRef getPassName() const override { return "AddressSanitizerModule"; }
 
  private:
   void initializeCallbacks(Module &M);
@@ -1646,8 +1646,7 @@ void FunctionStackPoisoner::poisonRedZones(ArrayRef<uint8_t> ShadowBytes,
 
 // Fake stack allocator (asan_fake_stack.h) has 11 size classes
 // for every power of 2 from kMinStackMallocSize to kMaxAsanStackMallocSizeClass
-_Ret_range_(0, kMaxAsanStackMallocSizeClass)
-static int StackMallocSizeClass(_In_range_(0, kMaxAsanStackMallocSizeClass) uint64_t LocalStackSize) {
+static int StackMallocSizeClass(uint64_t LocalStackSize) {
   assert(LocalStackSize <= kMaxStackMallocSize);
   uint64_t MaxSize = kMinStackMallocSize;
   for (int i = 0;; i++, MaxSize *= 2)

@@ -45,8 +45,11 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "dxc/DXIL/DxilInstructions.h" // HLSL Change - DxilInst_OutputComplete usage
 #include "dxc/DXIL/DxilMetadataHelper.h" // HLSL Change - combine dxil metadata.
+#include "dxc/DXIL/DxilOperations.h"     // HLSL Change - Get HLSL Opcodes
 #include "dxc/DXIL/DxilUtil.h" // HLSL Change - special handling of convergent marker
+
 using namespace llvm;
 
 #define DEBUG_TYPE "local"
@@ -332,9 +335,11 @@ bool llvm::isInstructionTriviallyDead(Instruction *I,
     if (Constant *C = dyn_cast<Constant>(CI->getArgOperand(0)))
       return C->isNullValue() || isa<UndefValue>(C);
 
-  // HLSL change - don't force unused convergenet markers to stay
-  if (CallInst *CI = dyn_cast<CallInst>(I))
-    if (hlsl::dxilutil::IsConvergentMarker(CI)) return true;
+  // HLSL Change - Verify that function has no side effects
+  if (hlsl::dxilutil::FunctionHasNoSideEffects(I))
+    return true;
+
+  // HLSL Change End
 
   return false;
 }
@@ -442,7 +447,7 @@ bool llvm::SimplifyInstructionsInBlock(BasicBlock *BB,
     assert(!BI->isTerminator());
     Instruction *Inst = BI++;
 
-    WeakVH BIHandle(BI);
+    WeakTrackingVH BIHandle(BI);
     if (recursivelySimplifyInstruction(Inst, TLI)) {
       MadeChange = true;
       if (BIHandle != BI)
@@ -483,7 +488,7 @@ void llvm::RemovePredecessorAndSimplify(BasicBlock *BB, BasicBlock *Pred) {
   // that can be removed.
   BB->removePredecessor(Pred, true);
 
-  WeakVH PhiIt = &BB->front();
+  WeakTrackingVH PhiIt = &BB->front();
   while (PHINode *PN = dyn_cast<PHINode>(PhiIt)) {
     PhiIt = &*++BasicBlock::iterator(cast<Instruction>(PhiIt));
     Value *OldPhiIt = PhiIt;

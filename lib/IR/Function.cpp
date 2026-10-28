@@ -515,7 +515,7 @@ static std::string getMangledTypeStr(Type* Ty) {
   return Result;
 }
 
-std::string Intrinsic::getName(_In_range_(0, num_intrinsics-1) ID id, ArrayRef<Type*> Tys) {
+std::string Intrinsic::getName(ID id, ArrayRef<Type*> Tys) {
   assert(id < num_intrinsics && "Invalid intrinsic ID!");
   static const char * const Table[] = {
     "not_intrinsic",
@@ -705,9 +705,9 @@ static void DecodeIITType(unsigned &NextElt, ArrayRef<unsigned char> Infos,
   case IIT_EMPTYSTRUCT:
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Struct, 0));
     return;
-  case IIT_STRUCT5: ++StructElts; // FALL THROUGH.
-  case IIT_STRUCT4: ++StructElts; // FALL THROUGH.
-  case IIT_STRUCT3: ++StructElts; // FALL THROUGH.
+  case IIT_STRUCT5: ++StructElts; LLVM_FALLTHROUGH; // HLSL Change
+  case IIT_STRUCT4: ++StructElts; LLVM_FALLTHROUGH; // HLSL Change
+  case IIT_STRUCT3: ++StructElts; LLVM_FALLTHROUGH; // HLSL Change
   case IIT_STRUCT2: {
     OutputTable.push_back(IITDescriptor::get(IITDescriptor::Struct,StructElts));
 

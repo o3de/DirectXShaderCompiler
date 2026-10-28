@@ -17,7 +17,8 @@ namespace spirv {
 SpirvModule::SpirvModule()
     : capabilities({}), extensions({}), extInstSets({}), memoryModel(nullptr),
       entryPoints({}), executionModes({}), moduleProcesses({}), decorations({}),
-      constants({}), variables({}), functions({}), debugInstructions({}) {}
+      constants({}), undefs({}), variables({}), functions({}),
+      debugInstructions({}), perVertexInterp(false) {}
 
 SpirvModule::~SpirvModule() {
   for (auto *cap : capabilities)
@@ -42,6 +43,8 @@ SpirvModule::~SpirvModule() {
     decoration->releaseMemory();
   for (auto *constant : constants)
     constant->releaseMemory();
+  for (auto *undef : undefs)
+    undef->releaseMemory();
   for (auto *var : variables)
     var->releaseMemory();
   for (auto *di : debugInstructions)
@@ -87,6 +90,12 @@ bool SpirvModule::invokeVisitor(Visitor *visitor, bool reverseOrder) {
     for (auto iter = constants.rbegin(); iter != constants.rend(); ++iter) {
       auto *constant = *iter;
       if (!constant->invokeVisitor(visitor))
+        return false;
+    }
+
+    for (auto iter = undefs.rbegin(); iter != undefs.rend(); ++iter) {
+      auto *undef = *iter;
+      if (!undef->invokeVisitor(visitor))
         return false;
     }
 
@@ -202,12 +211,16 @@ bool SpirvModule::invokeVisitor(Visitor *visitor, bool reverseOrder) {
       if (!constant->invokeVisitor(visitor))
         return false;
 
+    for (auto undef : undefs)
+      if (!undef->invokeVisitor(visitor))
+        return false;
+
     for (auto var : variables)
       if (!var->invokeVisitor(visitor))
         return false;
 
-    for (auto *debugInstruction : debugInstructions)
-      if (!debugInstruction->invokeVisitor(visitor))
+    for (size_t i = 0; i < debugInstructions.size(); i++)
+      if (!debugInstructions[i]->invokeVisitor(visitor))
         return false;
 
     for (auto fn : functions)
@@ -236,9 +249,44 @@ bool SpirvModule::addCapability(SpirvCapability *cap) {
   return capabilities.insert(cap);
 }
 
+bool SpirvModule::hasCapability(SpirvCapability &cap) {
+  return capabilities.count(&cap) != 0;
+}
+
 void SpirvModule::setMemoryModel(SpirvMemoryModel *model) {
   assert(model && "cannot set a null memory model");
+  if (memoryModel)
+    memoryModel->releaseMemory();
   memoryModel = model;
+}
+
+bool SpirvModule::promoteAddressingModel(spv::AddressingModel addrModel) {
+  assert(memoryModel && "base memory model must be set first");
+  auto getPriority = [](spv::AddressingModel am) -> int {
+    switch (am) {
+    default:
+      assert(false && "unknown addressing model");
+      return 0;
+    case spv::AddressingModel::Logical:
+      return 0;
+    case spv::AddressingModel::Physical32:
+      return 1;
+    case spv::AddressingModel::Physical64:
+      return 2;
+    case spv::AddressingModel::PhysicalStorageBuffer64:
+      return 3;
+    }
+  };
+
+  int current = getPriority(memoryModel->getAddressingModel());
+  int pending = getPriority(addrModel);
+
+  if (pending > current) {
+    memoryModel->setAddressingModel(addrModel);
+    return true;
+  } else {
+    return false;
+  }
 }
 
 void SpirvModule::addEntryPoint(SpirvEntryPoint *ep) {
@@ -246,7 +294,20 @@ void SpirvModule::addEntryPoint(SpirvEntryPoint *ep) {
   entryPoints.push_back(ep);
 }
 
-void SpirvModule::addExecutionMode(SpirvExecutionMode *em) {
+SpirvExecutionModeBase *
+SpirvModule::findExecutionMode(SpirvFunction *entryPoint,
+                               spv::ExecutionMode em) {
+  for (SpirvExecutionModeBase *cem : executionModes) {
+    if (cem->getEntryPoint() != entryPoint)
+      continue;
+    if (cem->getExecutionMode() != em)
+      continue;
+    return cem;
+  }
+  return nullptr;
+}
+
+void SpirvModule::addExecutionMode(SpirvExecutionModeBase *em) {
   assert(em && "cannot add null execution mode");
   executionModes.push_back(em);
 }
@@ -275,9 +336,15 @@ SpirvExtInstImport *SpirvModule::getExtInstSet(llvm::StringRef name) {
   return nullptr;
 }
 
-void SpirvModule::addVariable(SpirvVariable *var) {
+void SpirvModule::addVariable(SpirvVariableLike *var) {
   assert(var && "cannot add null variable to the module");
   variables.push_back(var);
+}
+
+void SpirvModule::addVariable(SpirvVariableLike *var, SpirvInstruction *pos) {
+  assert(var && "cannot add null variable to the module");
+  auto location = std::find(variables.begin(), variables.end(), pos);
+  variables.insert(location, var);
 }
 
 void SpirvModule::addDecoration(SpirvDecoration *decor) {
@@ -288,6 +355,11 @@ void SpirvModule::addDecoration(SpirvDecoration *decor) {
 void SpirvModule::addConstant(SpirvConstant *constant) {
   assert(constant);
   constants.push_back(constant);
+}
+
+void SpirvModule::addUndef(SpirvUndef *undef) {
+  assert(undef);
+  undefs.push_back(undef);
 }
 
 void SpirvModule::addString(SpirvString *str) {
@@ -308,6 +380,17 @@ void SpirvModule::addDebugInfo(SpirvDebugInstruction *info) {
 void SpirvModule::addModuleProcessed(SpirvModuleProcessed *p) {
   assert(p);
   moduleProcesses.push_back(p);
+}
+
+SpirvDebugCompilationUnit *SpirvModule::getDebugCompilationUnit() {
+  SpirvDebugCompilationUnit *unit = debugCompilationUnit;
+  assert(unit && "null DebugCompilationUnit");
+  return unit;
+}
+
+void SpirvModule::setDebugCompilationUnit(SpirvDebugCompilationUnit *unit) {
+  assert(unit);
+  debugCompilationUnit = unit;
 }
 
 } // end namespace spirv

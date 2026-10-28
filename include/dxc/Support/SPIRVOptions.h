@@ -20,6 +20,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Option/ArgList.h"
 
+#include <optional>
+
 namespace clang {
 namespace spirv {
 
@@ -37,32 +39,58 @@ enum class SpirvLayoutRule {
 
 struct SpirvCodeGenOptions {
   /// Disable legalization and optimization and emit raw SPIR-V
-  bool codeGenHighLevel;
-  bool debugInfoFile;
-  bool debugInfoLine;
-  bool debugInfoSource;
-  bool debugInfoTool;
-  bool debugInfoRich;
-  bool defaultRowMajor;
-  bool disableValidation;
-  bool enable16BitTypes;
-  bool enableReflect;
-  bool invertY; // Additive inverse
-  bool invertW; // Multiplicative inverse
-  bool noWarnEmulatedFeatures;
-  bool noWarnIgnoredFeatures;
-  bool useDxLayout;
-  bool useGlLayout;
-  bool useScalarLayout;
-  bool flattenResourceArrays;
-  bool autoShiftBindings;
-  bool supportNonzeroBaseInstance;
-  SpirvLayoutRule cBufferLayoutRule;
-  SpirvLayoutRule sBufferLayoutRule;
-  SpirvLayoutRule tBufferLayoutRule;
-  SpirvLayoutRule ampPayloadLayoutRule;
+  bool codeGenHighLevel = false;
+  bool debugInfoFile = false;
+  bool debugInfoLine = false;
+  bool debugInfoSource = false;
+  bool debugInfoTool = false;
+  bool debugInfoRich = false;
+  /// Use NonSemantic.Vulkan.DebugInfo.100 debug info instead of
+  /// OpenCL.DebugInfo.100
+  bool debugInfoVulkan = false;
+  bool defaultRowMajor = false;
+  bool disableValidation = false;
+  bool enable16BitTypes = false;
+  bool finiteMathOnly = false;
+  bool enableReflect = false;
+  bool invertY = false; // Additive inverse
+  bool invertW = false; // Multiplicative inverse
+  bool noWarnEmulatedFeatures = false;
+  bool noWarnIgnoredFeatures = false;
+  bool preserveBindings = false;
+  bool preserveInterface = false;
+  bool useDxLayout = false;
+  bool useGlLayout = false;
+  bool useLegacyBufferMatrixOrder = false;
+  bool useScalarLayout = false;
+  bool flattenResourceArrays = false;
+  bool reduceLoadSize = false;
+  bool disableImageTypeDepthHint = false; // Disable depth hint for OpTypeImage because some mobile drivers crash.
+  bool autoShiftBindings = false;
+  bool supportNonzeroBaseInstance = false;
+  bool supportNonzeroBaseVertex = false;
+  bool fixFuncCallArguments = false;
+  bool enableMaximalReconvergence = false;
+  bool useVulkanMemoryModel = false;
+  bool useUnknownImageFormat = false;
+  bool useDescriptorHeap = false;
+  bool IEEEStrict = false;
+  /// Maximum length in words for the OpString literal containing the shader
+  /// source for DebugSource and DebugSourceContinued. If the source code length
+  /// is larger than this number, we will use DebugSourceContinued instructions
+  /// for follow-up source code after the first DebugSource instruction. Note
+  /// that this number must be less than or equal to 0xFFFDu because of the
+  /// limitation of a single SPIR-V instruction size (0xFFFF) - 2 operand words
+  /// for OpString. Currently a smaller value is only used to test
+  /// DebugSourceContinued generation.
+  uint32_t debugSourceLen = 0;
+  SpirvLayoutRule cBufferLayoutRule = SpirvLayoutRule::Void;
+  SpirvLayoutRule sBufferLayoutRule = SpirvLayoutRule::Void;
+  SpirvLayoutRule tBufferLayoutRule = SpirvLayoutRule::Void;
+  SpirvLayoutRule ampPayloadLayoutRule = SpirvLayoutRule::Void;
   llvm::StringRef stageIoOrder;
   llvm::StringRef targetEnv;
+  uint32_t maxId = 0;
   llvm::SmallVector<int32_t, 4> bShift;
   llvm::SmallVector<int32_t, 4> sShift;
   llvm::SmallVector<int32_t, 4> tShift;
@@ -71,9 +99,30 @@ struct SpirvCodeGenOptions {
   llvm::SmallVector<llvm::StringRef, 4> optConfig;
   std::vector<std::string> bindRegister;
   std::vector<std::string> bindGlobals;
+  std::string entrypointName;
+  std::string floatDenormalMode; // OPT_denorm
 
-  // String representation of all command line options.
+  // User-defined bindings/set numbers for resource/sampler/counter heaps.
+  struct BindingInfo {
+    size_t binding;
+    size_t set;
+  };
+  std::optional<BindingInfo> resourceHeapBinding;
+  std::optional<BindingInfo> samplerHeapBinding;
+  std::optional<BindingInfo> counterHeapBinding;
+
+  bool signaturePacking =
+      false; ///< Whether signature packing is enabled or not
+
+  bool printAll =
+      false; // Dump SPIR-V module before each pass and after the last one.
+
+  // String representation of all command line options and input file.
   std::string clOptions;
+  std::string inputFile;
+
+  // String representation of original source
+  std::string origSource;
 };
 
 } // namespace spirv

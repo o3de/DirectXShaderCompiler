@@ -1,7 +1,6 @@
-// Run: %dxc -T vs_6_0 -E main
+// RUN: %dxc -T vs_6_0 -E main -fcgl  %s -spirv | FileCheck %s
 
 // CHECK: OpCapability Sampled1D
-// CHECK: OpCapability ImageMSArray
 
 // CHECK: %type_1d_image = OpTypeImage %float 1D 2 0 0 1 Unknown
 // CHECK: %_ptr_UniformConstant_type_1d_image = OpTypePointer UniformConstant %type_1d_image
@@ -30,9 +29,6 @@
 // CHECK: %type_2d_image_array_0 = OpTypeImage %uint 2D 2 1 1 1 Unknown
 // CHECK: %_ptr_UniformConstant_type_2d_image_array_0 = OpTypePointer UniformConstant %type_2d_image_array_0
 
-// CHECK: %type_2d_image_array_1 = OpTypeImage %float 2D 2 1 0 1 Unknown
-// CHECK: %_ptr_UniformConstant_type_2d_image_array_1 = OpTypePointer UniformConstant %type_2d_image_array_1
-
 // CHECK: %t1 = OpVariable %_ptr_UniformConstant_type_1d_image UniformConstant
 Texture1D   <float4> t1 : register(t1);
 // CHECK: %t2 = OpVariable %_ptr_UniformConstant_type_2d_image UniformConstant
@@ -54,20 +50,8 @@ Texture2DMS      <int3>   t8 : register(t8);
 // CHECK: %t9 = OpVariable %_ptr_UniformConstant_type_2d_image_array_0 UniformConstant
 Texture2DMSArray <uint4>  t9 : register(t9);
 
-struct S {
-    float a;
-    float b;
-};
-
-struct T {
-    float1 a;
-    float2 b;
-};
-
-// CHECK: %sTex = OpVariable %_ptr_UniformConstant_type_1d_image UniformConstant
-Texture1D<S>      sTex;
-// CHECK: %tTex = OpVariable %_ptr_UniformConstant_type_2d_image_array_1 UniformConstant
-Texture2DArray<T> tTex;
+// CHECK: %t10 = OpVariable %_ptr_UniformConstant_type_2d_image_1 UniformConstant
+Texture2D   <bool>   t10 : register(t10);
 
 void main() {
 // CHECK-LABEL: %main = OpFunction

@@ -10,123 +10,52 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-#ifdef _WIN32
-
+#include "dxc/Support/FileIOHelper.h"
 #include "dxc/Support/Global.h"
 #include "dxc/Support/WinIncludes.h"
 #include "dxc/Support/dxcapi.use.h"
-#include "dxc/Support/FileIOHelper.h"
-#include "llvm/Support/MSFileSystem.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MSFileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "dxc/dxcapi.h"
-#include "dxc/dxcapi.internal.h"
-#include "dxc/dxcpix.h"
-#include "dxc/Support/microcom.h"
-#include "dxc/DxilContainer/DxilContainer.h"
-#include "dxc/DXIL/DxilUtil.h"
-#include "dxc/DXIL/DxilPDB.h"
 #include "dxc/DXIL/DxilMetadataHelper.h"
 #include "dxc/DXIL/DxilModule.h"
-#include "dxc/Support/Unicode.h"
+#include "dxc/DXIL/DxilPDB.h"
+#include "dxc/DXIL/DxilUtil.h"
+#include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/Support/HLSLOptions.h"
+#include "dxc/Support/Path.h"
+#include "dxc/Support/Unicode.h"
+#include "dxc/Support/microcom.h"
+#include "dxc/dxcapi.h"
+#include "dxc/dxcapi.internal.h"
 
-#include "dxcshadersourceinfo.h"
 #include "dxc/Support/dxcfilesystem.h"
+#include "dxcshadersourceinfo.h"
 
-#include <vector>
-#include <locale>
+#include "dxc/DxilCompression/DxilCompression.h"
+#include "dxc/DxilContainer/DxilRuntimeReflection.h"
+
+#include <algorithm>
 #include <codecvt>
+#include <locale>
 #include <string>
+#include <vector>
+
+#ifdef _WIN32
+#include "dxc/dxcpix.h"
 #include <dia2.h>
+#endif
 
 using namespace dxc;
 using namespace llvm;
 
-static const std::string ToUtf8String(const std::wstring &str) {
-  std::wstring_convert<std::codecvt_utf8<wchar_t> > converter;
-  return converter.to_bytes(str.data(), str.data()+str.size());
-}
-
-static std::wstring ToWstring(const char *ptr, size_t size) {
-  std::wstring_convert<std::codecvt_utf8_utf16<wchar_t> > converter;
-  return converter.from_bytes(ptr, ptr+size);
-}
-static std::wstring ToWstring(const char *ptr) {
-  return ToWstring(ptr, strlen(ptr));
-}
-static std::wstring ToWstring(const std::string &str) {
-  return ToWstring(str.data(), str.size());
-}
-static std::wstring ToWstring(StringRef str) {
-  return ToWstring(str.data(), str.size());
-}
-static HRESULT CopyWstringToBSTR(const std::wstring &str, BSTR *pResult) {
-  if (!pResult) return E_POINTER;
-  *pResult = nullptr;
-
-  if (str.empty())
-    return S_OK;
-
-  CComBSTR buf(str.data());
-  *pResult = buf.Detach();
-  return S_OK;
-}
-
-static std::wstring NormalizePath(const WCHAR *path) {
-  std::wstring PathStorage;
-  dxcutil::MakeAbsoluteOrCurDirRelativeW(path, PathStorage);
-  std::string FilenameStr8 = Unicode::UTF16ToUTF8StringOrThrow(path);
-  llvm::SmallString<128> NormalizedPath;
-  llvm::sys::path::native(FilenameStr8, NormalizedPath);
-  std::wstring FilenameStr16 = Unicode::UTF8ToUTF16StringOrThrow(NormalizedPath.c_str());
-  return FilenameStr16;
-}
-
-static bool IsBitcode(const void *ptr, size_t size) {
-  const uint8_t pattern[] = {'B','C',};
-  if (size < _countof(pattern))
-    return false;
-  return !memcmp(ptr, pattern, _countof(pattern));
-}
-
-static std::vector<std::pair<std::wstring, std::wstring> > ComputeArgPairs(ArrayRef<std::string> args) {
-  std::vector<std::pair<std::wstring, std::wstring> > ret;
-
-  const llvm::opt::OptTable *optionTable = hlsl::options::getHlslOptTable();
-  assert(optionTable);
-  if (optionTable) {
-    std::vector<const char *> argPointerList;
-    for (unsigned i = 0; i < args.size(); i++) {
-      argPointerList.push_back(args[i].c_str());
-    }
-
-    unsigned missingIndex = 0;
-    unsigned missingCount = 0;
-    llvm::opt::InputArgList argList = optionTable->ParseArgs(argPointerList, missingIndex, missingCount);
-    for (llvm::opt::Arg *arg : argList) {
-      std::pair<std::wstring, std::wstring> newPair;
-      newPair.first = ToWstring( arg->getOption().getName() );
-      if (arg->getNumValues() > 0) {
-        newPair.second = ToWstring( arg->getValue() );
-      }
-
-      ret.push_back(std::move(newPair));
-    }
-  }
-  return ret;
-}
-
-struct DxcPdbVersionInfo :
-  public IDxcVersionInfo2,
-  public IDxcVersionInfo3
-{
+struct DxcPdbVersionInfo : public IDxcVersionInfo2, public IDxcVersionInfo3 {
 private:
   DXC_MICROCOM_TM_REF_FIELDS()
 
@@ -140,7 +69,8 @@ public:
   std::string m_VersionCommitSha = {};
   std::string m_VersionString = {};
 
-  static HRESULT CopyStringToOutStringPtr(const std::string &Str, _Out_ char **ppOutString) {
+  static HRESULT CopyStringToOutStringPtr(const std::string &Str,
+                                          char **ppOutString) {
     *ppOutString = nullptr;
     char *const pString = (char *)CoTaskMemAlloc(Str.size() + 1);
     if (pString == nullptr)
@@ -152,11 +82,14 @@ public:
     return S_OK;
   }
 
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
-    return DoBasicQueryInterface<IDxcVersionInfo, IDxcVersionInfo2, IDxcVersionInfo3>(this, iid, ppvObject);
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+    return DoBasicQueryInterface<IDxcVersionInfo, IDxcVersionInfo2,
+                                 IDxcVersionInfo3>(this, iid, ppvObject);
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetVersion(_Out_ UINT32 *pMajor, _Out_ UINT32 *pMinor) override {
+  virtual HRESULT STDMETHODCALLTYPE GetVersion(UINT32 *pMajor,
+                                               UINT32 *pMinor) override {
     if (!pMajor || !pMinor)
       return E_POINTER;
     *pMajor = m_Version.Major;
@@ -164,13 +97,15 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetFlags(_Out_ UINT32 *pFlags) {
-    if (!pFlags) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE GetFlags(UINT32 *pFlags) override {
+    if (!pFlags)
+      return E_POINTER;
     *pFlags = m_Version.VersionFlags;
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetCommitInfo(_Out_ UINT32 *pCommitCount, _Outptr_result_z_ char **pCommitHash) {
+  virtual HRESULT STDMETHODCALLTYPE GetCommitInfo(UINT32 *pCommitCount,
+                                                  char **pCommitHash) override {
     if (!pCommitHash)
       return E_POINTER;
 
@@ -180,7 +115,8 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetCustomVersionString(_Outptr_result_z_ char **pVersionString) {
+  virtual HRESULT STDMETHODCALLTYPE
+  GetCustomVersionString(char **pVersionString) override {
     if (!pVersionString)
       return E_POINTER;
     IFR(CopyStringToOutStringPtr(m_VersionString, pVersionString));
@@ -188,61 +124,171 @@ public:
   }
 };
 
-struct PdbRecompilerIncludeHandler : public IDxcIncludeHandler {
-  private:
-  DXC_MICROCOM_TM_REF_FIELDS()
+// Implement the legacy IDxcPdbUtils interface with an instance of
+// the new impelmentation.
+struct DxcPdbUtilsAdapter : public IDxcPdbUtils {
+private:
+  IDxcPdbUtils2 *m_pImpl;
 
-  public:
-  DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
-  DXC_MICROCOM_TM_ALLOC(PdbRecompilerIncludeHandler)
-
-  PdbRecompilerIncludeHandler(IMalloc *pMalloc) : m_dwRef(0), m_pMalloc(pMalloc) {}
-
-  std::unordered_map< std::wstring, unsigned > m_FileMap;
-  IDxcPdbUtils *m_pPdbUtils = nullptr;
-
-  UINT32 m_Major = 0;
-  UINT32 m_Minor = 0;
-  std::string m_Hash;
-  UINT32 m_Flags = 0;
-  UINT32 m_CommitCount = 0;
-
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
-    return DoBasicQueryInterface<IDxcIncludeHandler>(this, iid, ppvObject);
+  HRESULT CopyBlobWideToBSTR(IDxcBlobWide *pBlob, BSTR *pResult) {
+    if (!pResult)
+      return E_POINTER;
+    *pResult = nullptr;
+    if (pBlob) {
+      CComBSTR pBstr(pBlob->GetStringLength(), pBlob->GetStringPointer());
+      *pResult = pBstr.Detach();
+    }
+    return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE LoadSource(
-    _In_z_ LPCWSTR pFilename,                                 // Candidate filename.
-    _COM_Outptr_result_maybenull_ IDxcBlob **ppIncludeSource  // Resultant source object for included file, nullptr if not found.
-    ) override
-  {
-    if (!ppIncludeSource)
-      return E_POINTER;
-    *ppIncludeSource = nullptr;
+public:
+  DxcPdbUtilsAdapter(IDxcPdbUtils2 *pImpl) : m_pImpl(pImpl) {}
+  ULONG STDMETHODCALLTYPE AddRef() override { return m_pImpl->AddRef(); }
+  ULONG STDMETHODCALLTYPE Release() override { return m_pImpl->Release(); }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+    return m_pImpl->QueryInterface(iid, ppvObject);
+  }
 
-    std::wstring Filename = NormalizePath(pFilename);
-    auto it = m_FileMap.find(Filename);
-    if (it == m_FileMap.end())
-      return E_FAIL;
+  HRESULT STDMETHODCALLTYPE Load(IDxcBlob *pPdbOrDxil) override {
+    return m_pImpl->Load(pPdbOrDxil);
+  }
 
-    CComPtr<IDxcBlobEncoding> pSource;
-    IFR(m_pPdbUtils->GetSource(it->second, &pSource));
+  virtual HRESULT STDMETHODCALLTYPE GetSourceCount(UINT32 *pCount) override {
+    return m_pImpl->GetSourceCount(pCount);
+  }
 
-    CComPtr<IDxcBlobEncoding> pOutBlob;
-    IFR(hlsl::DxcCreateBlobEncodingFromBlob(pSource, 0, pSource->GetBufferSize(), /*encoding Known*/true, CP_UTF8, m_pMalloc, &pOutBlob));
+  virtual HRESULT STDMETHODCALLTYPE
+  GetSource(UINT32 uIndex, IDxcBlobEncoding **ppResult) override {
+    return m_pImpl->GetSource(uIndex, ppResult);
+  }
 
-    return pOutBlob.QueryInterface(ppIncludeSource);
+  virtual HRESULT STDMETHODCALLTYPE GetSourceName(UINT32 uIndex,
+                                                  BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetSourceName(uIndex, &pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetFlagCount(UINT32 *pCount) override {
+    return m_pImpl->GetFlagCount(pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetFlag(UINT32 uIndex,
+                                            BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetFlag(uIndex, &pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetArgCount(UINT32 *pCount) override {
+    return m_pImpl->GetArgCount(pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetArg(UINT32 uIndex,
+                                           BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetArg(uIndex, &pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetDefineCount(UINT32 *pCount) override {
+    return m_pImpl->GetDefineCount(pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetDefine(UINT32 uIndex,
+                                              BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetDefine(uIndex, &pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetArgPairCount(UINT32 *pCount) override {
+    return m_pImpl->GetArgPairCount(pCount);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetArgPair(UINT32 uIndex, BSTR *pName,
+                                               BSTR *pValue) override {
+    CComPtr<IDxcBlobWide> pNameBlob;
+    CComPtr<IDxcBlobWide> pValueBlob;
+    IFR(m_pImpl->GetArgPair(uIndex, &pNameBlob, &pValueBlob));
+    IFR(CopyBlobWideToBSTR(pNameBlob, pName));
+    IFR(CopyBlobWideToBSTR(pValueBlob, pValue));
+    return S_OK;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetTargetProfile(BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetTargetProfile(&pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetEntryPoint(BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetEntryPoint(&pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetMainFileName(BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetMainFileName(&pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+
+  virtual BOOL STDMETHODCALLTYPE IsFullPDB() override {
+    return m_pImpl->IsFullPDB();
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE OverrideArgs(DxcArgPair *pArgPairs,
+                                                 UINT32 uNumArgPairs) override {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  OverrideRootSignature(const WCHAR *pRootSignature) override {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  CompileForFullPDB(IDxcResult **ppResult) override {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetFullPDB(IDxcBlob **ppFullPDB) override {
+    return E_NOTIMPL;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetHash(IDxcBlob **ppResult) override {
+    return m_pImpl->GetHash(ppResult);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE GetName(BSTR *pResult) override {
+    CComPtr<IDxcBlobWide> pBlob;
+    IFR(m_pImpl->GetName(&pBlob));
+    return CopyBlobWideToBSTR(pBlob, pResult);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  GetVersionInfo(IDxcVersionInfo **ppVersionInfo) override {
+    return m_pImpl->GetVersionInfo(ppVersionInfo);
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  SetCompiler(IDxcCompiler3 *pCompiler) override {
+    return E_NOTIMPL;
   }
 };
 
-struct DxcPdbUtils : public IDxcPdbUtils, public IDxcPixDxilDebugInfoFactory
+struct DxcPdbUtils : public IDxcPdbUtils2
+#ifdef _WIN32
+    // Skip Pix debug info on linux for dia dependence.
+    ,
+                     public IDxcPixDxilDebugInfoFactory
+#endif
 {
 private:
+  // Making the adapter and this interface the same object and share reference
+  // counting.
+  DxcPdbUtilsAdapter m_Adapter;
+
   DXC_MICROCOM_TM_REF_FIELDS()
 
   struct Source_File {
-    std::wstring Name;
-    CComPtr<IDxcBlob> Content;
+    CComPtr<IDxcBlobWide> Name;
+    CComPtr<IDxcBlobEncoding> Content;
   };
 
   CComPtr<IDxcBlob> m_InputBlob;
@@ -250,11 +296,12 @@ private:
   CComPtr<IDxcBlob> m_ContainerBlob;
   std::vector<Source_File> m_SourceFiles;
 
-  std::wstring m_EntryPoint;
-  std::wstring m_TargetProfile;
-  std::wstring m_Name;
-  std::wstring m_MainFileName;
+  CComPtr<IDxcBlobWide> m_EntryPoint;
+  CComPtr<IDxcBlobWide> m_TargetProfile;
+  CComPtr<IDxcBlobWide> m_Name;
+  CComPtr<IDxcBlobWide> m_MainFileName;
   CComPtr<IDxcBlob> m_HashBlob;
+  CComPtr<IDxcBlob> m_WholeDxil;
   bool m_HasVersionInfo = false;
   hlsl::DxilCompilerVersion m_VersionInfo;
   std::string m_VersionCommitSha;
@@ -266,55 +313,252 @@ private:
   CComPtr<IDxcCompiler3> m_pCompiler;
 
   struct ArgPair {
-    std::wstring Name;
-    std::wstring Value;
+    CComPtr<IDxcBlobWide> Name;
+    CComPtr<IDxcBlobWide> Value;
   };
   std::vector<ArgPair> m_ArgPairs;
-  std::vector<std::wstring> m_Defines;
-  std::vector<std::wstring> m_Args;
-  std::vector<std::wstring> m_Flags;
+  std::vector<CComPtr<IDxcBlobWide>> m_Defines;
+  std::vector<CComPtr<IDxcBlobWide>> m_Args;
+  std::vector<CComPtr<IDxcBlobWide>> m_Flags;
+
+  struct LibraryEntry {
+    std::vector<char> PdbInfo;
+    CComPtr<IDxcBlobWide> pName;
+  };
+
+  std::vector<LibraryEntry> m_LibraryPdbs;
+  // std::vector<CComPtr<IDxcBlobWide> > m_LibraryNames;
+  UINT32 m_uCustomToolchainID = 0;
+  CComPtr<IDxcBlob> m_customToolchainData;
 
   void ResetAllArgs() {
     m_ArgPairs.clear();
     m_Defines.clear();
     m_Args.clear();
     m_Flags.clear();
-    m_EntryPoint.clear();
-    m_TargetProfile.clear();
+    m_EntryPoint = nullptr;
+    m_TargetProfile = nullptr;
   }
 
   void Reset() {
+    m_WholeDxil = 0;
+    m_uCustomToolchainID = 0;
     m_pDebugProgramBlob = nullptr;
     m_InputBlob = nullptr;
     m_ContainerBlob = nullptr;
     m_SourceFiles.clear();
-    m_Name.clear();
-    m_MainFileName.clear();
+    m_Name = nullptr;
+    m_MainFileName = nullptr;
     m_HashBlob = nullptr;
     m_HasVersionInfo = false;
     m_VersionInfo = {};
     m_VersionCommitSha.clear();
     m_VersionString.clear();
     m_pCachedRecompileResult = nullptr;
+    m_LibraryPdbs.clear();
+    m_customToolchainData = nullptr;
     ResetAllArgs();
   }
 
-  bool HasSources() const {
-    return m_SourceFiles.size();
+  HRESULT Utf8ToBlobWide(StringRef str, IDxcBlobWide **ppResult) {
+    CComPtr<IDxcBlobEncoding> pUtf8Blob;
+    IFR(hlsl::DxcCreateBlob(str.data(), str.size(),
+                            /*bPinned*/ true, /*bCopy*/ false,
+                            /*encodingKnown*/ true, CP_UTF8, m_pMalloc,
+                            &pUtf8Blob));
+    return hlsl::DxcGetBlobAsWide(pUtf8Blob, m_pMalloc, ppResult);
+  }
+
+  static HRESULT CopyBlobWide(IDxcBlobWide *pBlob, IDxcBlobWide **ppResult) {
+    if (!ppResult)
+      return E_POINTER;
+    *ppResult = nullptr;
+
+    if (!pBlob)
+      return S_OK;
+
+    return pBlob->QueryInterface(ppResult);
+  }
+
+  static bool IsBitcode(const void *ptr, size_t size) {
+    const uint8_t pattern[] = {
+        'B',
+        'C',
+    };
+    if (size < _countof(pattern))
+      return false;
+    return !memcmp(ptr, pattern, _countof(pattern));
+  }
+
+  static std::vector<std::pair<std::string, std::string>>
+  ComputeArgPairs(ArrayRef<const char *> args) {
+    std::vector<std::pair<std::string, std::string>> ret;
+
+    const llvm::opt::OptTable *optionTable = hlsl::options::getHlslOptTable();
+    assert(optionTable);
+    if (optionTable) {
+      unsigned missingIndex = 0;
+      unsigned missingCount = 0;
+      llvm::opt::InputArgList argList =
+          optionTable->ParseArgs(args, missingIndex, missingCount);
+      for (llvm::opt::Arg *arg : argList) {
+        std::pair<std::string, std::string> newPair;
+        newPair.first = arg->getOption().getName();
+        if (arg->getNumValues() > 0) {
+          newPair.second = arg->getValue();
+        }
+        ret.push_back(std::move(newPair));
+      }
+    }
+    return ret;
+  }
+
+  HRESULT AddSource(StringRef name, StringRef content) {
+    Source_File source;
+    IFR(hlsl::DxcCreateBlob(content.data(), content.size(),
+                            /*bPinned*/ false, /*bCopy*/ true,
+                            /*encodingKnown*/ true, CP_UTF8, m_pMalloc,
+                            &source.Content));
+
+    std::string normalizedPath = hlsl::NormalizePath(name);
+    IFR(Utf8ToBlobWide(normalizedPath, &source.Name));
+    // First file is the main file
+    if (m_SourceFiles.empty()) {
+      m_MainFileName = source.Name;
+    }
+
+    m_SourceFiles.push_back(std::move(source));
+    return S_OK;
+  }
+
+  HRESULT LoadFromPDBInfoPart(const hlsl::DxilShaderPDBInfo *header,
+                              uint32_t partSize) {
+    if (header->Version > hlsl::DxilShaderPDBInfoVersion::Latest) {
+      return E_FAIL;
+    }
+
+    hlsl::RDAT::DxilRuntimeData reader;
+
+    SmallVector<char, 1024> UncompressedBuffer;
+    const void *ptr = nullptr;
+    size_t size = 0;
+    if (header->CompressionType ==
+        hlsl::DxilShaderPDBInfoCompressionType::Zlib) {
+      UncompressedBuffer.resize(header->UncompressedSizeInBytes);
+      if (hlsl::ZlibResult::Success !=
+          hlsl::ZlibDecompress(DxcGetThreadMallocNoRef(), header + 1,
+                               header->SizeInBytes, UncompressedBuffer.data(),
+                               UncompressedBuffer.size())) {
+        return E_FAIL;
+      }
+      ptr = UncompressedBuffer.data();
+      size = UncompressedBuffer.size();
+    } else if (header->CompressionType ==
+               hlsl::DxilShaderPDBInfoCompressionType::Uncompressed) {
+      assert(header->UncompressedSizeInBytes == header->SizeInBytes);
+      ptr = header + 1;
+      size = header->UncompressedSizeInBytes;
+    } else {
+      return E_FAIL;
+    }
+
+    if (!reader.InitFromRDAT(ptr, size)) {
+      return E_FAIL;
+    }
+
+    auto pdbInfo = reader.GetDxilPdbInfoTable()[0];
+    return LoadFromPdbInfoReader(pdbInfo);
+  }
+
+  HRESULT LoadFromPdbInfoReader(hlsl::RDAT::DxilPdbInfo_Reader &reader) {
+    auto sources = reader.getSources();
+    for (size_t i = 0; i < sources.Count(); i++) {
+      const char *name = sources[i].getName();
+      const char *content = sources[i].getContent();
+      IFR(AddSource(name, content));
+    }
+
+    if (reader.sizeWholeDxil()) {
+      assert(!m_WholeDxil);
+      IFR(hlsl::DxcCreateBlobOnHeapCopy(reader.getWholeDxil(),
+                                        reader.sizeWholeDxil(), &m_WholeDxil));
+    }
+
+    m_uCustomToolchainID = reader.getCustomToolchainId();
+    if (size_t size = reader.sizeCustomToolchainData()) {
+      IFR(hlsl::DxcCreateBlobOnHeapCopy(reader.getCustomToolchainData(), size,
+                                        &m_customToolchainData));
+    }
+
+    auto libraries = reader.getLibraries();
+    unsigned libCount = libraries.Count();
+    for (size_t i = 0; i < libCount; i++) {
+      auto libReader = reader.getLibraries()[i];
+      if (libReader.sizeData() == 0)
+        return E_FAIL;
+
+      CComPtr<IDxcBlob> pLibraryPdb;
+      CComPtr<IDxcBlobWide> pLibraryName;
+      IFR(hlsl::DxcCreateBlobOnHeapCopy(libReader.getData(),
+                                        libReader.sizeData(), &pLibraryPdb));
+      IFR(Utf8ToBlobWide(libReader.getName(), &pLibraryName));
+
+      LibraryEntry Entry;
+      Entry.PdbInfo.assign((const char *)libReader.getData(),
+                           (const char *)libReader.getData() +
+                               libReader.sizeData());
+      Entry.pName = pLibraryName;
+      m_LibraryPdbs.push_back(std::move(Entry));
+    }
+
+    auto argPairs = reader.getArgPairs();
+    for (size_t i = 0; i + 1 < argPairs.Count(); i += 2) {
+      const char *name = argPairs[i + 0];
+      const char *value = argPairs[i + 1];
+      IFR(AddArgPair(name, value));
+    }
+
+    assert(!reader.sizeHash() ||
+           reader.sizeHash() == sizeof(hlsl::DxilShaderHash));
+    if (reader.sizeHash() == sizeof(hlsl::DxilShaderHash)) {
+      hlsl::DxilShaderHash hash = {};
+      memcpy(&hash, reader.getHash(), reader.sizeHash());
+      if (!m_HashBlob) {
+        IFR(hlsl::DxcCreateBlobOnHeapCopy(&hash, sizeof(hash), &m_HashBlob));
+      } else {
+        DXASSERT_NOMSG(
+            m_HashBlob->GetBufferSize() == sizeof(hash) &&
+            0 == memcmp(m_HashBlob->GetBufferPointer(), &hash, sizeof(hash)));
+      }
+    }
+
+    if (!m_Name) {
+      IFR(Utf8ToBlobWide(reader.getPdbName(), &m_Name));
+    }
+
+    // Entry point might have been omitted. Set it to main by default.
+    if (!m_EntryPoint) {
+      IFR(Utf8ToBlobWide("main", &m_EntryPoint));
+    }
+
+    return S_OK;
   }
 
   HRESULT PopulateSourcesFromProgramHeaderOrBitcode(IDxcBlob *pProgramBlob) {
     UINT32 bitcode_size = 0;
     const char *bitcode = nullptr;
 
-    if (hlsl::IsValidDxilProgramHeader((hlsl::DxilProgramHeader *)pProgramBlob->GetBufferPointer(), pProgramBlob->GetBufferSize())) {
-      hlsl::GetDxilProgramBitcode((hlsl::DxilProgramHeader *)pProgramBlob->GetBufferPointer(), &bitcode, &bitcode_size);
-    }
-    else if (IsBitcode(pProgramBlob->GetBufferPointer(), pProgramBlob->GetBufferSize())) {
+    if (hlsl::IsValidDxilProgramHeader(
+            (hlsl::DxilProgramHeader *)pProgramBlob->GetBufferPointer(),
+            pProgramBlob->GetBufferSize())) {
+      hlsl::GetDxilProgramBitcode(
+          (hlsl::DxilProgramHeader *)pProgramBlob->GetBufferPointer(), &bitcode,
+          &bitcode_size);
+    } else if (IsBitcode(pProgramBlob->GetBufferPointer(),
+                         pProgramBlob->GetBufferSize())) {
       bitcode = (char *)pProgramBlob->GetBufferPointer();
       bitcode_size = pProgramBlob->GetBufferSize();
-    }
-    else {
+    } else {
       return E_INVALIDARG;
     }
 
@@ -322,31 +566,34 @@ private:
     std::unique_ptr<llvm::Module> pModule;
 
     // NOTE: this doesn't copy the memory, just references it.
-    std::unique_ptr<llvm::MemoryBuffer> mb = llvm::MemoryBuffer::getMemBuffer(StringRef(bitcode, bitcode_size), "-", /*RequiresNullTerminator*/ false);
+    std::unique_ptr<llvm::MemoryBuffer> mb =
+        llvm::MemoryBuffer::getMemBuffer(StringRef(bitcode, bitcode_size), "-",
+                                         /*RequiresNullTerminator*/ false);
 
     // Lazily parse the module
     std::string DiagStr;
-    pModule = hlsl::dxilutil::LoadModuleFromBitcodeLazy(std::move(mb), context, DiagStr);
+    pModule = hlsl::dxilutil::LoadModuleFromBitcodeLazy(std::move(mb), context,
+                                                        DiagStr);
     if (!pModule)
       return E_FAIL;
 
     // Materialize only the stuff we need, so it's fast
     {
       llvm::StringRef DebugMetadataList[] = {
-        hlsl::DxilMDHelper::kDxilSourceContentsMDName,
-        hlsl::DxilMDHelper::kDxilSourceDefinesMDName,
-        hlsl::DxilMDHelper::kDxilSourceArgsMDName,
-        hlsl::DxilMDHelper::kDxilVersionMDName,
-        hlsl::DxilMDHelper::kDxilShaderModelMDName,
-        hlsl::DxilMDHelper::kDxilEntryPointsMDName,
-        hlsl::DxilMDHelper::kDxilSourceMainFileNameMDName,
+          hlsl::DxilMDHelper::kDxilSourceContentsMDName,
+          hlsl::DxilMDHelper::kDxilSourceDefinesMDName,
+          hlsl::DxilMDHelper::kDxilSourceArgsMDName,
+          hlsl::DxilMDHelper::kDxilVersionMDName,
+          hlsl::DxilMDHelper::kDxilShaderModelMDName,
+          hlsl::DxilMDHelper::kDxilEntryPointsMDName,
+          hlsl::DxilMDHelper::kDxilSourceMainFileNameMDName,
       };
       pModule->materializeSelectNamedMetadata(DebugMetadataList);
     }
 
     hlsl::DxilModule &DM = pModule->GetOrCreateDxilModule();
-    m_EntryPoint = ToWstring(DM.GetEntryFunctionName());
-    m_TargetProfile = ToWstring(DM.GetShaderModel()->GetName());
+    IFR(Utf8ToBlobWide(DM.GetEntryFunctionName(), &m_EntryPoint));
+    IFR(Utf8ToBlobWide(DM.GetShaderModel()->GetName(), &m_TargetProfile));
 
     // For each all the named metadata node in the module
     for (llvm::NamedMDNode &node : pModule->named_metadata()) {
@@ -354,52 +601,43 @@ private:
 
       // dx.source.content
       if (node_name == hlsl::DxilMDHelper::kDxilSourceContentsMDName ||
-          node_name == hlsl::DxilMDHelper::kDxilSourceContentsOldMDName)
-      {
+          node_name == hlsl::DxilMDHelper::kDxilSourceContentsOldMDName) {
         for (unsigned i = 0; i < node.getNumOperands(); i++) {
           llvm::MDTuple *tup = cast<llvm::MDTuple>(node.getOperand(i));
           MDString *md_name = cast<MDString>(tup->getOperand(0));
           MDString *md_content = cast<MDString>(tup->getOperand(1));
-
-          // File name
-          Source_File file;
-          file.Name = ToWstring(md_name->getString());
-
-          // File content
-          IFR(hlsl::DxcCreateBlobOnHeapCopy(
-            md_content->getString().data(),
-            md_content->getString().size(),
-            &file.Content));
-
-          m_SourceFiles.push_back(std::move(file));
+          AddSource(md_name->getString(), md_content->getString());
         }
       }
       // dx.source.mainFileName
       else if (node_name == hlsl::DxilMDHelper::kDxilSourceMainFileNameMDName ||
-               node_name == hlsl::DxilMDHelper::kDxilSourceMainFileNameOldMDName)
-      {
+               node_name ==
+                   hlsl::DxilMDHelper::kDxilSourceMainFileNameOldMDName) {
         MDTuple *tup = cast<MDTuple>(node.getOperand(0));
         MDString *str = cast<MDString>(tup->getOperand(0));
-        m_MainFileName = ToWstring(str->getString());
+        std::string normalized = hlsl::NormalizePath(str->getString());
+        m_MainFileName =
+            nullptr; // This may already be set from reading dx.source content.
+                     // If we have a dx.source.mainFileName, we want to use that
+                     // here as the source of truth. Set it to nullptr to avoid
+                     // leak (and assert).
+        IFR(Utf8ToBlobWide(normalized, &m_MainFileName));
       }
       // dx.source.args
       else if (node_name == hlsl::DxilMDHelper::kDxilSourceArgsMDName ||
-               node_name == hlsl::DxilMDHelper::kDxilSourceArgsOldMDName)
-      {
+               node_name == hlsl::DxilMDHelper::kDxilSourceArgsOldMDName) {
         MDTuple *tup = cast<MDTuple>(node.getOperand(0));
-        std::vector<std::string> args;
+        std::vector<const char *> args;
         // Args
         for (unsigned i = 0; i < tup->getNumOperands(); i++) {
           StringRef arg = cast<MDString>(tup->getOperand(i))->getString();
-          args.push_back(arg.str());
+          args.push_back(arg.data());
         }
 
-        std::vector<std::pair<std::wstring, std::wstring> > Pairs = ComputeArgPairs(args);
-        for (std::pair<std::wstring, std::wstring> &p : Pairs) {
-          ArgPair newPair;
-          newPair.Name  = std::move(p.first);
-          newPair.Value = std::move(p.second);
-          AddArgPair(std::move(newPair));
+        std::vector<std::pair<std::string, std::string>> Pairs =
+            ComputeArgPairs(args);
+        for (std::pair<std::string, std::string> &p : Pairs) {
+          IFR(AddArgPair(p.first, p.second));
         }
       }
     }
@@ -407,42 +645,28 @@ private:
     return S_OK;
   }
 
-  static void ReadNullSeparatedStringList(StringRef string_list, std::vector<std::wstring> *out_list) {
-    const char *ptr = string_list.data();
-    for (unsigned i = 0; i < string_list.size();) {
-      const char *item = ptr + i;
-      unsigned item_len = 0;
-      for (; i < string_list.size(); i++) {
-        if (ptr[i] == 0) {
-          i++;
-          break;
-        }
-        item_len++;
-      }
-      out_list->push_back(ToWstring(item, item_len));
-    }
-  }
-
-  HRESULT HandleDxilContainer(IDxcBlob *pContainer, IDxcBlob **ppDebugProgramBlob) {
-    const hlsl::DxilContainerHeader *header = (const hlsl::DxilContainerHeader *)m_ContainerBlob->GetBufferPointer();
+  HRESULT HandleDxilContainer(IDxcBlob *pContainer,
+                              IDxcBlob **ppDebugProgramBlob) {
+    const hlsl::DxilContainerHeader *header =
+        (const hlsl::DxilContainerHeader *)m_ContainerBlob->GetBufferPointer();
     for (auto it = hlsl::begin(header); it != hlsl::end(header); it++) {
       const hlsl::DxilPartHeader *part = *it;
       hlsl::DxilFourCC four_cc = (hlsl::DxilFourCC)part->PartFourCC;
 
       switch (four_cc) {
 
-      case hlsl::DFCC_CompilerVersion:
-      {
-        const hlsl::DxilCompilerVersion *header = (const hlsl::DxilCompilerVersion *)(part+1);
+      case hlsl::DFCC_CompilerVersion: {
+        const hlsl::DxilCompilerVersion *header =
+            (const hlsl::DxilCompilerVersion *)(part + 1);
         m_VersionInfo = *header;
         m_HasVersionInfo = true;
 
-        const char *ptr = (const char *)(header+1);
+        const char *ptr = (const char *)(header + 1);
         unsigned i = 0;
 
         {
           unsigned commitShaLength = 0;
-          const char *commitSha = (const char *)(header+1) + i;
+          const char *commitSha = (const char *)(header + 1) + i;
           for (; i < header->VersionStringListSizeInBytes; i++) {
             if (ptr[i] == 0) {
               i++;
@@ -454,7 +678,7 @@ private:
         }
 
         {
-          const char *versionString = (const char *)(header+1) + i;
+          const char *versionString = (const char *)(header + 1) + i;
           unsigned versionStringLength = 0;
           for (; i < header->VersionStringListSizeInBytes; i++) {
             if (ptr[i] == 0) {
@@ -468,9 +692,16 @@ private:
 
       } break;
 
-      case hlsl::DFCC_ShaderSourceInfo:
-      {
-        const hlsl::DxilSourceInfo *header = (const hlsl::DxilSourceInfo *)(part+1);
+      case hlsl::DFCC_ShaderPDBInfo: {
+        const hlsl::DxilShaderPDBInfo *header =
+            (const hlsl::DxilShaderPDBInfo *)(part + 1);
+        IFR(LoadFromPDBInfoPart(header, part->PartSize));
+      } break;
+
+      // This is now legacy.
+      case hlsl::DFCC_ShaderSourceInfo: {
+        const hlsl::DxilSourceInfo *header =
+            (const hlsl::DxilSourceInfo *)(part + 1);
         hlsl::SourceInfoReader reader;
         if (!reader.Init(header, part->PartSize)) {
           Reset();
@@ -479,137 +710,153 @@ private:
 
         // Args
         for (unsigned i = 0; i < reader.GetArgPairCount(); i++) {
-          ArgPair newPair;
-          {
-            const hlsl::SourceInfoReader::ArgPair &pair = reader.GetArgPair(i);
-            newPair.Name = ToWstring(pair.Name);
-            newPair.Value = ToWstring(pair.Value);
-          }
-          AddArgPair(std::move(newPair));
-        }
-
-        // Entry point might have been omitted. Set it to main by default.
-        if (m_EntryPoint.empty()) {
-          m_EntryPoint = L"main";
+          const hlsl::SourceInfoReader::ArgPair &pair = reader.GetArgPair(i);
+          IFR(AddArgPair(pair.Name, pair.Value));
         }
 
         // Sources
         for (unsigned i = 0; i < reader.GetSourcesCount(); i++) {
           hlsl::SourceInfoReader::Source source_data = reader.GetSource(i);
-
-          Source_File source;
-          source.Name = ToWstring(source_data.Name);
-          IFR(hlsl::DxcCreateBlobOnHeapCopy(
-            source_data.Content.data(),
-            source_data.Content.size(),
-            &source.Content));
-
-          // First file is the main file
-          if (i == 0) {
-            m_MainFileName = source.Name;
-          }
-
-          m_SourceFiles.push_back(std::move(source));
+          IFR(AddSource(source_data.Name, source_data.Content));
         }
 
       } break;
 
-      case hlsl::DFCC_ShaderHash:
-      {
-        const hlsl::DxilShaderHash *hash_header = (const hlsl::DxilShaderHash *)(part+1);
-        IFR(hlsl::DxcCreateBlobOnHeapCopy(hash_header, sizeof(*hash_header), &m_HashBlob));
+      case hlsl::DFCC_ShaderHash: {
+        const hlsl::DxilShaderHash *hash_header =
+            (const hlsl::DxilShaderHash *)(part + 1);
+        IFR(hlsl::DxcCreateBlobOnHeapCopy(hash_header, sizeof(*hash_header),
+                                          &m_HashBlob));
       } break;
 
-      case hlsl::DFCC_ShaderDebugName:
-      {
-        const hlsl::DxilShaderDebugName *name_header = (const hlsl::DxilShaderDebugName *)(part+1);
-        const char *ptr = (char *)(name_header+1);
-        m_Name = ToWstring(ptr, name_header->NameLength);
+      case hlsl::DFCC_ShaderDebugName: {
+        const hlsl::DxilShaderDebugName *name_header =
+            (const hlsl::DxilShaderDebugName *)(part + 1);
+        const char *ptr = (const char *)(name_header + 1);
+        IFR(Utf8ToBlobWide(ptr, &m_Name));
       } break;
 
-      case hlsl::DFCC_ShaderDebugInfoDXIL:
-      {
-        const hlsl::DxilProgramHeader *program_header = (const hlsl::DxilProgramHeader *)(part+1);
+      case hlsl::DFCC_ShaderDebugInfoDXIL: {
+        const hlsl::DxilProgramHeader *program_header =
+            (const hlsl::DxilProgramHeader *)(part + 1);
 
         CComPtr<IDxcBlob> pProgramHeaderBlob;
-        IFR(hlsl::DxcCreateBlobFromPinned(program_header, program_header->SizeInUint32*sizeof(UINT32), &pProgramHeaderBlob));
+        IFR(hlsl::DxcCreateBlobFromPinned(
+            program_header, program_header->SizeInUint32 * sizeof(UINT32),
+            &pProgramHeaderBlob));
         IFR(pProgramHeaderBlob.QueryInterface(ppDebugProgramBlob));
 
       } break; // hlsl::DFCC_ShaderDebugInfoDXIL
-      } // switch (four_cc)
-    } // For each part
+      }        // switch (four_cc)
+    }          // For each part
 
     return S_OK;
   }
 
-  void AddArgPair(ArgPair &&newPair) {
+  HRESULT AddArgPair(StringRef name, StringRef value) {
     const llvm::opt::OptTable *optTable = hlsl::options::getHlslOptTable();
 
-    if (newPair.Name.size() && newPair.Value.size()) {
+    // If the value for define is somehow empty, do not add it.
+    if (name == "D" && value.empty())
+      return S_OK;
+
+    SmallVector<char, 32> fusedArgStorage;
+    if (name.size() && value.size()) {
       // Handling case where old positional arguments used to have
       // <input> written as the option name.
-      if (newPair.Name == L"<input>") {
-        newPair.Name.clear();
+      if (name == "<input>") {
+        name = "";
       }
       // Check if the option and its value must be merged. Newer compiler
       // pre-merge them before writing them to the PDB, but older PDBs might
       // have them separated.
       else {
-        std::string NameUtf8 = ToUtf8String(newPair.Name);
-        llvm::opt::Option opt = optTable->findOption(NameUtf8.c_str());
+        llvm::opt::Option opt = optTable->findOption(name.data());
         if (opt.isValid()) {
           if (opt.getKind() == llvm::opt::Option::JoinedClass) {
-            newPair.Name += newPair.Value;
-            newPair.Value.clear();
+            StringRef newName =
+                (Twine(name) + Twine(value)).toStringRef(fusedArgStorage);
+            name = newName;
+            value = "";
           }
         }
       }
     }
 
+    CComPtr<IDxcBlobWide> pValueBlob;
+    CComPtr<IDxcBlobWide> pNameBlob;
+    if (name.size())
+      IFR(Utf8ToBlobWide(name, &pNameBlob));
+    if (value.size())
+      IFR(Utf8ToBlobWide(value, &pValueBlob));
+
     bool excludeFromFlags = false;
-    if (newPair.Name == L"E") {
-      m_EntryPoint = newPair.Value;
+    if (name == "E") {
+      m_EntryPoint = pValueBlob;
       excludeFromFlags = true;
-    }
-    else if (newPair.Name == L"T") {
-      m_TargetProfile = newPair.Value;
+    } else if (name == "T") {
+      m_TargetProfile = pValueBlob;
       excludeFromFlags = true;
-    }
-    else if (newPair.Name == L"D") {
-      m_Defines.push_back(newPair.Value);
+    } else if (name == "D") {
+      m_Defines.push_back(pValueBlob);
       excludeFromFlags = true;
     }
 
-    std::wstring nameWithDash;
-    if (newPair.Name.size())
-      nameWithDash = std::wstring(L"-") + newPair.Name;
+    CComPtr<IDxcBlobWide> pNameWithDashBlob;
+    if (name.size()) {
+      SmallVector<char, 32> nameWithDashStorage;
+      StringRef nameWithDash =
+          (Twine("-") + Twine(name)).toStringRef(nameWithDashStorage);
+      IFR(Utf8ToBlobWide(nameWithDash, &pNameWithDashBlob));
+    }
 
     if (!excludeFromFlags) {
-      if (nameWithDash.size())
-        m_Flags.push_back(nameWithDash);
-      if (newPair.Value.size())
-        m_Flags.push_back(newPair.Value);
+      if (pNameWithDashBlob)
+        m_Flags.push_back(pNameWithDashBlob);
+      if (pValueBlob)
+        m_Flags.push_back(pValueBlob);
     }
 
-    if (nameWithDash.size())
-      m_Args.push_back(nameWithDash);
-    if (newPair.Value.size())
-      m_Args.push_back(newPair.Value);
+    if (pNameWithDashBlob)
+      m_Args.push_back(pNameWithDashBlob);
+    if (pValueBlob)
+      m_Args.push_back(pValueBlob);
 
-    m_ArgPairs.push_back( std::move(newPair) );
+    ArgPair newPair;
+    newPair.Name = pNameBlob;
+    newPair.Value = pValueBlob;
+    m_ArgPairs.push_back(std::move(newPair));
+
+    return S_OK;
+  }
+
+  bool NeedToLookInILDB() {
+    return !m_SourceFiles.size() && m_LibraryPdbs.empty();
   }
 
 public:
   DXC_MICROCOM_TM_ADDREF_RELEASE_IMPL()
   DXC_MICROCOM_TM_ALLOC(DxcPdbUtils)
 
-  DxcPdbUtils(IMalloc *pMalloc) : m_dwRef(0), m_pMalloc(pMalloc) {}
+  DxcPdbUtils(IMalloc *pMalloc)
+      : m_Adapter(this), m_dwRef(0), m_pMalloc(pMalloc) {}
 
-  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **ppvObject) override {
-    return DoBasicQueryInterface<IDxcPdbUtils, IDxcPixDxilDebugInfoFactory>(this, iid, ppvObject);
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,
+                                           void **ppvObject) override {
+#ifdef _WIN32
+    HRESULT hr =
+        DoBasicQueryInterface<IDxcPdbUtils2, IDxcPixDxilDebugInfoFactory>(
+            this, iid, ppvObject);
+#else
+    HRESULT hr = DoBasicQueryInterface<IDxcPdbUtils2>(this, iid, ppvObject);
+#endif
+    if (FAILED(hr)) {
+      return DoBasicQueryInterface<IDxcPdbUtils>(&m_Adapter, iid, ppvObject);
+    }
+    return hr;
   }
 
-  HRESULT STDMETHODCALLTYPE Load(_In_ IDxcBlob *pPdbOrDxil) override {
+  HRESULT STDMETHODCALLTYPE Load(IDxcBlob *pPdbOrDxil) override {
 
     if (!pPdbOrDxil)
       return E_POINTER;
@@ -633,23 +880,25 @@ public:
       IFR(hlsl::CreateReadOnlyBlobStream(pPdbOrDxil, &pStream));
 
       // PDB
-      if (SUCCEEDED(hlsl::pdb::LoadDataFromStream(m_pMalloc, pStream, &m_ContainerBlob))) {
+      if (SUCCEEDED(hlsl::pdb::LoadDataFromStream(m_pMalloc, pStream,
+                                                  &m_ContainerBlob))) {
         IFR(HandleDxilContainer(m_ContainerBlob, &m_pDebugProgramBlob));
-        if (!HasSources()) {
+        if (NeedToLookInILDB()) {
           if (m_pDebugProgramBlob) {
             IFR(PopulateSourcesFromProgramHeaderOrBitcode(m_pDebugProgramBlob));
-          }
-          else {
+          } else {
             return E_FAIL;
           }
         }
       }
       // DXIL Container
-      else if (hlsl::IsValidDxilContainer((const hlsl::DxilContainerHeader *)pPdbOrDxil->GetBufferPointer(), pPdbOrDxil->GetBufferSize())) {
+      else if (hlsl::IsValidDxilContainer((const hlsl::DxilContainerHeader *)
+                                              pPdbOrDxil->GetBufferPointer(),
+                                          pPdbOrDxil->GetBufferSize())) {
         m_ContainerBlob = pPdbOrDxil;
         IFR(HandleDxilContainer(m_ContainerBlob, &m_pDebugProgramBlob));
         // If we have a Debug DXIL, populate the debug info.
-        if (m_pDebugProgramBlob && !HasSources()) {
+        if (m_pDebugProgramBlob && NeedToLookInILDB()) {
           IFR(PopulateSourcesFromProgramHeaderOrBitcode(m_pDebugProgramBlob));
         }
       }
@@ -657,270 +906,182 @@ public:
       else {
         CComPtr<IDxcBlob> pProgramHeaderBlob;
         IFR(hlsl::DxcCreateBlobFromPinned(
-          (hlsl::DxilProgramHeader *)pPdbOrDxil->GetBufferPointer(),
-          pPdbOrDxil->GetBufferSize(), &pProgramHeaderBlob));
+            (hlsl::DxilProgramHeader *)pPdbOrDxil->GetBufferPointer(),
+            pPdbOrDxil->GetBufferSize(), &pProgramHeaderBlob));
 
         IFR(pProgramHeaderBlob.QueryInterface(&m_pDebugProgramBlob));
         IFR(PopulateSourcesFromProgramHeaderOrBitcode(m_pDebugProgramBlob));
       }
+
+      IFR(SetEntryPointToDefaultIfEmpty());
     }
-    catch (std::bad_alloc) {
-      Reset();
-      return E_OUTOFMEMORY;
-    }
+    CATCH_CPP_RETURN_HRESULT();
 
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetSourceCount(_Out_ UINT32 *pCount) override {
-    if (!pCount) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE GetSourceCount(UINT32 *pCount) override {
+    if (!pCount)
+      return E_POINTER;
     *pCount = (UINT32)m_SourceFiles.size();
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetSource(_In_ UINT32 uIndex, _COM_Outptr_ IDxcBlobEncoding **ppResult) override {
-    if (uIndex >= m_SourceFiles.size()) return E_INVALIDARG;
-    if (!ppResult) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE
+  GetSource(UINT32 uIndex, IDxcBlobEncoding **ppResult) override {
+    if (uIndex >= m_SourceFiles.size())
+      return E_INVALIDARG;
+    if (!ppResult)
+      return E_POINTER;
     *ppResult = nullptr;
     return m_SourceFiles[uIndex].Content.QueryInterface(ppResult);
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetSourceName(_In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pResult) override {
-    if (uIndex >= m_SourceFiles.size()) return E_INVALIDARG;
-    return CopyWstringToBSTR(m_SourceFiles[uIndex].Name, pResult);
+  virtual HRESULT STDMETHODCALLTYPE
+  GetSourceName(UINT32 uIndex, IDxcBlobWide **ppResult) override {
+    if (uIndex >= m_SourceFiles.size())
+      return E_INVALIDARG;
+    return m_SourceFiles[uIndex].Name.QueryInterface(ppResult);
   }
 
-  static inline HRESULT GetStringCount(const std::vector<std::wstring> &list, _Out_ UINT32 *pCount) {
-    if (!pCount) return E_POINTER;
+  static inline HRESULT
+  GetStringCount(const std::vector<CComPtr<IDxcBlobWide>> &list,
+                 UINT32 *pCount) {
+    if (!pCount)
+      return E_POINTER;
     *pCount = (UINT32)list.size();
     return S_OK;
   }
 
-  static inline HRESULT GetStringOption(const std::vector<std::wstring> &list, _In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pResult) {
-    if (uIndex >= list.size()) return E_INVALIDARG;
-    return CopyWstringToBSTR(list[uIndex], pResult);
+  static inline HRESULT
+  GetStringOption(const std::vector<CComPtr<IDxcBlobWide>> &list, UINT32 uIndex,
+                  IDxcBlobWide **ppResult) {
+    if (uIndex >= list.size())
+      return E_INVALIDARG;
+    return list[uIndex].QueryInterface(ppResult);
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetFlagCount(_Out_ UINT32 *pCount) override {  return GetStringCount(m_Flags, pCount); }
-  virtual HRESULT STDMETHODCALLTYPE GetFlag(_In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pResult) override { return GetStringOption(m_Flags, uIndex, pResult); }
-  virtual HRESULT STDMETHODCALLTYPE GetArgCount(_Out_ UINT32 *pCount) override { return GetStringCount(m_Args, pCount); }
-  virtual HRESULT STDMETHODCALLTYPE GetArg(_In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pResult) override { return GetStringOption(m_Args, uIndex, pResult); }
-  virtual HRESULT STDMETHODCALLTYPE GetDefineCount(_Out_ UINT32 *pCount) override { return GetStringCount(m_Defines, pCount); }
-  virtual HRESULT STDMETHODCALLTYPE GetDefine(_In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pResult) override { return GetStringOption(m_Defines, uIndex, pResult); }
+  virtual HRESULT STDMETHODCALLTYPE GetFlagCount(UINT32 *pCount) override {
+    return GetStringCount(m_Flags, pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetFlag(UINT32 uIndex,
+                                            IDxcBlobWide **ppResult) override {
+    return GetStringOption(m_Flags, uIndex, ppResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetArgCount(UINT32 *pCount) override {
+    return GetStringCount(m_Args, pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetArg(UINT32 uIndex,
+                                           IDxcBlobWide **ppResult) override {
+    return GetStringOption(m_Args, uIndex, ppResult);
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetDefineCount(UINT32 *pCount) override {
+    return GetStringCount(m_Defines, pCount);
+  }
+  virtual HRESULT STDMETHODCALLTYPE
+  GetDefine(UINT32 uIndex, IDxcBlobWide **ppResult) override {
+    return GetStringOption(m_Defines, uIndex, ppResult);
+  }
 
-  virtual HRESULT STDMETHODCALLTYPE GetArgPairCount(_Out_ UINT32 *pCount) override {
-    if (!pCount) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE GetArgPairCount(UINT32 *pCount) override {
+    if (!pCount)
+      return E_POINTER;
     *pCount = (UINT32)m_ArgPairs.size();
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetArgPair(_In_ UINT32 uIndex, _Outptr_result_z_ BSTR *pName, _Outptr_result_z_ BSTR *pValue) override {
-    if (!pName || !pValue) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE GetArgPair(
+      UINT32 uIndex, IDxcBlobWide **ppName, IDxcBlobWide **ppValue) override {
+    if (!ppName || !ppValue)
+      return E_POINTER;
+    if (uIndex >= m_ArgPairs.size())
+      return E_INVALIDARG;
     const ArgPair &pair = m_ArgPairs[uIndex];
 
-    *pName = nullptr;
-    *pValue = nullptr;
+    *ppName = nullptr;
+    *ppValue = nullptr;
 
-    if (pair.Name.size())
-      IFR(CopyWstringToBSTR(pair.Name, pName));
+    if (pair.Name) {
+      IFR(pair.Name.QueryInterface(ppName));
+    }
 
-    if (pair.Value.size())
-      IFR(CopyWstringToBSTR(pair.Value, pValue));
+    if (pair.Value) {
+      IFR(pair.Value.QueryInterface(ppValue));
+    }
 
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetTargetProfile(_Outptr_result_z_ BSTR *pResult) override {
-    return CopyWstringToBSTR(m_TargetProfile, pResult);
+  virtual HRESULT STDMETHODCALLTYPE
+  GetTargetProfile(IDxcBlobWide **ppResult) override {
+    return CopyBlobWide(m_TargetProfile, ppResult);
   }
-  virtual HRESULT STDMETHODCALLTYPE GetEntryPoint(_Outptr_result_z_ BSTR *pResult) override {
-    return CopyWstringToBSTR(m_EntryPoint, pResult);
+  virtual HRESULT STDMETHODCALLTYPE
+  GetEntryPoint(IDxcBlobWide **ppResult) override {
+    return CopyBlobWide(m_EntryPoint, ppResult);
   }
-  virtual HRESULT STDMETHODCALLTYPE GetMainFileName(_Outptr_result_z_ BSTR *pResult) {
-    return CopyWstringToBSTR(m_MainFileName, pResult);
+  virtual HRESULT STDMETHODCALLTYPE
+  GetMainFileName(IDxcBlobWide **ppResult) override {
+    return CopyBlobWide(m_MainFileName, ppResult);
   }
 
   virtual BOOL STDMETHODCALLTYPE IsFullPDB() override {
     return m_pDebugProgramBlob != nullptr;
   }
+  virtual BOOL STDMETHODCALLTYPE IsPDBRef() override {
+    return m_LibraryPdbs.size() == 0 && m_SourceFiles.size() == 0 &&
+           !m_WholeDxil;
+  }
 
-  virtual HRESULT STDMETHODCALLTYPE OverrideArgs(_In_ DxcArgPair *pArgPairs, UINT32 uNumArgPairs) override {
-    try {
-      DxcThreadMalloc TM(m_pMalloc);
-
-      ResetAllArgs();
-
-      for (UINT32 i = 0; i < uNumArgPairs; i++) {
-        ArgPair newPair;
-        newPair.Name  = pArgPairs[i].pName ? pArgPairs[i].pName : L"";
-        newPair.Value = pArgPairs[i].pValue ? pArgPairs[i].pValue : L"";
-        AddArgPair(std::move(newPair));
+  HRESULT SetEntryPointToDefaultIfEmpty() {
+    // Entry point might have been omitted. Set it to main by default.
+    // Don't set entry point if this instance is non-debug DXIL and has no
+    // arguments at all.
+    if ((!m_EntryPoint || m_EntryPoint->GetStringLength() == 0) &&
+        !m_ArgPairs.empty()) {
+      // Don't set the name if the target is a lib
+      if (!m_TargetProfile || m_TargetProfile->GetStringLength() < 3 ||
+          0 != wcsncmp(m_TargetProfile->GetStringPointer(), L"lib", 3)) {
+        m_EntryPoint = nullptr;
+        IFR(Utf8ToBlobWide("main", &m_EntryPoint));
       }
-
-      // Clear the cached compile result
-      m_pCachedRecompileResult = nullptr;
     }
-    CATCH_CPP_RETURN_HRESULT()
-
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE OverrideRootSignature(_In_ const WCHAR *pRootSignature) override {
-    try {
-      DxcThreadMalloc TM(m_pMalloc);
-
-      std::vector<ArgPair> newArgPairs;
-      for (ArgPair &pair : m_ArgPairs) {
-        if (pair.Name == L"rootsig-define") {
-          continue;
-        }
-        newArgPairs.push_back(pair);
-      }
-
-      ResetAllArgs();
-
-      for (ArgPair &newArg : newArgPairs) {
-        AddArgPair(std::move(newArg));
-      }
-
-      ArgPair rsPair;
-      rsPair.Name = L"rootsig-define";
-      rsPair.Value = L"__DXC_RS_DEFINE";
-      AddArgPair(std::move(rsPair));
-
-      ArgPair defPair;
-      defPair.Name = L"D";
-      defPair.Value = std::wstring(L"__DXC_RS_DEFINE=") + pRootSignature;
-      AddArgPair(std::move(defPair));
-
-      // Clear the cached compile result
-      m_pCachedRecompileResult = nullptr;
-    }
-    CATCH_CPP_RETURN_HRESULT()
-
-    return S_OK;
-  }
-
-  virtual HRESULT STDMETHODCALLTYPE CompileForFullPDB(_COM_Outptr_ IDxcResult **ppResult) {
-    if (!ppResult) return E_POINTER;
-    *ppResult = nullptr;
-
-    if (!m_InputBlob)
-      return E_FAIL;
-
-    if (m_pCachedRecompileResult)
-      return m_pCachedRecompileResult.QueryInterface(ppResult);
-
-    DxcThreadMalloc TM(m_pMalloc);
-
-    // Fail early if there are no source files.
-    if (m_SourceFiles.empty())
-      return E_FAIL;
-
-    if (!m_pCompiler)
-      IFR(DxcCreateInstance2(m_pMalloc, CLSID_DxcCompiler, IID_PPV_ARGS(&m_pCompiler)));
-
-    std::vector<std::wstring> new_args_storage;
-    for (unsigned i = 0; i < m_ArgPairs.size(); i++) {
-      std::wstring name  = m_ArgPairs[i].Name;
-      std::wstring value = m_ArgPairs[i].Value;
-
-      if (name == L"Zs") continue;
-      if (name == L"Zi") continue;
-
-      if (name.size()) {
-        name.insert(name.begin(), L'-');
-        new_args_storage.push_back(std::move(name));
-      }
-      if (value.size()) {
-        new_args_storage.push_back(std::move(value));
-      }
-    }
-    new_args_storage.push_back(L"-Zi");
-
-    std::vector<const WCHAR *> new_args;
-    for (std::wstring &arg : new_args_storage) {
-      new_args.push_back(arg.c_str());
-    }
-
-    assert(m_MainFileName.size());
-    if (m_MainFileName.size())
-      new_args.push_back(m_MainFileName.c_str());
-
-    CComPtr<PdbRecompilerIncludeHandler> pIncludeHandler = CreateOnMalloc<PdbRecompilerIncludeHandler>(m_pMalloc);
-    if (!pIncludeHandler)
-      return E_OUTOFMEMORY;
-
-    pIncludeHandler->m_pPdbUtils = this;
-    for (unsigned i = 0; i < m_SourceFiles.size(); i++) {
-      std::wstring NormalizedName = NormalizePath(m_SourceFiles[i].Name.c_str());
-      pIncludeHandler->m_FileMap.insert(std::pair<std::wstring, unsigned>(NormalizedName, i));
-    }
-
-    IDxcBlob *main_file = m_SourceFiles[0].Content;
-
-    DxcBuffer source_buf = {};
-    source_buf.Ptr = main_file->GetBufferPointer();
-    source_buf.Size = main_file->GetBufferSize();
-    source_buf.Encoding = CP_UTF8;
-
-    CComPtr<IDxcResult> pResult;
-    IFR(m_pCompiler->Compile(&source_buf, new_args.data(), new_args.size(), pIncludeHandler, IID_PPV_ARGS(&m_pCachedRecompileResult)));
-
-    CComPtr<IDxcOperationResult> pOperationResult;
-    return m_pCachedRecompileResult.QueryInterface(ppResult);
-  }
-
-  virtual HRESULT STDMETHODCALLTYPE GetFullPDB(_COM_Outptr_ IDxcBlob **ppFullPDB) override {
-    if (!m_InputBlob)
-      return E_FAIL;
-    if (!ppFullPDB) return E_POINTER;
-    *ppFullPDB = nullptr;
-    // If we are already a full pdb, just return the input blob
-    if (IsFullPDB()) {
-      return m_InputBlob.QueryInterface(ppFullPDB);
-    }
-
-    CComPtr<IDxcResult> pResult;
-
-    IFR(CompileForFullPDB(&pResult));
-
-    CComPtr<IDxcOperationResult> pOperationResult;
-    IFR(pResult.QueryInterface(&pOperationResult));
-
-    HRESULT CompileResult = S_OK;
-    IFR(pOperationResult->GetStatus(&CompileResult));
-    IFR(CompileResult);
-
-    CComPtr<IDxcBlob> pFullPDB;
-    CComPtr<IDxcBlobUtf16> pFullPDBName;
-    IFR(pResult->GetOutput(DXC_OUT_PDB, IID_PPV_ARGS(&pFullPDB), &pFullPDBName));
-
-    return pFullPDB.QueryInterface(ppFullPDB);
-  }
-
-  virtual HRESULT STDMETHODCALLTYPE GetHash(_COM_Outptr_ IDxcBlob **ppResult) override {
-    if (!ppResult) return E_POINTER;
+  virtual HRESULT STDMETHODCALLTYPE GetHash(IDxcBlob **ppResult) override {
+    if (!ppResult)
+      return E_POINTER;
     *ppResult = nullptr;
     if (m_HashBlob)
       return m_HashBlob.QueryInterface(ppResult);
     return E_FAIL;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetName(_Outptr_result_z_ BSTR *pResult) override {
-    return CopyWstringToBSTR(m_Name, pResult);
+  virtual HRESULT STDMETHODCALLTYPE GetWholeDxil(IDxcBlob **ppResult) override {
+    if (!ppResult)
+      return E_POINTER;
+    *ppResult = nullptr;
+    if (m_WholeDxil)
+      return m_WholeDxil.QueryInterface(ppResult);
+    return S_OK;
   }
 
-  virtual STDMETHODIMP NewDxcPixDxilDebugInfo(
-      _COM_Outptr_ IDxcPixDxilDebugInfo **ppDxilDebugInfo) override
-  {
+  virtual HRESULT STDMETHODCALLTYPE GetName(IDxcBlobWide **ppResult) override {
+    return CopyBlobWide(m_Name, ppResult);
+  }
+
+#ifdef _WIN32
+  virtual STDMETHODIMP
+  NewDxcPixDxilDebugInfo(IDxcPixDxilDebugInfo **ppDxilDebugInfo) override {
     if (!m_pDebugProgramBlob)
       return E_FAIL;
 
     DxcThreadMalloc TM(m_pMalloc);
 
     CComPtr<IDiaDataSource> pDataSource;
-    IFR(DxcCreateInstance2(m_pMalloc, CLSID_DxcDiaDataSource, IID_PPV_ARGS(&pDataSource)));
+    IFR(DxcCreateInstance2(m_pMalloc, CLSID_DxcDiaDataSource,
+                           IID_PPV_ARGS(&pDataSource)));
 
     CComPtr<IStream> pStream;
     IFR(hlsl::CreateReadOnlyBlobStream(m_pDebugProgramBlob, &pStream));
@@ -937,12 +1098,14 @@ public:
   }
 
   virtual STDMETHODIMP NewDxcPixCompilationInfo(
-      _COM_Outptr_ IDxcPixCompilationInfo **ppCompilationInfo) override
-  {
+      IDxcPixCompilationInfo **ppCompilationInfo) override {
     return E_NOTIMPL;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE GetVersionInfo(_COM_Outptr_ IDxcVersionInfo **ppVersionInfo) {
+#endif
+
+  virtual HRESULT STDMETHODCALLTYPE
+  GetVersionInfo(IDxcVersionInfo **ppVersionInfo) override {
     if (!ppVersionInfo)
       return E_POINTER;
 
@@ -952,7 +1115,8 @@ public:
 
     DxcThreadMalloc TM(m_pMalloc);
 
-    CComPtr<DxcPdbVersionInfo> result = CreateOnMalloc<DxcPdbVersionInfo>(m_pMalloc);
+    CComPtr<DxcPdbVersionInfo> result =
+        CreateOnMalloc<DxcPdbVersionInfo>(m_pMalloc);
     if (result == nullptr) {
       return E_OUTOFMEMORY;
     }
@@ -963,30 +1127,77 @@ public:
     return S_OK;
   }
 
-  virtual HRESULT STDMETHODCALLTYPE SetCompiler(_In_ IDxcCompiler3 *pCompiler) override {
-    m_pCompiler = pCompiler;
-    m_pCachedRecompileResult = nullptr; // Clear the previously compiled result
+  virtual HRESULT STDMETHODCALLTYPE
+  GetLibraryPDBCount(UINT32 *pCount) override {
+    if (!pCount)
+      return E_POINTER;
+    *pCount = (UINT32)m_LibraryPdbs.size();
+    return S_OK;
+  }
+  virtual HRESULT STDMETHODCALLTYPE
+  GetLibraryPDB(UINT32 uIndex, IDxcPdbUtils2 **ppOutPdbUtils,
+                IDxcBlobWide **ppLibraryName) override {
+    if (!ppOutPdbUtils)
+      return E_POINTER;
+    if (uIndex >= m_LibraryPdbs.size())
+      return E_INVALIDARG;
+
+    LibraryEntry &Entry = m_LibraryPdbs[uIndex];
+    hlsl::RDAT::DxilRuntimeData rdat;
+    if (!rdat.InitFromRDAT(Entry.PdbInfo.data(), Entry.PdbInfo.size()))
+      return E_FAIL;
+    if (rdat.GetDxilPdbInfoTable().Count() != 1)
+      return E_FAIL;
+
+    auto reader = rdat.GetDxilPdbInfoTable()[0];
+
+    CComPtr<DxcPdbUtils> pNewPdbUtils = DxcPdbUtils::Alloc(m_pMalloc);
+    IFR(pNewPdbUtils->LoadFromPdbInfoReader(reader));
+    pNewPdbUtils.QueryInterface(ppOutPdbUtils);
+
+    if (ppLibraryName) {
+      *ppLibraryName = nullptr;
+      if (Entry.pName) {
+        IFR(Entry.pName.QueryInterface(ppLibraryName));
+      }
+    }
+
+    return S_OK;
+  }
+  virtual HRESULT STDMETHODCALLTYPE GetCustomToolchainID(UINT32 *pID) override {
+    if (!pID)
+      return E_POINTER;
+    *pID = m_uCustomToolchainID;
+    return S_OK;
+  }
+
+  virtual HRESULT STDMETHODCALLTYPE
+  GetCustomToolchainData(IDxcBlob **ppBlob) override {
+    if (!ppBlob)
+      return E_POINTER;
+    *ppBlob = nullptr;
+    if (m_customToolchainData)
+      return m_customToolchainData.QueryInterface(ppBlob);
     return S_OK;
   }
 };
 
-HRESULT CreateDxcPdbUtils(_In_ REFIID riid, _Out_ LPVOID *ppv) {
-  CComPtr<DxcPdbUtils> result = CreateOnMalloc<DxcPdbUtils>(DxcGetThreadMallocNoRef());
-  if (result == nullptr) {
-    *ppv = nullptr;
-    return E_OUTOFMEMORY;
+HRESULT CreateDxcPdbUtils(REFIID riid, LPVOID *ppv) {
+  if (!ppv)
+    return E_POINTER;
+  *ppv = nullptr;
+  if (riid == __uuidof(IDxcPdbUtils)) {
+    CComPtr<DxcPdbUtils> pdbUtils2 =
+        CreateOnMalloc<DxcPdbUtils>(DxcGetThreadMallocNoRef());
+    if (!pdbUtils2)
+      return E_OUTOFMEMORY;
+    return pdbUtils2.p->QueryInterface(riid, ppv);
+  } else {
+    CComPtr<DxcPdbUtils> result =
+        CreateOnMalloc<DxcPdbUtils>(DxcGetThreadMallocNoRef());
+    if (result == nullptr)
+      return E_OUTOFMEMORY;
+    return result.p->QueryInterface(riid, ppv);
   }
-  return result.p->QueryInterface(riid, ppv);
+  return E_NOINTERFACE;
 }
-
-#else
-
-#include "dxc/Support/WinIncludes.h"
-
-HRESULT CreateDxcPdbUtils(_In_ REFIID riid, _Out_ LPVOID *ppv) {
-  return E_NOTIMPL;
-}
-
-#endif
-
-

@@ -409,7 +409,7 @@ static bool hasDirectVisibilityAttribute(const NamedDecl *D,
   case LVForExplicitType:
     if (D->hasAttr<TypeVisibilityAttr>())
       return true;
-    // fallthrough
+    LLVM_FALLTHROUGH; // HLSL Change
   case LVForValue:
   case LVForExplicitValue:
     if (D->hasAttr<VisibilityAttr>())
@@ -1414,6 +1414,10 @@ void NamedDecl::printQualifiedName(raw_ostream &OS,
         OS << "(anonymous namespace)";
       else
         OS << *ND;
+    // HLSL Change Begin - not add cbuffer name to qualified name.
+    } else if (isa<HLSLBufferDecl>(*I)) {
+      continue;
+    // HLSL Change End.
     } else if (const RecordDecl *RD = dyn_cast<RecordDecl>(*I)) {
       if (!RD->getIdentifier())
         OS << "(anonymous " << RD->getKindName() << ')';
@@ -2872,13 +2876,29 @@ bool FunctionDecl::hasUnusedResultAttr() const {
   QualType RetType = getReturnType();
   if (RetType->isRecordType()) {
     const CXXRecordDecl *Ret = RetType->getAsCXXRecordDecl();
-    const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(this);
-    if (Ret && Ret->hasAttr<WarnUnusedResultAttr>() &&
-        !(MD && MD->getCorrespondingMethodInClass(Ret, true)))
+    // HLSL Change Begin - nodiscard on a type should apply to all methods, even
+    // if they are not marked nodiscard themselves. This is the C++17 behavior.
+    if (Ret && Ret->hasAttr<WarnUnusedResultAttr>())
       return true;
+    // HLSL Change End
   }
   return hasAttr<WarnUnusedResultAttr>();
 }
+
+// HLSL Change Begin - support nodiscard attr.
+Attr *FunctionDecl::getNoDiscardAttr() const {
+  QualType RetType = getReturnType();
+  if (RetType->isRecordType()) {
+    const CXXRecordDecl *Ret = RetType->getAsCXXRecordDecl();
+    const CXXMethodDecl *MD = dyn_cast<CXXMethodDecl>(this);
+    if (Ret && Ret->hasAttr<WarnUnusedResultAttr>() &&
+        (!hasAttr<WarnUnusedResultAttr>() ||
+         !(MD && (MD->getCorrespondingMethodInClass(Ret, true)))))
+      return Ret->getAttr<WarnUnusedResultAttr>();
+  }
+  return getAttr<WarnUnusedResultAttr>();
+}
+// HLSL Change End
 
 /// \brief For an inline function definition in C, or for a gnu_inline function
 /// in C++, determine whether the definition will be externally visible.
@@ -3406,7 +3426,7 @@ SourceRange FieldDecl::getSourceRange() const {
   case ISK_InClassListInit:
     if (const Expr *E = static_cast<const Expr *>(InitStorage.getPointer()))
       return SourceRange(getInnerLocStart(), E->getLocEnd());
-    // FALLTHROUGH
+    LLVM_FALLTHROUGH; // HLSL Change
 
   case ISK_CapturedVLAType:
     return DeclaratorDecl::getSourceRange();

@@ -14,9 +14,11 @@
 #include "InstCombineInternal.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/Triple.h" // HLSL Change
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
@@ -24,7 +26,6 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Analysis/TargetLibraryInfo.h"
 
 using namespace llvm;
 using namespace PatternMatch;
@@ -2053,6 +2054,10 @@ Instruction *InstCombiner::visitICmpInstWithCastAndCast(ICmpInst &ICI) {
 static Instruction *ProcessUGT_ADDCST_ADD(ICmpInst &I, Value *A, Value *B,
                                           ConstantInt *CI2, ConstantInt *CI1,
                                           InstCombiner &IC) {
+  // HLSL Change begin - DXIL has no sadd.with.overflow intrinsic.
+  if (Triple(I.getModule()->getTargetTriple()).isDXIL())
+    return nullptr;
+  // HLSL Change end
   // The transformation we're trying to do here is to transform this into an
   // llvm.sadd.with.overflow.  To do this, we have to replace the original add
   // with a narrower add, and discard the add-with-constant that is part of the
@@ -2145,6 +2150,12 @@ bool InstCombiner::OptimizeOverflowCheck(OverflowCheckFlavor OCF, Value *LHS,
     return true;
   };
 
+  // If the overflow check was an add followed by a compare, the insertion point
+  // may be pointing to the compare.  We want to insert the new instructions
+  // before the add in case there are uses of the add between the add and the
+  // compare.
+  Builder->SetInsertPoint(&OrigI);
+
   switch (OCF) {
   case OCF_INVALID:
     llvm_unreachable("bad overflow check kind!");
@@ -2159,6 +2170,7 @@ bool InstCombiner::OptimizeOverflowCheck(OverflowCheckFlavor OCF, Value *LHS,
       return SetResult(Builder->CreateAdd(LHS, RHS), Builder->getTrue(), true);
   }
   // FALL THROUGH uadd into sadd
+  LLVM_FALLTHROUGH; // HLSL Change
   case OCF_SIGNED_ADD: {
     // X + 0 -> {X, false}
     if (match(RHS, m_Zero()))
@@ -2198,7 +2210,7 @@ bool InstCombiner::OptimizeOverflowCheck(OverflowCheckFlavor OCF, Value *LHS,
                        true);
     if (OR == OverflowResult::AlwaysOverflows)
       return SetResult(Builder->CreateMul(LHS, RHS), Builder->getTrue(), true);
-  } // FALL THROUGH
+  } LLVM_FALLTHROUGH; // HLSL CHANGE
   case OCF_SIGNED_MUL:
     // X * undef -> undef
     if (isa<UndefValue>(RHS))
@@ -2238,6 +2250,10 @@ bool InstCombiner::OptimizeOverflowCheck(OverflowCheckFlavor OCF, Value *LHS,
 ///          replacement required.
 static Instruction *ProcessUMulZExtIdiom(ICmpInst &I, Value *MulVal,
                                          Value *OtherVal, InstCombiner &IC) {
+  // HLSL Change begin - DXIL has no umul.with.overflow intrinsic.
+  if (Triple(I.getModule()->getTargetTriple()).isDXIL())
+    return nullptr;
+  // HLSL Change end
   // Don't bother doing this transformation for pointers, don't do it for
   // vectors.
   if (!isa<IntegerType>(MulVal->getType()))
@@ -2704,28 +2720,28 @@ Instruction *InstCombiner::visitICmpInst(ICmpInst &I) {
 
     case ICmpInst::ICMP_UGT:
       std::swap(Op0, Op1);                   // Change icmp ugt -> icmp ult
-      // FALL THROUGH
+      LLVM_FALLTHROUGH; // HLSL CHANGE
     case ICmpInst::ICMP_ULT:{               // icmp ult i1 A, B -> ~A & B
       Value *Not = Builder->CreateNot(Op0, I.getName()+"tmp");
       return BinaryOperator::CreateAnd(Not, Op1);
     }
     case ICmpInst::ICMP_SGT:
       std::swap(Op0, Op1);                   // Change icmp sgt -> icmp slt
-      // FALL THROUGH
+      LLVM_FALLTHROUGH; // HLSL CHANGE
     case ICmpInst::ICMP_SLT: {               // icmp slt i1 A, B -> A & ~B
       Value *Not = Builder->CreateNot(Op1, I.getName()+"tmp");
       return BinaryOperator::CreateAnd(Not, Op0);
     }
     case ICmpInst::ICMP_UGE:
       std::swap(Op0, Op1);                   // Change icmp uge -> icmp ule
-      // FALL THROUGH
+      LLVM_FALLTHROUGH; // HLSL CHANGE
     case ICmpInst::ICMP_ULE: {               //  icmp ule i1 A, B -> ~A | B
       Value *Not = Builder->CreateNot(Op0, I.getName()+"tmp");
       return BinaryOperator::CreateOr(Not, Op1);
     }
     case ICmpInst::ICMP_SGE:
       std::swap(Op0, Op1);                   // Change icmp sge -> icmp sle
-      // FALL THROUGH
+      LLVM_FALLTHROUGH; // HLSL CHANGE
     case ICmpInst::ICMP_SLE: {               //  icmp sle i1 A, B -> A | ~B
       Value *Not = Builder->CreateNot(Op1, I.getName()+"tmp");
       return BinaryOperator::CreateOr(Not, Op0);
@@ -3476,7 +3492,7 @@ Instruction *InstCombiner::visitICmpInst(ICmpInst &I) {
       case Instruction::LShr:
         if (I.isSigned())
           break;
-        // fall-through
+        LLVM_FALLTHROUGH; // HLSL Change
       case Instruction::SDiv:
       case Instruction::AShr:
         if (!BO0->isExact() || !BO1->isExact())

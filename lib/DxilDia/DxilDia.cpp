@@ -18,8 +18,8 @@ HRESULT dxil_dia::StringRefToBSTR(llvm::StringRef value, BSTR *pRetVal) {
   try {
     wchar_t *wide;
     size_t sideSize;
-    if (!Unicode::UTF8BufferToUTF16Buffer(value.data(), value.size(), &wide,
-      &sideSize))
+    if (!Unicode::UTF8BufferToWideBuffer(value.data(), value.size(), &wide,
+                                         &sideSize))
       return E_FAIL;
     *pRetVal = SysAllocString(wide);
     delete[] wide;
@@ -28,6 +28,4 @@ HRESULT dxil_dia::StringRefToBSTR(llvm::StringRef value, BSTR *pRetVal) {
   return S_OK;
 }
 
-HRESULT dxil_dia::ENotImpl() {
-  return E_NOTIMPL;
-}
+HRESULT dxil_dia::ENotImpl() { return E_NOTIMPL; }

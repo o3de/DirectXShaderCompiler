@@ -15,14 +15,15 @@
 #ifndef LLVM_CLANG_LIB_SEMA_VKCONSTANTSTABLES_H
 #define LLVM_CLANG_LIB_SEMA_VKCONSTANTSTABLES_H
 
+#include <string>
+#include <utility>
+#include <vector>
+
 std::vector<std::pair<std::string, uint32_t>> GetVkIntegerConstants() {
   return {
-      {"CrossDeviceScope", 0u},
-      {"DeviceScope",      1u},
-      {"WorkgroupScope",   2u},
-      {"SubgroupScope",    3u},
-      {"InvocationScope",  4u},
-      {"QueueFamilyScope", 5u},
+      {"CrossDeviceScope", 0u}, {"DeviceScope", 1u},
+      {"WorkgroupScope", 2u},   {"SubgroupScope", 3u},
+      {"InvocationScope", 4u},  {"QueueFamilyScope", 5u},
   };
 }
 

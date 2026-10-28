@@ -13,14 +13,15 @@
 #include "dxc/Support/Unicode.h"
 #include "dxc/Support/WinIncludes.h"
 
+#include "dxc/DxilContainer/DxilContainer.h"
+#include "dxc/Support/HLSLOptions.h"
+#include "dxc/Support/dxcapi.extval.h"
+#include "dxc/Support/dxcapi.use.h"
 #include "dxc/dxcapi.h"
 #include "dxc/dxcapi.internal.h"
-#include "dxc/Support/dxcapi.use.h"
-#include "dxc/Support/HLSLOptions.h"
-#include "dxc/DxilContainer/DxilContainer.h"
 
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support//MSFileSystem.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 
 using namespace dxc;
@@ -32,18 +33,20 @@ static cl::opt<bool> Help("help", cl::desc("Print help"));
 static cl::alias Help_h("h", cl::aliasopt(Help));
 static cl::alias Help_q("?", cl::aliasopt(Help));
 
-static cl::opt<std::string>
-InputFilename(cl::Positional, cl::desc("<input dxil file>"));
+static cl::opt<std::string> InputFilename(cl::Positional,
+                                          cl::desc("<input dxil file>"));
 
-static cl::opt<std::string> OutputFilename("o",
-                                           cl::desc("Override output filename for signed container"),
-                                           cl::value_desc("filename"));
+static cl::opt<std::string>
+    OutputFilename("o",
+                   cl::desc("Override output filename for signed container"),
+                   cl::value_desc("filename"));
 
 class DxvContext {
 private:
-  DxcDllSupport &m_dxcSupport;
+  DxcDllExtValidationLoader &m_dxcSupport;
+
 public:
-  DxvContext(DxcDllSupport &dxcSupport)
+  DxvContext(DxcDllExtValidationLoader &dxcSupport)
       : m_dxcSupport(dxcSupport) {}
 
   void Validate();
@@ -52,7 +55,7 @@ public:
 void DxvContext::Validate() {
   {
     CComPtr<IDxcBlobEncoding> pSource;
-    ReadFileIntoBlob(m_dxcSupport, StringRefUtf16(InputFilename), &pSource);
+    ReadFileIntoBlob(m_dxcSupport, StringRefWide(InputFilename), &pSource);
 
     bool bSourceIsDxilContainer = hlsl::IsValidDxilContainer(
         hlsl::IsDxilContainerLike(pSource->GetBufferPointer(),
@@ -92,7 +95,8 @@ void DxvContext::Validate() {
     CComPtr<IDxcOperationResult> pResult;
 
     IFT(m_dxcSupport.CreateInstance(CLSID_DxcValidator, &pValidator));
-    IFT(pValidator->Validate(pContainerBlob, DxcValidatorFlags_InPlaceEdit, &pResult));
+    IFT(pValidator->Validate(pContainerBlob, DxcValidatorFlags_InPlaceEdit,
+                             &pResult));
 
     HRESULT status;
     IFT(pResult->GetStatus(&status));
@@ -104,17 +108,20 @@ void DxvContext::Validate() {
       std::string msg(pStart);
       IFTMSG(status, msg);
     } else {
-      // Source was unsigned DxilContainer, write signed container if it's now signed:
+      // Source was unsigned DxilContainer, write signed container if it's now
+      // signed:
       if (!OutputFilename.empty()) {
         if (bSourceIsDxilContainer) {
           const hlsl::DxilContainerHeader *pHeader = hlsl::IsDxilContainerLike(
               pSource->GetBufferPointer(), pSource->GetBufferSize());
-          WriteBlobToFile(pSource, StringRefUtf16(OutputFilename), CP_ACP);
+          WriteBlobToFile(pSource, StringRefWide(OutputFilename), CP_ACP);
           if (memcmp(&pHeader->Hash, &origHash,
                      sizeof(hlsl::DxilContainerHash)) != 0) {
-            printf("Signed DxilContainer written to \"%s\"\n", OutputFilename.c_str());
+            printf("Signed DxilContainer written to \"%s\"\n",
+                   OutputFilename.c_str());
           } else {
-            printf("Unchanged DxilContainer written to \"%s\"\n", OutputFilename.c_str());
+            printf("Unchanged DxilContainer written to \"%s\"\n",
+                   OutputFilename.c_str());
           }
         } else {
           printf("Source was not a DxilContainer, no output file written.\n");
@@ -125,12 +132,17 @@ void DxvContext::Validate() {
   }
 }
 
-int __cdecl main(int argc,  _In_reads_z_(argc) const char **argv) {
+#ifdef _WIN32
+int __cdecl main(int argc, const char **argv) {
+#else
+int main(int argc, const char **argv) {
+#endif
   const char *pStage = "Operation";
   if (llvm::sys::fs::SetupPerThreadFileSystem())
     return 1;
   llvm::sys::fs::AutoCleanupPerThreadFileSystem auto_cleanup_fs;
-  if (FAILED(DxcInitThreadMalloc())) return 1;
+  if (FAILED(DxcInitThreadMalloc()))
+    return 1;
   DxcSetThreadMallocToDefault();
   try {
     llvm::sys::fs::MSFileSystem *msfPtr;
@@ -150,8 +162,30 @@ int __cdecl main(int argc,  _In_reads_z_(argc) const char **argv) {
       return 2;
     }
 
-    DxcDllSupport dxcSupport;
-    dxc::EnsureEnabled(dxcSupport);
+    DxcDllExtValidationLoader dxcSupport;
+    HRESULT dllResult = dxcSupport.initialize();
+    if (DXC_FAILED(dllResult)) {
+      switch (dxcSupport.getFailureReason()) {
+      case dxcSupport.InitializationFailures::FailedCompilerLoad: {
+        fprintf(stderr, "dxcompiler.dll failed to load\n");
+        break;
+      }
+      case dxcSupport.InitializationFailures::FailedDxilPath: {
+        fprintf(stderr, "dxil.dll path %s could not be found",
+                dxcSupport.getDxilDllPath().c_str());
+        break;
+      }
+      case dxcSupport.InitializationFailures::FailedDxilLoad: {
+        fprintf(stderr, "%s failed to load",
+                dxcSupport.getDxilDllPath().c_str());
+        break;
+      }
+      default: {
+        llvm_unreachable("unexpected failure reason");
+      }
+      }
+      return dllResult;
+    }
 
     DxvContext context(dxcSupport);
     pStage = "Validation";
@@ -160,8 +194,8 @@ int __cdecl main(int argc,  _In_reads_z_(argc) const char **argv) {
     try {
       const char *msg = hlslException.what();
       Unicode::acp_char printBuffer[128]; // printBuffer is safe to treat as
-                                          // UTF-8 because we use ASCII only errors
-                                          // only
+                                          // UTF-8 because we use ASCII only
+                                          // errors only
       if (msg == nullptr || *msg == '\0') {
         sprintf_s(printBuffer, _countof(printBuffer),
                   "Validation failed - error code 0x%08x.", hlslException.hr);

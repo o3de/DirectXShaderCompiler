@@ -15,6 +15,8 @@
 #ifndef LLVM_CLANG_BASIC_LANGOPTIONS_H
 #define LLVM_CLANG_BASIC_LANGOPTIONS_H
 
+#include "dxc/DXIL/DxilConstants.h" // For DXIL:: default values.
+#include "dxc/Support/HLSLVersion.h"
 #include "clang/Basic/CommentOptions.h"
 #include "clang/Basic/LLVM.h"
 #include "clang/Basic/ObjCRuntime.h"
@@ -39,6 +41,7 @@ public:
 #else
 
 #define LANGOPT(Name, Bits, Default, Description) static const unsigned Name = Default;
+#define LANGOPT_BOOL(Name, Default, Description) static const bool Name = static_cast<bool>( Default );
 #define ENUM_LANGOPT(Name, Type, Bits, Default, Description)
 #include "clang/Basic/LangOptions.fixed.def"
 
@@ -149,20 +152,29 @@ public:
 #endif
 
   // HLSL Change Starts
-  unsigned HLSLVersion; 
+  hlsl::LangStd HLSLVersion = hlsl::LangStd::vLatest;
   std::string HLSLEntryFunction;
   std::string HLSLProfile;
-  unsigned RootSigMajor;
-  unsigned RootSigMinor;
-  bool IsHLSLLibrary;
-  bool UseMinPrecision; // use min precision, not native precision.
-  bool EnableDX9CompatMode;
-  bool EnableFXCCompatMode;
-  bool EnablePayloadAccessQualifiers;
+  unsigned RootSigMajor = 1;
+  unsigned RootSigMinor = 1;
+  bool IsHLSLLibrary = false;
+  bool UseMinPrecision = true; // use min precision, not native precision.
+  bool EnableDX9CompatMode = false;
+  bool EnableFXCCompatMode = false;
+  bool EnablePayloadAccessQualifiers = false;
+  bool DumpImplicitTopLevelDecls = true;
+  bool ExportShadersOnly = false;
+  hlsl::DXIL::DefaultLinkage DefaultLinkage =
+      hlsl::DXIL::DefaultLinkage::Default;
+  /// Whether use row major as default matrix major.
+  bool HLSLDefaultRowMajor = false;
+  unsigned MaxHLSLVectorLength = hlsl::DXIL::kDefaultMaxVectorLength;
   // HLSL Change Ends
 
   bool SPIRV = false;  // SPIRV Change
-  
+  unsigned SpirvMajorVersion; // SPIRV Change
+  unsigned SpirvMinorVersion; // SPIRV Change
+
   bool isSignedOverflowDefined() const {
     return getSignedOverflowBehavior() == SOB_Defined;
   }

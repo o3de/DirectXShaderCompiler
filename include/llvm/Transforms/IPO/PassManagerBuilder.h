@@ -129,13 +129,19 @@ public:
   bool HLSLHighLevel = false; // HLSL Change
   bool HLSLAllowPreserveValues = false; // HLSL Change
   bool HLSLOnlyWarnOnUnrollFail = false; // HLSL Change
+  bool HLSLUnrollCountIsHint = false;    // HLSL Change
   hlsl::HLSLExtensionsCodegenHelper *HLSLExtensionsCodeGen = nullptr; // HLSL Change
   bool HLSLResMayAlias = false; // HLSL Change
   unsigned ScanLimit = 0; // HLSL Change
   bool EnableGVN = true; // HLSL Change
   bool StructurizeLoopExitsForUnroll = false; // HLSL Change
+  bool HLSLEnableAggressiveReassociation = true; // HLSL Change
   bool HLSLEnableLifetimeMarkers = false; // HLSL Change
+  bool HLSLEnablePartialLifetimeMarkers = false; // HLSL Change
   bool HLSLEnableDebugNops = false; // HLSL Change
+  bool HLSLEarlyInlining = true; // HLSL Change
+  bool HLSLNoSink = false; // HLSL Change
+  void addHLSLPasses(legacy::PassManagerBase &MPM); // HLSL Change
 
 private:
   /// ExtensionList - This is list of all of the extensions that are registered.

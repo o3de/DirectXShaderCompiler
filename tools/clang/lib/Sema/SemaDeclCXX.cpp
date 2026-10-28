@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "clang/Basic/OperatorKinds.h"
 #include "clang/Sema/SemaInternal.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -1783,13 +1784,10 @@ Sema::CheckDerivedToBaseConversion(QualType Derived, QualType Base,
   // explore multiple paths to determine if there is an ambiguity.
   CXXBasePaths Paths(/*FindAmbiguities=*/true, /*RecordPaths=*/true,
                      /*DetectVirtual=*/false);
-
   bool DerivationOkay = IsDerivedFrom(Derived, Base, Paths);
-  // HLSL Change Begin - fix crash when Paths is empty.
-  // Merged from upstream.
-  if (!DerivationOkay)
-    return true;
-  // HLSL Change End.
+  assert(DerivationOkay &&
+         "Can only be used with a derived-to-base conversion");
+  (void)DerivationOkay;
   
   if (!Paths.isAmbiguous(Context.getCanonicalType(Base).getUnqualifiedType())) {
     if (InaccessibleBaseID) {
@@ -3405,7 +3403,7 @@ BuildImplicitBaseInitializer(Sema &SemaRef, CXXConstructorDecl *Constructor,
       break;
     }
   }
-  // Fall through.
+  LLVM_FALLTHROUGH; // HLSL Change
   case IIK_Default: {
     InitializationKind InitKind
       = InitializationKind::CreateDefault(Constructor->getLocation());
@@ -6958,6 +6956,14 @@ static void extendRight(SourceRange &R, const SourceRange &After) {
 /// well-formed type for the conversion operator.
 void Sema::CheckConversionDeclarator(Declarator &D, QualType &R,
                                      StorageClass& SC) {
+  // HLSL Change Starts
+  if (getLangOpts().HLSL) {
+    Diag(D.getIdentifierLoc(), diag::err_hlsl_unsupported_conversion_operator);
+    D.setInvalidType();
+    return;
+  }
+  // HLSL Change Ends
+
   // C++ [class.conv.fct]p1:
   //   Neither parameter types nor return type can be specified. The
   //   type of a conversion function (8.3.5) is "function taking no
@@ -7024,7 +7030,7 @@ void Sema::CheckConversionDeclarator(Declarator &D, QualType &R,
           PastFunctionChunk = true;
           break;
         }
-        // Fall through.
+        LLVM_FALLTHROUGH; // HLSL Change
       case DeclaratorChunk::Array:
         NeedsTypedef = true;
         extendRight(After, Chunk.getSourceRange());
@@ -11320,7 +11326,7 @@ static bool hasOneRealArgument(MultiExprArg Args) {
     if (!Args[1]->isDefaultArgument())
       return false;
     
-    // fall through
+    LLVM_FALLTHROUGH; // HLSL Change
   case 1:
     return !Args[0]->isDefaultArgument();
   }
@@ -11637,6 +11643,24 @@ bool Sema::CheckOverloadedOperatorDeclaration(FunctionDecl *FnDecl) {
          "Expected an overloaded operator declaration");
 
   OverloadedOperatorKind Op = FnDecl->getOverloadedOperator();
+
+  // HLSL Change Starts
+  if (LangOpts.HLSL) {
+    if (Op == OO_Delete || Op == OO_Array_Delete || Op == OO_New ||
+        Op == OO_Array_New || Op == OO_Equal ||
+        (Op >= OO_PlusEqual && Op <= OO_GreaterGreaterEqual) ||
+        Op == OO_PlusPlus || Op == OO_MinusMinus || Op == OO_ArrowStar ||
+        Op == OO_Arrow) {
+      return Diag(FnDecl->getLocation(),
+                  diag::err_hlsl_overloading_operator_disallowed)
+             << FnDecl->getDeclName() << 0;
+    }
+    if (!isa<CXXMethodDecl>(FnDecl))
+      return Diag(FnDecl->getLocation(),
+                  diag::err_hlsl_overloading_operator_disallowed)
+             << FnDecl->getDeclName() << 1;
+  }
+  // HLSL Change Ends
 
   // C++ [over.oper]p5:
   //   The allocation and deallocation functions, operator new,
@@ -13586,6 +13610,7 @@ bool Sema::checkThisInStaticMemberFunctionExceptionSpec(CXXMethodDecl *Method) {
   case EST_ComputedNoexcept:
     if (!Finder.TraverseStmt(Proto->getNoexceptExpr()))
       return true;
+      LLVM_FALLTHROUGH; // HLSL Change
     
   case EST_Dynamic:
     for (const auto &E : Proto->exceptions()) {

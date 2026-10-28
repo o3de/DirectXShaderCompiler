@@ -53,6 +53,7 @@
 #include "llvm/ProfileData/InstrProfReader.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/TimeProfiler.h" // HLSL Change
 #include "dxc/DXIL/DxilConstants.h"    // HLSL Change
 
 using namespace clang;
@@ -989,7 +990,7 @@ void CodeGenModule::addCompilerUsedGlobal(llvm::GlobalValue *GV) {
 }
 
 static void emitUsed(CodeGenModule &CGM, StringRef Name,
-                     std::vector<llvm::WeakVH> &List) {
+                     std::vector<llvm::WeakTrackingVH> &List) {
   // Don't create llvm.used if there is no need.
   if (List.empty())
     return;
@@ -1556,8 +1557,10 @@ void CodeGenModule::CompleteDIClassType(const CXXMethodDecl* D) {
 
   if (CGDebugInfo *DI = getModuleDebugInfo())
     if (getCodeGenOpts().getDebugInfo() >= CodeGenOptions::LimitedDebugInfo) {
-      const auto *ThisPtr = cast<PointerType>(D->getThisType(getContext()));
-      DI->getOrCreateRecordType(ThisPtr->getPointeeType(), D->getLocation());
+      // HLSL Change Begin - This is a reference.
+      QualType ThisType = D->getThisObjectType(getContext());
+      DI->getOrCreateRecordType(ThisType, D->getLocation());
+      // HLSL Change End - This is a reference.
     }
 }
 
@@ -1573,6 +1576,12 @@ void CodeGenModule::EmitGlobalDefinition(GlobalDecl GD, llvm::GlobalValue *GV) {
     // linkage.
     if (!shouldEmitFunction(GD))
       return;
+    
+    // HLSL Change Begin - Support hierarchial time tracing.
+    const auto *FD = dyn_cast<FunctionDecl>(D);
+    llvm::TimeTraceScope TimeScope(
+        "CodeGen Function", [FD]() { return FD->getQualifiedNameAsString(); });
+    // HLSL Change End - Support hierarchial time tracing.
 
     if (const auto *Method = dyn_cast<CXXMethodDecl>(D)) {
       CompleteDIClassType(Method);
@@ -3367,6 +3376,12 @@ void CodeGenModule::EmitLinkageSpec(const LinkageSpecDecl *LSD) {
 
 /// EmitTopLevelDecl - Emit code for a single top level declaration.
 void CodeGenModule::EmitTopLevelDecl(Decl *D) {
+  llvm::TimeTraceScope TimeScope("CGM::EmitTopLevelDecl", [&] {
+    if (const auto *ND = dyn_cast<NamedDecl>(D))
+      return ND->getName();
+    return StringRef("Unnamed decl");
+  });
+
   // Ignore dependent declarations.
   if (D->getDeclContext() && D->getDeclContext()->isDependentContext())
     return;
@@ -3390,6 +3405,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     // Skip variable templates
     if (cast<VarDecl>(D)->getDescribedVarTemplate())
       return;
+    LLVM_FALLTHROUGH; // HLSL Change
   case Decl::VarTemplateSpecialization:
     EmitGlobal(cast<VarDecl>(D));
     // HLSL Change Start - add resource or subobject for global variables

@@ -3,7 +3,7 @@
 if(WIN32)
 find_package(TAEF REQUIRED)
 find_package(DiaSDK REQUIRED) # Used for constants and declarations.
-find_package(D3D12 REQUIRED) # Used for ExecutionTest.cpp.
+find_package(D3D12 REQUIRED)  # Used in DxilContainerTest for DXBC compilation/reflection
 endif(WIN32)
 
 set( LLVM_LINK_COMPONENTS
@@ -14,6 +14,7 @@ set( LLVM_LINK_COMPONENTS
   dxilcontainer
   dxilrootsignature
   hlsl
+  dxilhash
   option
   bitreader
   bitwriter
@@ -28,13 +29,13 @@ set(HLSL_IGNORE_SOURCES
   TestMain.cpp
   HLSLTestOptions.cpp
 )
-add_clang_library(clang-hlsl-tests SHARED
+add_clang_library(ClangHLSLTests SHARED
   AllocatorTest.cpp
   CompilerTest.cpp
   DxilContainerTest.cpp
   DxilModuleTest.cpp
+  DxilResourceTests.cpp
   DXIsenseTest.cpp
-  ExecutionTest.cpp
   ExtensionTest.cpp
   FunctionTest.cpp
   LinkerTest.cpp
@@ -42,50 +43,54 @@ add_clang_library(clang-hlsl-tests SHARED
   Objects.cpp
   OptimizerTest.cpp
   OptionsTest.cpp
+  PixDiaTest.cpp
   PixTest.cpp
+  PixTestUtils.cpp
   RewriterTest.cpp
-  ShaderOpTest.cpp
   SystemValueTest.cpp
   ValidationTest.cpp
   VerifierTest.cpp
-  clang-hlsl-tests.rc
-  )
-else (WIN32)
-set(HLSL_IGNORE_SOURCES
-  ExecutionTest.cpp
-  LinkerTest.cpp
-  MSFileSysTest.cpp
-  PixTest.cpp
-  RewriterTest.cpp
-  ShaderOpTest.cpp
-  DxilContainerTest.cpp
-  ValidationTest.cpp
-  CompilerTest.cpp
   )
 
-add_clang_unittest(clang-hlsl-tests
+  add_dependencies(ClangUnitTests ClangHLSLTests)
+else (WIN32)
+set(HLSL_IGNORE_SOURCES
+  MSFileSysTest.cpp
+  PixDiaTest.cpp
+  )
+
+add_clang_unittest(ClangHLSLTests
   AllocatorTest.cpp
+  CompilerTest.cpp
+  DxilContainerTest.cpp
   DxilModuleTest.cpp
+  DxilResourceTests.cpp
   DXIsenseTest.cpp
   ExtensionTest.cpp
   FunctionTest.cpp
   HLSLTestOptions.cpp
+  LinkerTest.cpp
   Objects.cpp
   OptimizerTest.cpp
   OptionsTest.cpp
+  RewriterTest.cpp
+  PixTest.cpp
+  PixTestUtils.cpp
   SystemValueTest.cpp
   TestMain.cpp
+  ValidationTest.cpp
   VerifierTest.cpp
   )
 
 endif(WIN32)
 
-set_target_properties(clang-hlsl-tests PROPERTIES FOLDER "Clang tests")
+set_target_properties(ClangHLSLTests PROPERTIES FOLDER "Clang tests")
 
 if (WIN32)
-target_link_libraries(clang-hlsl-tests PRIVATE
+target_link_libraries(ClangHLSLTests PRIVATE
   dxcompiler
   HLSLTestLib
+  LLVMDxilContainer
   LLVMDxilDia
   ${TAEF_LIBRARIES}
   ${DIASDK_LIBRARIES}
@@ -93,8 +98,9 @@ target_link_libraries(clang-hlsl-tests PRIVATE
   shlwapi
   )
 else(WIN32)
-target_link_libraries(clang-hlsl-tests
+target_link_libraries(ClangHLSLTests
   dxcompiler
+  LLVMDxilDia
   HLSLTestLib
   )
 endif(WIN32)
@@ -108,25 +114,23 @@ include_directories(${LLVM_MAIN_INCLUDE_DIR}/dxc/Test)
 endif(WIN32)
 
 # Add includes to directly reference intrinsic tables.
-include_directories(../../lib/Sema)
+include_directories(${CLANG_BINARY_DIR}/lib/Sema)
 
-add_dependencies(clang-hlsl-tests dxcompiler)
+add_dependencies(ClangHLSLTests dxcompiler)
 
-if(WIN32)
-install(TARGETS clang-hlsl-tests
-  RUNTIME DESTINATION bin)
-else(WIN32)
-set_output_directory(clang-hlsl-tests
-  ${LLVM_RUNTIME_OUTPUT_INTDIR} ${LLVM_LIBRARY_OUTPUT_INTDIR})
-endif(WIN32)
+if (NOT CLANG_INCLUDE_TESTS)
+  set_output_directory(ClangHLSLTests
+    ${LLVM_RUNTIME_OUTPUT_INTDIR} ${LLVM_LIBRARY_OUTPUT_INTDIR})
+  if (NOT WIN32)
+    add_test(NAME test-hlsl-codegen
+            COMMAND $<TARGET_FILE:ClangHLSLTests> --HlslDataDir
+              ${PROJECT_SOURCE_DIR}/tools/clang/test/HLSL)
+  endif()
+endif()
 
 if(WIN32)
 # Add a .user file with settings for te.exe.
 file(TO_NATIVE_PATH "${CMAKE_CURRENT_SOURCE_DIR}" DOS_STYLE_SOURCE_DIR)
 file(TO_NATIVE_PATH "${TAEF_BIN_DIR}" DOS_TAEF_BIN_DIR)
-configure_file(clang-hlsl-tests.vcxproj.user.txt clang-hlsl-tests.vcxproj.user)
+configure_file(ClangHLSLTests.vcxproj.user.txt ClangHLSLTests.vcxproj.user)
 endif(WIN32)
-
-add_test(NAME test-hlsl-codegen
-  COMMAND clang-hlsl-tests --HlslDataDir
-          ${PROJECT_SOURCE_DIR}/tools/clang/test/HLSL)

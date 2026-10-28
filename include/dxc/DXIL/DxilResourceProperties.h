@@ -16,15 +16,17 @@
 namespace llvm {
 class Constant;
 class Type;
-}
+class Module;
+} // namespace llvm
 
 namespace hlsl {
 
 struct DxilResourceProperties {
   struct TypedProps {
-    uint8_t CompType;  // TypedBuffer/Image component type.
-    uint8_t CompCount; // Number of components known to shader.
-    uint8_t Reserved2;
+    uint8_t CompType;    // TypedBuffer/Image component type.
+    uint8_t CompCount;   // Number of components known to shader.
+    uint8_t SampleCount; // Number of samples for multisample texture if defined
+                         // in HLSL.
     uint8_t Reserved3;
   };
 
@@ -46,14 +48,15 @@ struct DxilResourceProperties {
     uint8_t SamplerCmpOrHasCounter : 1;
 
     // BYTE 2
-    uint8_t Reserved2;
+    uint8_t IsReorderCoherent : 1;
+    uint8_t Reserved2 : 7;
 
     // BYTE 3
     uint8_t Reserved3;
   };
 
   union {
-    BasicProps  Basic;
+    BasicProps Basic;
     uint32_t RawDword0;
   };
   // DWORD
@@ -66,7 +69,7 @@ struct DxilResourceProperties {
   };
   DxilResourceProperties();
   DXIL::ResourceClass getResourceClass() const;
-  DXIL::ResourceKind  getResourceKind() const;
+  DXIL::ResourceKind getResourceKind() const;
   DXIL::ComponentType getCompType() const;
   unsigned getElementStride() const;
   void setResourceKind(DXIL::ResourceKind RK);
@@ -87,11 +90,17 @@ struct DxilInst_AnnotateHandle;
 namespace resource_helper {
 llvm::Constant *getAsConstant(const DxilResourceProperties &, llvm::Type *Ty,
                               const ShaderModel &);
+llvm::Type *GetResourcePropertiesType(llvm::Module &M);
 DxilResourceProperties loadPropsFromConstant(const llvm::Constant &C);
 DxilResourceProperties
-loadPropsFromAnnotateHandle(DxilInst_AnnotateHandle &annotateHandle, const ShaderModel &);
+loadPropsFromAnnotateHandle(DxilInst_AnnotateHandle &annotateHandle,
+                            const ShaderModel &);
 DxilResourceProperties loadPropsFromResourceBase(const DxilResourceBase *);
+DxilResourceProperties tryMergeProps(DxilResourceProperties,
+                                     DxilResourceProperties);
 
+llvm::Constant *tryMergeProps(const llvm::Constant *, const llvm::Constant *,
+                              llvm::Type *Ty, const ShaderModel &);
 } // namespace resource_helper
 
 } // namespace hlsl

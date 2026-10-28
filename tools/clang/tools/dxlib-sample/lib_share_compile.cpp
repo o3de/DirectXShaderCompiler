@@ -9,19 +9,19 @@
 //                                                                           //
 ///////////////////////////////////////////////////////////////////////////////
 
-#include "dxc/Support/WinIncludes.h"
-#include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/DXIL/DxilShaderModel.h"
+#include "dxc/DxilContainer/DxilContainer.h"
 #include "dxc/Support/Global.h"
+#include "dxc/Support/WinIncludes.h"
 #include "dxc/dxcapi.h"
 
 #include "dxc/Support/FileIOHelper.h"
 
 #include "dxc/Support/Unicode.h"
+#include "lib_share_helper.h"
 #include <d3dcompiler.h>
 #include <string>
 #include <vector>
-#include "lib_share_helper.h"
 
 using namespace libshare;
 using namespace hlsl;
@@ -72,13 +72,12 @@ HRESULT CompileToLib(IDxcBlob *pSource, std::vector<DxcDefine> &defines,
   return hr;
 }
 
-
-#include "dxc/Support/dxcapi.impl.h"
 #include "dxc/Support/HLSLOptions.h"
+#include "dxc/Support/dxcapi.impl.h"
 static void ReadOptsAndValidate(hlsl::options::MainArgs &mainArgs,
                                 hlsl::options::DxcOpts &opts,
                                 AbstractMemoryStream *pOutputStream,
-                                _COM_Outptr_ IDxcOperationResult **ppResult,
+                                IDxcOperationResult **ppResult,
                                 bool &finished) {
   const llvm::opt::OptTable *table = ::options::getHlslOptTable();
   raw_stream_ostream outStream(pOutputStream);
@@ -87,14 +86,17 @@ static void ReadOptsAndValidate(hlsl::options::MainArgs &mainArgs,
     CComPtr<IDxcBlob> pErrorBlob;
     IFT(pOutputStream->QueryInterface(&pErrorBlob));
     outStream.flush();
-    IFT(DxcResult::Create(E_INVALIDARG, DXC_OUT_NONE, {
-        DxcOutputObject::ErrorOutput(opts.DefaultTextCodePage,
-          (LPCSTR)pErrorBlob->GetBufferPointer(), pErrorBlob->GetBufferSize())
-      }, ppResult));
+    IFT(DxcResult::Create(
+        E_INVALIDARG, DXC_OUT_NONE,
+        {DxcOutputObject::ErrorOutput(opts.DefaultTextCodePage,
+                                      (LPCSTR)pErrorBlob->GetBufferPointer(),
+                                      pErrorBlob->GetBufferSize())},
+        ppResult));
     finished = true;
     return;
   }
-  DXASSERT(opts.HLSLVersion > 2015, "else ReadDxcOpts didn't fail for non-isense");
+  DXASSERT(opts.HLSLVersion > hlsl::LangStd::v2015,
+           "else ReadDxcOpts didn't fail for non-isense");
   finished = false;
 }
 
@@ -107,8 +109,7 @@ HRESULT CompileFromBlob(IDxcBlobEncoding *pSource, LPCWSTR pSourceName,
   CComPtr<IDxcLinker> linker;
 
   // Upconvert legacy targets
-  const hlsl::ShaderModel *SM =
-    hlsl::ShaderModel::GetByName(pTarget);
+  const hlsl::ShaderModel *SM = hlsl::ShaderModel::GetByName(pTarget);
   const char *Target = pTarget;
   if (SM->IsValid() && SM->GetMajor() < 6) {
     Target = hlsl::ShaderModel::Get(SM->GetKind(), 6, 0)->GetName();
@@ -120,7 +121,8 @@ HRESULT CompileFromBlob(IDxcBlobEncoding *pSource, LPCWSTR pSourceName,
     CA2W pTargetProfileW(Target);
 
     // Preprocess.
-    std::unique_ptr<IncludeToLibPreprocessor> preprocessor = IncludeToLibPreprocessor::CreateIncludeToLibPreprocessor(pInclude);
+    std::unique_ptr<IncludeToLibPreprocessor> preprocessor =
+        IncludeToLibPreprocessor::CreateIncludeToLibPreprocessor(pInclude);
 
     if (arguments.size()) {
       CComPtr<AbstractMemoryStream> pOutputStream;
@@ -136,8 +138,6 @@ HRESULT CompileFromBlob(IDxcBlobEncoding *pSource, LPCWSTR pSourceName,
       }
 
       for (const llvm::opt::Arg *A : opts.Args.filtered(options::OPT_I)) {
-        const bool IsFrameworkFalse = false;
-        const bool IgnoreSysRoot = true;
         if (dxcutil::IsAbsoluteOrCurDirRelative(A->getValue())) {
           preprocessor->AddIncPath(A->getValue());
         } else {
@@ -155,13 +155,12 @@ HRESULT CompileFromBlob(IDxcBlobEncoding *pSource, LPCWSTR pSourceName,
 
     LibCacheManager &libCache = LibCacheManager::GetLibCacheManager();
     IFR(CreateLinker(&linker));
-    IDxcIncludeHandler * const kNoIncHandler = nullptr;
+    IDxcIncludeHandler *const kNoIncHandler = nullptr;
     const auto &snippets = preprocessor->GetSnippets();
-    const bool bLazyLoad = true;
     std::string processedHeader = "";
     std::vector<std::wstring> hashStrList;
     std::vector<LPCWSTR> hashList;
-//#define LIB_SHARE_DBG
+// #define LIB_SHARE_DBG
 #ifdef LIB_SHARE_DBG
     std::vector<std::wstring> defineList;
     defineList.emplace_back(L"");
@@ -188,24 +187,25 @@ HRESULT CompileFromBlob(IDxcBlobEncoding *pSource, LPCWSTR pSourceName,
       contentStrList.emplace_back(tmpContents.m_psz);
       contentList.emplace_back(contentStrList.back().c_str());
 #endif
-      if (!libCache.GetLibBlob(processedHeader, snippet, compilerInput, hash, &pOutputBlob)) {
+      if (!libCache.GetLibBlob(processedHeader, snippet, compilerInput, hash,
+                               &pOutputBlob)) {
         // Cannot find existing blob, create from pSource.
         IDxcBlob **ppCode = &pOutputBlob;
 
         auto compileFn = [&](IDxcBlob *pSource) {
-          IFT(CompileToLib(pSource, defines, kNoIncHandler, arguments,
-                           ppCode, nullptr));
+          IFT(CompileToLib(pSource, defines, kNoIncHandler, arguments, ppCode,
+                           nullptr));
         };
-        libCache.AddLibBlob(processedHeader, snippet, compilerInput, hash, &pOutputBlob,
-                            compileFn);
+        libCache.AddLibBlob(processedHeader, snippet, compilerInput, hash,
+                            &pOutputBlob, compileFn);
       }
       hashStrList.emplace_back(std::to_wstring(hash));
       hashList.emplace_back(hashStrList.back().c_str());
       linker->RegisterLibrary(hashList.back(), pOutputBlob);
       pOutputBlob.Detach(); // Ownership is in libCache.
     }
-    std::wstring wEntry = Unicode::UTF8ToUTF16StringOrThrow(pEntrypoint);
-    std::wstring wTarget = Unicode::UTF8ToUTF16StringOrThrow(Target);
+    std::wstring wEntry = Unicode::UTF8ToWideStringOrThrow(pEntrypoint);
+    std::wstring wTarget = Unicode::UTF8ToWideStringOrThrow(Target);
 
     // Link
 #ifdef LIB_SHARE_DBG
@@ -235,8 +235,8 @@ HRESULT WINAPI DxilD3DCompile(LPCVOID pSrcData, SIZE_T SrcDataSize,
     *ppErrorMsgs = nullptr;
 
   IFR(CreateLibrary(&library));
-  IFR(library->CreateBlobWithEncodingFromPinned((LPBYTE)pSrcData, SrcDataSize,
-                                                CP_ACP, &source));
+  IFR(library->CreateBlobWithEncodingFromPinned(pSrcData, SrcDataSize, CP_ACP,
+                                                &source));
   HRESULT hr = S_OK;
   CComPtr<IMalloc> m_pMalloc(GetGlobalHeapMalloc());
   DxcThreadMalloc TM(m_pMalloc);
@@ -273,7 +273,7 @@ HRESULT WINAPI DxilD3DCompile(LPCVOID pSrcData, SIZE_T SrcDataSize,
     if (Flags1 & D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY)
       arguments.push_back(L"/Gec");
     // /Ges Not implemented:
-    //if (Flags1 & D3DCOMPILE_ENABLE_STRICTNESS)
+    // if (Flags1 & D3DCOMPILE_ENABLE_STRICTNESS)
     // arguments.push_back(L"/Ges");
     if (Flags1 & D3DCOMPILE_IEEE_STRICTNESS)
       arguments.push_back(L"/Gis");
@@ -337,8 +337,8 @@ HRESULT WINAPI DxilD3DCompile2(
   *ppOperationResult = nullptr;
 
   IFR(CreateLibrary(&library));
-  IFR(library->CreateBlobWithEncodingFromPinned((LPBYTE)pSrcData, SrcDataSize,
-                                                CP_ACP, &source));
+  IFR(library->CreateBlobWithEncodingFromPinned(pSrcData, SrcDataSize, CP_ACP,
+                                                &source));
   HRESULT hr = S_OK;
   CComPtr<IMalloc> m_pMalloc(GetGlobalHeapMalloc());
   DxcThreadMalloc TM(m_pMalloc);

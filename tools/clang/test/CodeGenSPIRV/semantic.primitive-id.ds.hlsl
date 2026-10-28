@@ -1,4 +1,4 @@
-// Run: %dxc -T ds_6_0 -E main
+// RUN: %dxc -T ds_6_0 -E main -fcgl  %s -spirv | FileCheck %s
 
 // HS PCF output
 struct HsPcfOut {

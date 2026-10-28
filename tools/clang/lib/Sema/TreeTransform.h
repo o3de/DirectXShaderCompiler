@@ -793,9 +793,12 @@ public:
   ///
   /// By default, performs semantic analysis when building the function type.
   /// Subclasses may override this routine to provide different behavior.
-  QualType RebuildFunctionProtoType(QualType T,
-                                    MutableArrayRef<QualType> ParamTypes,
-                                    const FunctionProtoType::ExtProtoInfo &EPI);
+  // HLSL Change - FIX - We should move param mods to parameter QualTypes
+  QualType
+  RebuildFunctionProtoType(QualType T, MutableArrayRef<QualType> ParamTypes,
+                           ArrayRef<hlsl::ParameterModifier> ParamMods,
+                           const FunctionProtoType::ExtProtoInfo &EPI);
+  // HLSL Change - End
 
   /// \brief Build a new unprototyped function type.
   QualType RebuildFunctionNoProtoType(QualType ResultType);
@@ -2340,6 +2343,10 @@ public:
                                 QualType ThisType,
                                 bool isImplicit) {
     getSema().CheckCXXThisCapture(ThisLoc);
+    // HLSL Change Begin - adjust this from T* to T&-like
+    if (getSema().getLangOpts().HLSL)
+      return getSema().genereateHLSLThis(ThisLoc, ThisType, isImplicit);
+    // HLSL Change End - adjust this from T* to T&-like
     return new (getSema().Context) CXXThisExpr(ThisLoc, ThisType, isImplicit);
   }
 
@@ -3269,7 +3276,7 @@ TreeTransform<Derived>::TransformNestedNameSpecifierLoc(
         return NestedNameSpecifierLoc();
 
       if (TL.getType()->isDependentType() || TL.getType()->isRecordType() ||
-          (SemaRef.getLangOpts().CPlusPlus11 &&
+          ((SemaRef.getLangOpts().CPlusPlus11 || SemaRef.getLangOpts().HLSL) &&
            TL.getType()->isEnumeralType())) {
         assert(!TL.getType().hasLocalQualifiers() &&
                "Can't get cv-qualifiers here");
@@ -4745,7 +4752,10 @@ QualType TreeTransform<Derived>::TransformFunctionProtoType(
       T->getNumParams() != ParamTypes.size() ||
       !std::equal(T->param_type_begin(), T->param_type_end(),
                   ParamTypes.begin()) || EPIChanged) {
-    Result = getDerived().RebuildFunctionProtoType(ResultType, ParamTypes, EPI);
+    // HLSL Change - FIX - We should move param mods to parameter QualTypes
+    Result = getDerived().RebuildFunctionProtoType(ResultType, ParamTypes,
+                                                   T->getParamMods(), EPI);
+    // HLSL Change - End
     if (Result.isNull())
       return QualType();
   }
@@ -5490,6 +5500,81 @@ QualType TreeTransform<Derived>::TransformAttributedType(
 
   return result;
 }
+
+// HLSL Change Start
+template <typename Derived>
+QualType TreeTransform<Derived>::TransformAttributedLinAlgMatrixType(
+    TypeLocBuilder &TLB, AttributedLinAlgMatrixTypeLoc TL) {
+  const AttributedLinAlgMatrixType *OldTy = TL.getTypePtr();
+  QualType ModifiedTy = getDerived().TransformType(OldTy->getWrappedType());
+  if (ModifiedTy.isNull())
+    return QualType();
+
+  QualType Result = TL.getType();
+  if (getDerived().AlwaysRebuild() || ModifiedTy != OldTy->getWrappedType()) {
+    Result = SemaRef.Context.getAttributedLinAlgMatrixType(
+        ModifiedTy, OldTy->getComponentType(), OldTy->getRows(),
+        OldTy->getCols(), OldTy->getUse(), OldTy->getScope());
+  }
+
+  AttributedLinAlgMatrixTypeLoc NewTL =
+      TLB.push<AttributedLinAlgMatrixTypeLoc>(Result);
+  NewTL.setNameLoc(TL.getNameLoc());
+
+  return Result;
+}
+
+template <typename Derived>
+QualType TreeTransform<Derived>::TransformDependentAttributedLinAlgMatrixType(
+    TypeLocBuilder &TLB, DependentAttributedLinAlgMatrixTypeLoc TL) {
+  const DependentAttributedLinAlgMatrixType *T = TL.getTypePtr();
+
+  QualType NewWrappedType = getDerived().TransformType(T->getWrappedType());
+  if (NewWrappedType.isNull())
+    return QualType();
+
+  ExprResult CompTy = getDerived().TransformExpr(T->getComponentTyExpr());
+  ExprResult Rows = getDerived().TransformExpr(T->getRowsExpr());
+  ExprResult Cols = getDerived().TransformExpr(T->getColsExpr());
+  ExprResult Use = getDerived().TransformExpr(T->getUseExpr());
+  ExprResult Scope = getDerived().TransformExpr(T->getScopeExpr());
+
+  if (CompTy.isInvalid() || Rows.isInvalid() || Cols.isInvalid() ||
+      Use.isInvalid() || Scope.isInvalid())
+    return QualType();
+
+  Expr *NewCompTyExpr = CompTy.get();
+  Expr *NewRowsExpr = Rows.get();
+  Expr *NewColsExpr = Cols.get();
+  Expr *NewUseExpr = Use.get();
+  Expr *NewScopeExpr = Scope.get();
+
+  QualType Result = TL.getType();
+  if (getDerived().AlwaysRebuild() || NewWrappedType != T->getWrappedType() ||
+      NewCompTyExpr != T->getComponentTyExpr() ||
+      NewRowsExpr != T->getRowsExpr() || NewColsExpr != T->getColsExpr() ||
+      NewUseExpr != T->getUseExpr() || NewScopeExpr != T->getScopeExpr()) {
+    if (!hlsl::CreateAttributedLinAlgMatrixType(
+            SemaRef, NewWrappedType, NewCompTyExpr, NewRowsExpr, NewColsExpr,
+            NewUseExpr, NewScopeExpr, Result))
+      return QualType();
+  }
+
+  // Result might be dependent or not.
+  if (isa<DependentAttributedLinAlgMatrixType>(Result)) {
+    DependentAttributedLinAlgMatrixTypeLoc NewTL =
+        TLB.push<DependentAttributedLinAlgMatrixTypeLoc>(Result);
+    NewTL.setNameLoc(TL.getNameLoc());
+  } else {
+    AttributedLinAlgMatrixTypeLoc NewTL =
+        TLB.push<AttributedLinAlgMatrixTypeLoc>(Result);
+    NewTL.setNameLoc(TL.getNameLoc());
+  }
+
+  return Result;
+}
+
+// HLSL Change End
 
 template<typename Derived>
 QualType
@@ -9767,7 +9852,12 @@ TreeTransform<Derived>::TransformCXXDependentScopeMemberExpr(
   } else {
     OldBase = nullptr;
     BaseType = getDerived().TransformType(E->getBaseType());
-    ObjectType = BaseType->getAs<PointerType>()->getPointeeType();
+    // HLSL Change - Begin
+    // In HLSL, 'this' is an lvalue reference so implicit member accesses use
+    // '.' (IsArrow=false) and the stored base type IS the object type, not a
+    // pointer to it.
+    ObjectType = E->isArrow() ? BaseType->getPointeeType() : BaseType;
+    // HLSL Change - End
   }
 
   // Transform the first part of the nested-name-specifier that qualifies
@@ -10631,9 +10721,11 @@ TreeTransform<Derived>::TransformBlockExpr(BlockExpr *E) {
   QualType exprResultType =
       getDerived().TransformType(exprFunctionType->getReturnType());
 
-  QualType functionType =
-    getDerived().RebuildFunctionProtoType(exprResultType, paramTypes,
-                                          exprFunctionType->getExtProtoInfo());
+  // HLSL Change - FIX - We should move param mods to parameter QualTypes
+  QualType functionType = getDerived().RebuildFunctionProtoType(
+      exprResultType, paramTypes, exprFunctionType->getParamMods(),
+      exprFunctionType->getExtProtoInfo());
+  // HLSL Change - End
   blockScope->FunctionType = functionType;
 
   // Set the parameters on the block decl.
@@ -10873,16 +10965,19 @@ TreeTransform<Derived>::RebuildDependentSizedExtVectorType(QualType ElementType,
   return SemaRef.BuildExtVectorType(ElementType, SizeExpr, AttributeLoc);
 }
 
+// HLSL Change - FIX - We should move param mods to parameter QualTypes
 template<typename Derived>
 QualType TreeTransform<Derived>::RebuildFunctionProtoType(
     QualType T,
     MutableArrayRef<QualType> ParamTypes,
+    ArrayRef<hlsl::ParameterModifier> ParamMods,
     const FunctionProtoType::ExtProtoInfo &EPI) {
   return SemaRef.BuildFunctionType(T, ParamTypes,
                                    getDerived().getBaseLocation(),
                                    getDerived().getBaseEntity(),
-                                   EPI);
+                                   EPI, ParamMods);
 }
+// HLSL Change - End
 
 template<typename Derived>
 QualType TreeTransform<Derived>::RebuildFunctionNoProtoType(QualType T) {

@@ -36,9 +36,9 @@
 using namespace llvm;
 
 // HLSL Change
-#define NOMINMAX
-#include <windows.h>
+#include "dxc/Support/WinIncludes.h"
 #include "llvm/Support/MSFileSystem.h"
+#include "llvm/Support/FileSystem.h"
 // End HLSL Change
 
 static cl::opt<std::string>
@@ -52,6 +52,12 @@ static cl::list<std::string>
 CheckPrefixes("check-prefix",
               cl::desc("Prefix to use from check file (defaults to 'CHECK')"));
 
+static cl::alias CheckPrefixesAlias(
+    "check-prefixes", cl::aliasopt(CheckPrefixes), cl::CommaSeparated,
+    cl::NotHidden,
+    cl::desc(
+        "Alias for -check-prefix permitting multiple comma separated values"));
+
 static cl::opt<bool>
 NoCanonicalizeWhiteSpace("strict-whitespace",
               cl::desc("Do not treat all horizontal whitespace as equivalent"));
@@ -62,6 +68,11 @@ static cl::list<std::string> ImplicitCheckNot(
              "positive check. This can be used to ensure that no instances of\n"
              "this pattern occur which are not matched by a positive pattern"),
     cl::value_desc("pattern"));
+
+static cl::list<std::string>
+    GlobalDefines("D", cl::AlwaysPrefix,
+                  cl::desc("Define a variable to be used in capture patterns."),
+                  cl::value_desc("VAR=VALUE"));
 
 static cl::opt<bool> AllowEmptyInput(
     "allow-empty", cl::init(false),
@@ -867,7 +878,7 @@ static bool ReadCheckFile(SourceMgr &SM,
   for (const auto &PatternString : ImplicitCheckNot) {
     // Create a buffer with fake command line content in order to display the
     // command line option responsible for the specific implicit CHECK-NOT.
-    std::string Prefix = std::string("-") + ImplicitCheckNot.ArgStr + "='";
+    std::string Prefix = (Twine("-") + ImplicitCheckNot.ArgStr + "='").str();
     std::string Suffix = "'";
     std::unique_ptr<MemoryBuffer> CmdLine = MemoryBuffer::getMemBufferCopy(
         Prefix + PatternString + Suffix, "command line");
@@ -1352,6 +1363,26 @@ int main(int argc, char **argv) {
 
   /// VariableTable - This holds all the current filecheck variables.
   StringMap<StringRef> VariableTable;
+
+  bool GlobalDefineError = false;
+  for (const auto &G : GlobalDefines) {
+    size_t EqIdx = G.find('=');
+    if (EqIdx == std::string::npos) {
+      errs() << "Missing equal sign in command-line definition '-D" << G
+             << "'\n";
+      GlobalDefineError = true;
+      continue;
+    }
+    if (EqIdx == 0) {
+      errs() << "Missing pattern variable name in command-line definition '-D"
+             << G << "'\n";
+      GlobalDefineError = true;
+      continue;
+    }
+    VariableTable.insert(StringRef(G).split('='));
+  }
+  if (GlobalDefineError)
+    return 2;
 
   bool hasError = false;
 

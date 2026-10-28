@@ -191,12 +191,12 @@ public:
 template<> struct DenseMapInfo<SDValue> {
   static inline SDValue getEmptyKey() {
     SDValue V;
-    V.ResNo = -1U;
+    V.ResNo = ~0U;
     return V;
   }
   static inline SDValue getTombstoneKey() {
     SDValue V;
-    V.ResNo = -2U;
+    V.ResNo = ~1U;
     return V;
   }
   static unsigned getHashValue(const SDValue &Val) {
@@ -456,17 +456,17 @@ public:
 
   /// This class provides iterator support for SDUse
   /// operands that use a specific SDNode.
-  class use_iterator
-    : public std::iterator<std::forward_iterator_tag, SDUse, ptrdiff_t> {
+  class use_iterator {
     SDUse *Op;
     explicit use_iterator(SDUse *op) : Op(op) {
     }
     friend class SDNode;
   public:
-    typedef std::iterator<std::forward_iterator_tag,
-                          SDUse, ptrdiff_t>::reference reference;
-    typedef std::iterator<std::forward_iterator_tag,
-                          SDUse, ptrdiff_t>::pointer pointer;
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = SDUse;
+    using difference_type = std::ptrdiff_t;
+    using pointer = value_type *;
+    using reference = value_type &;
 
     use_iterator(const use_iterator &I) : Op(I.Op) {}
     use_iterator() : Op(nullptr) {}
@@ -879,7 +879,7 @@ inline SDValue::SDValue(SDNode *node, unsigned resno)
     : Node(node), ResNo(resno) {
   assert((!Node || ResNo < Node->getNumValues()) &&
          "Invalid result number for the given node!");
-  assert(ResNo < -2U && "Cannot use result numbers reserved for DenseMaps.");
+  assert(ResNo < ~1U && "Cannot use result numbers reserved for DenseMaps.");
 }
 
 inline unsigned SDValue::getOpcode() const {
@@ -2182,13 +2182,18 @@ public:
   }
 };
 
-class SDNodeIterator : public std::iterator<std::forward_iterator_tag,
-                                            SDNode, ptrdiff_t> {
+class SDNodeIterator {
   const SDNode *Node;
   unsigned Operand;
 
   SDNodeIterator(const SDNode *N, unsigned Op) : Node(N), Operand(Op) {}
 public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = SDNode;
+  using difference_type = std::ptrdiff_t;
+  using pointer = value_type *;
+  using reference = value_type &;
+
   bool operator==(const SDNodeIterator& x) const {
     return Operand == x.Operand;
   }

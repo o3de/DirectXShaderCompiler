@@ -27,6 +27,8 @@
 #include "llvm/ADT/BitVector.h"
 
 #include "dxc/DXIL/DxilConstants.h"
+#include "dxc/DXIL/DxilShaderModel.h"
+#include "dxc/HlslIntrinsicOp.h"
 
 using namespace clang;
 using namespace sema;
@@ -48,9 +50,9 @@ struct PayloadUse {
   const MemberExpr *Member = nullptr;
 };
 
-struct TraceRayCall {
-  TraceRayCall() = default;
-  TraceRayCall(const CallExpr *Call, const CFGBlock *Parent)
+struct PayloadBuiltinCall {
+  PayloadBuiltinCall() = default;
+  PayloadBuiltinCall(const CallExpr *Call, const CFGBlock *Parent)
       : Call(Call), Parent(Parent) {}
   const CallExpr *Call = nullptr;
   const CFGBlock *Parent = nullptr;
@@ -67,10 +69,11 @@ struct PayloadAccessInfo {
 };
 
 struct DxrShaderDiagnoseInfo {
-  const FunctionDecl *funcDecl;
-  const VarDecl *Payload;
-  DXIL::PayloadAccessShaderStage Stage;
-  std::vector<TraceRayCall> TraceCalls;
+  const FunctionDecl *funcDecl = nullptr;
+  const VarDecl *Payload = nullptr;
+  DXIL::PayloadAccessShaderStage Stage =
+      DXIL::PayloadAccessShaderStage::Invalid;
+  std::vector<PayloadBuiltinCall> PayloadBuiltinCalls;
   std::map<const FieldDecl *, std::vector<PayloadUse>> WritesPerField;
   std::map<const FieldDecl *, std::vector<PayloadUse>> ReadsPerField;
   std::vector<PayloadUse> PayloadAsCallArg;
@@ -83,6 +86,7 @@ DiagnosePayloadAccess(Sema &S, DxrShaderDiagnoseInfo &Info,
                       std::set<const FunctionDecl *> VisitedFunctions);
 
 const Stmt *IgnoreParensAndDecay(const Stmt *S);
+const MemberExpr *GetPayloadFieldMember(const Stmt *S);
 
 // Transform the shader stage to string to be used in diagnostics
 StringRef GetStringForShaderStage(DXIL::PayloadAccessShaderStage Stage) {
@@ -120,24 +124,42 @@ GetPayloadQualifierForStage(FieldDecl *Field,
   return DXIL::PayloadAccessQualifier::NoAccess;
 }
 
-// Returns the declaration of the payload used in a TraceRay call
-const VarDecl *GetPayloadParameterForTraceCall(const CallExpr *Trace) {
-  const Decl *callee = Trace->getCalleeDecl();
-  if (!callee)
-    return nullptr;
-
-  if (!isa<FunctionDecl>(callee))
-    return nullptr;
-
-  const FunctionDecl *FD = cast<FunctionDecl>(callee);
-
-  if (FD->isImplicit() && FD->getName() == "TraceRay") {
-    const Stmt *Param = IgnoreParensAndDecay(Trace->getArg(7));
-    if (const DeclRefExpr *ParamRef = dyn_cast<DeclRefExpr>(Param)) {
-      if (const VarDecl *Decl = dyn_cast<VarDecl>(ParamRef->getDecl()))
-        return Decl;
-    }
+static int GetPayloadParamIdxForIntrinsic(const FunctionDecl *FD) {
+  HLSLIntrinsicAttr *IntrinAttr = FD->getAttr<HLSLIntrinsicAttr>();
+  if (!IntrinAttr)
+    return -1;
+  switch ((IntrinsicOp)IntrinAttr->getOpcode()) {
+  default:
+    return -1;
+  case IntrinsicOp::IOP_TraceRay:
+  case IntrinsicOp::MOP_DxHitObject_TraceRay:
+  case IntrinsicOp::MOP_DxHitObject_Invoke:
+    return FD->getNumParams() - 1;
   }
+}
+
+static bool IsBuiltinWithPayload(const FunctionDecl *FD) {
+  return GetPayloadParamIdxForIntrinsic(FD) >= 0;
+}
+
+// Returns the declaration of the payload used in a call to TraceRay,
+// HitObject::TraceRay or HitObject::Invoke.
+const VarDecl *GetPayloadParameterForBuiltinCall(const CallExpr *Call) {
+  const Decl *Callee = Call->getCalleeDecl();
+  if (!Callee)
+    return nullptr;
+
+  if (!isa<FunctionDecl>(Callee))
+    return nullptr;
+
+  int PldParamIdx = GetPayloadParamIdxForIntrinsic(cast<FunctionDecl>(Callee));
+  if (PldParamIdx < 0)
+    return nullptr;
+
+  const Stmt *Param = IgnoreParensAndDecay(Call->getArg(PldParamIdx));
+  if (const DeclRefExpr *ParamRef = dyn_cast<DeclRefExpr>(Param))
+    if (const VarDecl *Decl = dyn_cast<VarDecl>(ParamRef->getDecl()))
+      return Decl;
   return nullptr;
 }
 
@@ -152,7 +174,6 @@ void GetPayloadAccesses(const Stmt *S, const DxrShaderDiagnoseInfo &Info,
       if (Ref->getDecl() == Info.Payload) {
         Accesses.push_back(PayloadAccessInfo{Member, Call, IsLValue});
       }
-      return;
     }
     if (const ImplicitCastExpr *Cast = dyn_cast<ImplicitCastExpr>(C)) {
       if (Cast->getCastKind() == CK_LValueToRValue) {
@@ -161,7 +182,7 @@ void GetPayloadAccesses(const Stmt *S, const DxrShaderDiagnoseInfo &Info,
     }
 
     GetPayloadAccesses(C, Info, Accesses, IsLValue,
-                       Member ? Member : dyn_cast<MemberExpr>(C),
+                       Member ? Member : GetPayloadFieldMember(C),
                        Call ? Call : dyn_cast<CallExpr>(C));
   }
 }
@@ -171,17 +192,20 @@ void CollectReadsWritesAndCallsForPayload(const Stmt *S,
                                           DxrShaderDiagnoseInfo &Info,
                                           const CFGBlock *Block) {
   std::vector<PayloadAccessInfo> PayloadAccesses;
-  GetPayloadAccesses(S, Info, PayloadAccesses, true, dyn_cast<MemberExpr>(S),
+  GetPayloadAccesses(S, Info, PayloadAccesses, true, GetPayloadFieldMember(S),
                      dyn_cast<CallExpr>(S));
   for (auto &Access : PayloadAccesses) {
     // An access to a payload member was found.
     if (Access.Member) {
-      FieldDecl *Field = cast<FieldDecl>(Access.Member->getMemberDecl());
-      if (Access.IsLValue) {
-        Info.WritesPerField[Field].push_back(
-            PayloadUse{S, Block, Access.Member});
-      } else {
-        Info.ReadsPerField[Field].push_back(PayloadUse{S, Block, Access.Member});
+      if (FieldDecl *Field =
+              dyn_cast<FieldDecl>(Access.Member->getMemberDecl())) {
+        if (Access.IsLValue) {
+          Info.WritesPerField[Field].push_back(
+              PayloadUse{S, Block, Access.Member});
+        } else {
+          Info.ReadsPerField[Field].push_back(
+              PayloadUse{S, Block, Access.Member});
+        }
       }
     } else if (Access.Call) {
       Info.PayloadAsCallArg.push_back(PayloadUse{S, Block});
@@ -189,12 +213,9 @@ void CollectReadsWritesAndCallsForPayload(const Stmt *S,
   }
 }
 
-// Collects all TraceRay calls.
-void CollectTraceRayCalls(const Stmt *S, DxrShaderDiagnoseInfo &Info,
-                          const CFGBlock *Block) {
-  // TraceRay has void as return type so it should never be something else
-  // than a plain CallExpr.
-
+// Collects all calls to TraceRay, HitObject::TraceRay and HitObject::Invoke.
+void CollectBuiltinCallsWithPayload(const Stmt *S, DxrShaderDiagnoseInfo &Info,
+                                    const CFGBlock *Block) {
   if (const CallExpr *Call = dyn_cast<CallExpr>(S)) {
 
     const Decl *Callee = Call->getCalleeDecl();
@@ -203,23 +224,20 @@ void CollectTraceRayCalls(const Stmt *S, DxrShaderDiagnoseInfo &Info,
 
     const FunctionDecl *CalledFunction = cast<FunctionDecl>(Callee);
 
-    // Ignore trace calls here.
-    if (CalledFunction->isImplicit() &&
-        CalledFunction->getName() == "TraceRay") {
-      Info.TraceCalls.push_back({Call, Block});
-    }
+    if (IsBuiltinWithPayload(CalledFunction))
+      Info.PayloadBuiltinCalls.push_back({Call, Block});
   }
 }
 
 // Find the last write to the payload field in the given block.
 PayloadUse GetLastWriteInBlock(CFGBlock &Block,
-                              ArrayRef<PayloadUse> PayloadWrites) {
+                               ArrayRef<PayloadUse> PayloadWrites) {
   PayloadUse LastWrite;
   for (auto &Element : Block) { // TODO: reverse iterate?
     if (Optional<CFGStmt> S = Element.getAs<CFGStmt>()) {
-      auto It =
-          std::find_if(PayloadWrites.begin(), PayloadWrites.end(),
-                       [&](const PayloadUse &V) { return V.S == S->getStmt(); });
+      auto It = std::find_if(
+          PayloadWrites.begin(), PayloadWrites.end(),
+          [&](const PayloadUse &V) { return V.S == S->getStmt(); });
       if (It != std::end(PayloadWrites)) {
         LastWrite = *It;
         LastWrite.Parent = &Block;
@@ -266,13 +284,13 @@ GetAllWritesReachingExit(CFG &ShaderCFG, ArrayRef<PayloadUse> PayloadWrites) {
 
 // Find the first read to the payload field in the given block.
 PayloadUse GetFirstReadInBlock(CFGBlock &Block,
-                              ArrayRef<PayloadUse> PayloadReads) {
+                               ArrayRef<PayloadUse> PayloadReads) {
   PayloadUse FirstRead;
   for (auto &Element : Block) {
     if (Optional<CFGStmt> S = Element.getAs<CFGStmt>()) {
-      auto It =
-          std::find_if(PayloadReads.begin(), PayloadReads.end(),
-                       [&](const PayloadUse &V) { return V.S == S->getStmt(); });
+      auto It = std::find_if(
+          PayloadReads.begin(), PayloadReads.end(),
+          [&](const PayloadUse &V) { return V.S == S->getStmt(); });
       if (It != std::end(PayloadReads)) {
         FirstRead = *It;
         FirstRead.Parent = &Block;
@@ -326,8 +344,8 @@ CXXRecordDecl *GetPayloadType(const VarDecl *Payload) {
   return nullptr;
 }
 
-std::vector<FieldDecl*> GetAllPayloadFields(RecordDecl* PayloadType) {
-  std::vector<FieldDecl*> PayloadFields;
+std::vector<FieldDecl *> GetAllPayloadFields(RecordDecl *PayloadType) {
+  std::vector<FieldDecl *> PayloadFields;
 
   for (FieldDecl *Field : PayloadType->fields()) {
     QualType FieldType = Field->getType();
@@ -335,7 +353,8 @@ std::vector<FieldDecl*> GetAllPayloadFields(RecordDecl* PayloadType) {
       // Skip nested payload types.
       if (FieldRecordDecl->hasAttr<HLSLRayPayloadAttr>()) {
         auto SubTypeFields = GetAllPayloadFields(FieldRecordDecl);
-        PayloadFields.insert(PayloadFields.end(), SubTypeFields.begin(), SubTypeFields.end());
+        PayloadFields.insert(PayloadFields.end(), SubTypeFields.begin(),
+                             SubTypeFields.end());
         continue;
       }
     }
@@ -387,7 +406,8 @@ void DiagnosePayloadWrites(Sema &S, CFG &ShaderCFG, DominatorTree &DT,
       auto Qualifier = GetPayloadQualifierForStage(MemField, Info.Stage);
       if (Qualifier != DXIL::PayloadAccessQualifier::Write &&
           Qualifier != DXIL::PayloadAccessQualifier::ReadWrite) {
-        S.Diag(Write.Member->getExprLoc(), diag::warn_hlsl_payload_access_write_loss)
+        S.Diag(Write.Member->getExprLoc(),
+               diag::warn_hlsl_payload_access_write_loss)
             << Field->getName() << GetStringForShaderStage(Info.Stage);
       }
     }
@@ -487,7 +507,8 @@ void DiagnosePayloadReads(Sema &S, CFG &ShaderCFG, DominatorTree &DT,
       auto Qualifier = GetPayloadQualifierForStage(MemField, Info.Stage);
       if (Qualifier != DXIL::PayloadAccessQualifier::Read &&
           Qualifier != DXIL::PayloadAccessQualifier::ReadWrite) {
-        S.Diag(Read.Member->getExprLoc(), diag::warn_hlsl_payload_access_undef_read)
+        S.Diag(Read.Member->getExprLoc(),
+               diag::warn_hlsl_payload_access_undef_read)
             << Field->getName() << GetStringForShaderStage(Info.Stage);
       }
     }
@@ -524,13 +545,14 @@ void TraverseCFG(const CFGBlock &Block, Action PerElementAction,
   }
 }
 
-// Forward traverse the CFG and collect calls to TraceRay.
-void ForwardTraverseCFGAndCollectTraceCalls(
+// Forward traverse the CFG and collect calls to TraceRay, HitObject::TraceRay
+// and HitObject::Invoke.
+void ForwardTraverseCFGAndCollectBuiltinCallsWithPayload(
     const CFGBlock &Block, DxrShaderDiagnoseInfo &Info,
     std::set<const CFGBlock *> &Visited) {
   auto Action = [&Info](const CFGBlock &Block, const CFGElement &Element) {
     if (Optional<CFGStmt> S = Element.getAs<CFGStmt>()) {
-      CollectTraceRayCalls(S->getStmt(), Info, &Block);
+      CollectBuiltinCallsWithPayload(S->getStmt(), Info, &Block);
     }
   };
 
@@ -660,9 +682,9 @@ DiagnosePayloadAsFunctionArg(
       const FunctionDecl *CalledFunction = cast<FunctionDecl>(Callee);
 
       // Ignore trace calls here.
-      if (CalledFunction->isImplicit() &&
-          CalledFunction->getName() == "TraceRay") {
-        Info.TraceCalls.push_back(TraceRayCall{Call, Use.Parent});
+      if (IsBuiltinWithPayload(CalledFunction)) {
+        Info.PayloadBuiltinCalls.push_back(
+            PayloadBuiltinCall{Call, Use.Parent});
         continue;
       }
 
@@ -706,7 +728,7 @@ DiagnosePayloadAsFunctionArg(
   return WrittenFieldsInCalls;
 }
 
-// Collect all fields that cannot be accessed for the given shader stage. 
+// Collect all fields that cannot be accessed for the given shader stage.
 // This function recurses into nested payload types.
 void CollectNonAccessableFields(
     RecordDecl *PayloadType, DXIL::PayloadAccessShaderStage Stage,
@@ -768,10 +790,29 @@ void CollectAccessableFields(RecordDecl *PayloadType,
   }
 }
 
-// Emit diagnostics for a TraceRay call.
-void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
-                       const TraceRayCall &Trace, DominatorTree &DT) {
-  // For each TraceRay call check if write(caller) fields are written.
+void HandlePayloadInitializer(DxrShaderDiagnoseInfo &Info) {
+  const VarDecl *Payload = Info.Payload;
+
+  const Expr *Init = Payload->getInit();
+
+  if (Init) {
+    // If the payload has an initializer, then handle all fields as
+    // written. Sema will check that the initializer is correct.
+    // We can handle all fields as written.
+
+    RecordDecl *PayloadType = GetPayloadType(Info.Payload);
+    for (FieldDecl *Field : PayloadType->fields()) {
+      Info.WritesPerField[Field].push_back(PayloadUse{Init, nullptr, nullptr});
+    }
+  }
+}
+
+// Emit diagnostics for this call to either TraceRay, HitObject::TraceRay or
+// HitObject::Invoke.
+void DiagnoseBuiltinCallWithPayload(Sema &S, const VarDecl *Payload,
+                                    const PayloadBuiltinCall &PldCall,
+                                    DominatorTree &DT) {
+  // For each call check if write(caller) fields are written.
   const DXIL::PayloadAccessShaderStage CallerStage =
       DXIL::PayloadAccessShaderStage::Caller;
 
@@ -789,6 +830,18 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
     return;
   }
 
+  // Verify that the payload type is legal
+  if (!hlsl::IsHLSLCopyableAnnotatableRecord(Payload->getType()))
+    S.Diag(Payload->getLocation(), diag::err_payload_attrs_must_be_udt)
+        << /*payload|attributes|callable*/ 0 << /*parameter %2|type*/ 0
+        << Payload;
+
+  // This will produce more details, but also catch disallowed long vectors
+  const TypeDiagContext DiagContext = TypeDiagContext::PayloadParameters;
+  if (DiagnoseTypeElements(S, Payload->getLocation(), Payload->getType(),
+                           DiagContext, DiagContext))
+    return;
+
   CollectNonAccessableFields(PayloadType, CallerStage, {}, {},
                              NonWriteableFields, NonReadableFields);
 
@@ -798,14 +851,18 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
   // Find all writes to Payload that reaches the Trace
   DxrShaderDiagnoseInfo TraceInfo;
   TraceInfo.Payload = Payload;
+
+  // Handle initializers for the payload struct if any is present.
+  HandlePayloadInitializer(TraceInfo);
+
   std::set<const CFGBlock *> Visited;
 
-  const CFGBlock *Parent = Trace.Parent;
+  const CFGBlock *Parent = PldCall.Parent;
   Visited.insert(Parent);
-  // Collect payload accesses in the same block until we reach the TraceRay call
+  // Collect payload accesses in the same block until we reach the call
   for (auto Element : *Parent) {
     if (Optional<CFGStmt> S = Element.getAs<CFGStmt>()) {
-      if (S->getStmt() == Trace.Call)
+      if (S->getStmt() == PldCall.Call)
         break;
       CollectReadsWritesAndCallsForPayload(S->getStmt(), TraceInfo, Parent);
     }
@@ -818,10 +875,12 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
     BackwardTraverseCFGAndCollectReadsWrites(*Pred, TraceInfo, Visited);
   }
 
+  int PldArgIdx = PldCall.Call->getNumArgs() - 1;
+
   // Warn if a writeable field has not been written.
   for (const FieldDecl *Field : WriteableFields) {
     if (!TraceInfo.WritesPerField.count(Field)) {
-      S.Diag(Trace.Call->getArg(7)->getExprLoc(),
+      S.Diag(PldCall.Call->getArg(PldArgIdx)->getExprLoc(),
              diag::warn_hlsl_payload_access_no_write_for_trace_payload)
           << Field->getName();
     }
@@ -830,7 +889,7 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
   for (const FieldDecl *Field : NonWriteableFields) {
     if (TraceInfo.WritesPerField.count(Field)) {
       S.Diag(
-          Trace.Call->getArg(7)->getExprLoc(),
+          PldCall.Call->getArg(PldArgIdx)->getExprLoc(),
           diag::warn_hlsl_payload_access_write_but_no_write_for_trace_payload)
           << Field->getName();
     }
@@ -846,7 +905,7 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
   bool CallFound = false;
   for (auto Element : *Parent) { // TODO: reverse iterate?
     if (Optional<CFGStmt> S = Element.getAs<CFGStmt>()) {
-      if (S->getStmt() == Trace.Call) {
+      if (S->getStmt() == PldCall.Call) {
         CallFound = true;
         continue;
       }
@@ -863,7 +922,7 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
 
   for (const FieldDecl *Field : ReadableFields) {
     if (!TraceInfo.ReadsPerField.count(Field)) {
-      S.Diag(Trace.Call->getArg(7)->getExprLoc(),
+      S.Diag(PldCall.Call->getArg(PldArgIdx)->getExprLoc(),
              diag::warn_hlsl_payload_access_read_but_no_read_after_trace)
           << Field->getName();
     }
@@ -896,27 +955,29 @@ void DiagnoseTraceCall(Sema &S, const VarDecl *Payload,
   }
 }
 
-// Emit diagnostics for all TraceRay calls.
-void DiagnoseTraceCalls(Sema &S, CFG &ShaderCFG, DominatorTree &DT,
-                        DxrShaderDiagnoseInfo &Info) {
-  // Collect TraceRay calls in the shader.
+// Emit diagnostics for all calls to TraceRay, HitObject::TraceRay or
+// HitObject::Invoke.
+void DiagnoseBuiltinCallsWithPayload(Sema &S, CFG &ShaderCFG, DominatorTree &DT,
+                                     DxrShaderDiagnoseInfo &Info) {
+  // Collect calls with payload in the shader.
   std::set<const CFGBlock *> Visited;
-  ForwardTraverseCFGAndCollectTraceCalls(ShaderCFG.getEntry(), Info, Visited);
+  ForwardTraverseCFGAndCollectBuiltinCallsWithPayload(ShaderCFG.getEntry(),
+                                                      Info, Visited);
 
   std::set<const CallExpr *> Diagnosed;
 
-  for (const TraceRayCall &TraceCall : Info.TraceCalls) {
-    if (Diagnosed.count(TraceCall.Call))
+  for (const PayloadBuiltinCall &PldCall : Info.PayloadBuiltinCalls) {
+    if (Diagnosed.count(PldCall.Call))
       continue;
-    Diagnosed.insert(TraceCall.Call);
+    Diagnosed.insert(PldCall.Call);
 
-    const VarDecl *Payload = GetPayloadParameterForTraceCall(TraceCall.Call);
-    DiagnoseTraceCall(S, Payload, TraceCall, DT);
+    const VarDecl *Payload = GetPayloadParameterForBuiltinCall(PldCall.Call);
+    DiagnoseBuiltinCallWithPayload(S, Payload, PldCall, DT);
   }
 }
 
 // Emit diagnostics for all access to the payload of a shader,
-// and the input to TraceRay calls.
+// and the input to TraceRay, HitObject::TraceRay or HitObject::Invoke calls.
 std::vector<const FieldDecl *>
 DiagnosePayloadAccess(Sema &S, DxrShaderDiagnoseInfo &Info,
                       const std::set<const FieldDecl *> &FieldsToIgnoreRead,
@@ -969,9 +1030,9 @@ DiagnosePayloadAccess(Sema &S, DxrShaderDiagnoseInfo &Info,
     // Add calls that write fields as writes to allow the diagnostics on reads
     // to check if a call that writes the field dominates the read.
 
-    for (auto& P : WrittenFieldsInCalls) {
-        for (const FieldDecl* Field : P.second) {
-            Info.WritesPerField[Field].push_back(P.first);
+    for (auto &P : WrittenFieldsInCalls) {
+      for (const FieldDecl *Field : P.second) {
+        Info.WritesPerField[Field].push_back(P.first);
       }
     }
 
@@ -980,7 +1041,7 @@ DiagnosePayloadAccess(Sema &S, DxrShaderDiagnoseInfo &Info,
       DiagnosePayloadReads(S, TheCFG, DT, Info, NonReadableFields);
   }
 
-  DiagnoseTraceCalls(S, TheCFG, DT, Info);
+  DiagnoseBuiltinCallsWithPayload(S, TheCFG, DT, Info);
 
   return WrittenFields;
 }
@@ -1004,6 +1065,13 @@ const Stmt *IgnoreParensAndDecay(const Stmt *S) {
       return S;
     }
   }
+}
+
+const MemberExpr *GetPayloadFieldMember(const Stmt *S) {
+  const MemberExpr *Member = dyn_cast_or_null<MemberExpr>(S);
+  if (!Member || !isa<FieldDecl>(Member->getMemberDecl()))
+    return nullptr;
+  return Member;
 }
 
 // Emit warnings for calls that pass the payload to extern functions.
@@ -1116,4 +1184,138 @@ void DiagnoseRaytracingPayloadAccess(clang::Sema &S,
   visitor.diagnose(TU);
 }
 
+void DiagnoseCallableEntry(Sema &S, FunctionDecl *FD,
+                           llvm::StringRef StageName) {
+  if (!FD->getReturnType()->isVoidType())
+    S.Diag(FD->getLocation(), diag::err_shader_must_return_void) << StageName;
+
+  if (FD->getNumParams() != 1)
+    S.Diag(FD->getLocation(), diag::err_raytracing_entry_param_count)
+        << StageName << FD->getNumParams()
+        << /*Special message for callable.*/ 3;
+  else {
+    ParmVarDecl *Param = FD->getParamDecl(0);
+    if (!(Param->getAttr<HLSLInOutAttr>() ||
+          (Param->getAttr<HLSLOutAttr>() && Param->getAttr<HLSLInAttr>())))
+      S.Diag(Param->getLocation(), diag::err_payload_requires_inout)
+          << /*payload|callable*/ 1 << Param;
+    QualType Ty = Param->getType().getNonReferenceType();
+
+    // Don't diagnose incomplete type here. Function parameters are
+    // checked in Sema::CheckParmsForFunctionDef.
+    if (!S.RequireCompleteType(Param->getLocation(), Ty, 0) &&
+        !(hlsl::IsHLSLCopyableAnnotatableRecord(Ty)))
+      S.Diag(Param->getLocation(), diag::err_payload_attrs_must_be_udt)
+          << /*payload|attributes|callable*/ 2 << /*parameter %2|type*/ 0
+          << Param;
+  }
+  return;
+}
+
+void DiagnoseMissOrAnyHitEntry(Sema &S, FunctionDecl *FD,
+                               llvm::StringRef StageName,
+                               DXIL::ShaderKind Stage) {
+  if (!FD->getReturnType()->isVoidType())
+    S.Diag(FD->getLocation(), diag::err_shader_must_return_void) << StageName;
+
+  unsigned ExpectedParams = Stage == DXIL::ShaderKind::Miss ? 1 : 2;
+  if (ExpectedParams != FD->getNumParams()) {
+    S.Diag(FD->getLocation(), diag::err_raytracing_entry_param_count)
+        << StageName << FD->getNumParams() << ExpectedParams;
+    return;
+  }
+  ParmVarDecl *Param = FD->getParamDecl(0);
+  if (!(Param->getAttr<HLSLInOutAttr>() ||
+        (Param->getAttr<HLSLOutAttr>() && Param->getAttr<HLSLInAttr>()))) {
+    S.Diag(Param->getLocation(), diag::err_payload_requires_inout)
+        << /*payload|callable*/ 0 << Param;
+    return;
+  }
+
+  if (FD->getNumParams() > 1) {
+    Param = FD->getParamDecl(1);
+    if (Param->getAttr<HLSLInOutAttr>() || Param->getAttr<HLSLOutAttr>()) {
+      S.Diag(Param->getLocation(), diag::err_attributes_requiers_in) << Param;
+      return;
+    }
+  }
+
+  for (unsigned Idx = 0; Idx < ExpectedParams && Idx < FD->getNumParams();
+       ++Idx) {
+    Param = FD->getParamDecl(Idx);
+
+    QualType Ty = Param->getType().getNonReferenceType();
+
+    // Don't diagnose here, just continue if this fails. Function parameters are
+    // checked in Sema::CheckParmsForFunctionDef.
+    if (S.RequireCompleteType(Param->getLocation(), Ty, 0))
+      continue;
+
+    if (!(hlsl::IsHLSLCopyableAnnotatableRecord(Ty))) {
+      S.Diag(Param->getLocation(), diag::err_payload_attrs_must_be_udt)
+          << /*payload|attributes|callable*/ Idx << /*parameter %2|type*/ 0
+          << Param;
+    }
+  }
+  return;
+}
+
+void DiagnoseRayGenerationOrIntersectionEntry(Sema &S, FunctionDecl *FD,
+                                              llvm::StringRef StageName) {
+  if (!FD->getReturnType()->isVoidType())
+    S.Diag(FD->getLocation(), diag::err_shader_must_return_void) << StageName;
+  unsigned ExpectedParams = 0;
+  if (ExpectedParams != FD->getNumParams())
+    S.Diag(FD->getLocation(), diag::err_raytracing_entry_param_count)
+        << StageName << FD->getNumParams() << ExpectedParams;
+  return;
+}
+
+void DiagnoseClosestHitEntry(Sema &S, FunctionDecl *FD,
+                             llvm::StringRef StageName) {
+  if (!FD->getReturnType()->isVoidType())
+    S.Diag(FD->getLocation(), diag::err_shader_must_return_void) << StageName;
+  unsigned ExpectedParams = 2;
+
+  if (ExpectedParams != FD->getNumParams()) {
+    S.Diag(FD->getLocation(), diag::err_raytracing_entry_param_count)
+        << StageName << FD->getNumParams() << ExpectedParams;
+  }
+
+  if (FD->getNumParams() == 0)
+    return;
+
+  ParmVarDecl *Param = FD->getParamDecl(0);
+  if (!(Param->getAttr<HLSLInOutAttr>() ||
+        (Param->getAttr<HLSLOutAttr>() && Param->getAttr<HLSLInAttr>()))) {
+    S.Diag(Param->getLocation(), diag::err_payload_requires_inout)
+        << /*payload|callable*/ 0 << Param;
+  }
+
+  if (FD->getNumParams() > 1) {
+    Param = FD->getParamDecl(1);
+    if (Param->getAttr<HLSLInOutAttr>() || Param->getAttr<HLSLOutAttr>()) {
+      S.Diag(Param->getLocation(), diag::err_attributes_requiers_in) << Param;
+    }
+  }
+
+  for (unsigned Idx = 0; Idx < ExpectedParams && Idx < FD->getNumParams();
+       ++Idx) {
+    Param = FD->getParamDecl(Idx);
+
+    QualType Ty = Param->getType().getNonReferenceType();
+
+    // Don't diagnose here, just continue if this fails. Function parameters are
+    // checked in Sema::CheckParmsForFunctionDef.
+    if (S.RequireCompleteType(Param->getLocation(), Ty, 0))
+      continue;
+
+    if (!(hlsl::IsHLSLCopyableAnnotatableRecord(Ty))) {
+      S.Diag(Param->getLocation(), diag::err_payload_attrs_must_be_udt)
+          << /*payload|attributes|callable*/ Idx << /*parameter %2|type*/ 0
+          << Param;
+    }
+  }
+  return;
+}
 } // namespace hlsl

@@ -20,6 +20,8 @@
 #include "dxc/Support/SPIRVOptions.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/VersionTuple.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/StringRef.h"
 
@@ -42,15 +44,30 @@ enum class Extension {
   EXT_descriptor_indexing,
   EXT_fragment_fully_covered,
   EXT_fragment_invocation_density,
+  EXT_fragment_shader_interlock,
+  EXT_mesh_shader,
   EXT_shader_stencil_export,
   EXT_shader_viewport_index_layer,
   AMD_gpu_shader_half_float,
-  AMD_shader_explicit_vertex_parameter,
+  AMD_shader_early_and_late_fragment_tests,
   GOOGLE_hlsl_functionality1,
   GOOGLE_user_type,
   NV_ray_tracing,
   NV_mesh_shader,
   KHR_ray_query,
+  EXT_shader_image_int64,
+  KHR_physical_storage_buffer,
+  AMD_shader_enqueue,
+  KHR_vulkan_memory_model,
+  NV_compute_shader_derivatives,
+  KHR_compute_shader_derivatives,
+  KHR_fragment_shader_barycentric,
+  KHR_maximal_reconvergence,
+  KHR_float_controls,
+  NV_shader_subgroup_partitioned,
+  KHR_quad_control,
+  EXT_descriptor_heap,
+  KHR_untyped_pointers,
   Unknown,
 };
 
@@ -65,7 +82,7 @@ public:
   /// Allows all extensions to be used in CodeGen.
   void allowAllKnownExtensions();
 
-  /// Rqeusts the given extension for translating the given target feature at
+  /// Requests the given extension for translating the given target feature at
   /// the given source location. Emits an error if the given extension is not
   /// permitted to use.
   bool requestExtension(Extension, llvm::StringRef target, SourceLocation);
@@ -77,13 +94,13 @@ public:
   const char *getExtensionName(Extension symbol);
 
   /// Returns true if the given extension is a KHR extension.
-  bool isKHRExtension(llvm::StringRef name);
+  bool isKHRExtension(llvm::StringRef name) const;
 
   /// Returns the names of all known extensions as a string.
   std::string getKnownExtensions(const char *delimiter, const char *prefix = "",
                                  const char *postfix = "");
 
-  /// Rqeusts the given target environment for translating the given feature at
+  /// Request the given target environment for translating the given feature at
   /// the given source location. Emits an error if the requested target
   /// environment does not match user's target environemnt.
   bool requestTargetEnv(spv_target_env, llvm::StringRef target, SourceLocation);
@@ -95,18 +112,49 @@ public:
 
   /// Returns true if the given extension is not part of the core of the target
   /// environment.
-  bool isExtensionRequiredForTargetEnv(Extension);
+  bool isExtensionRequiredForTargetEnv(Extension) const;
 
   /// Returns true if the given extension is set in allowedExtensions
-  bool isExtensionEnabled(Extension);
+  bool isExtensionEnabled(Extension) const;
 
   /// Returns true if the target environment is Vulkan 1.1 or above.
   /// Returns false otherwise.
-  bool isTargetEnvVulkan1p1OrAbove();
+  bool isTargetEnvVulkan1p1OrAbove() const;
+
+  /// Returns true if the target environment is SPIR-V 1.4 or above.
+  /// Returns false otherwise.
+  bool isTargetEnvSpirv1p4OrAbove() const;
+
+  /// Returns true if the target environment is Vulkan 1.1 with SPIR-V 1.4 or
+  /// above. Returns false otherwise.
+  bool isTargetEnvVulkan1p1Spirv1p4OrAbove() const;
 
   /// Returns true if the target environment is Vulkan 1.2 or above.
   /// Returns false otherwise.
-  bool isTargetEnvVulkan1p2OrAbove();
+  bool isTargetEnvVulkan1p2OrAbove() const;
+
+  /// Returns true if the target environment is Vulkan 1.3 or above.
+  /// Returns false otherwise.
+  bool isTargetEnvVulkan1p3OrAbove() const;
+
+  /// Return true if the target environment is a Vulkan environment.
+  bool isTargetEnvVulkan() const;
+
+  /// Returns the spv_target_env matching the input string if possible.
+  /// This functions matches the spv_target_env with the command-line version
+  /// of the name ('vulkan1.1', not 'Vulkan 1.1').
+  /// Returns an empty Optional if no matching env is found.
+  static llvm::Optional<spv_target_env>
+  stringToSpvEnvironment(const std::string &target_env);
+
+  // Returns the SPIR-V version used for the target environment.
+  static clang::VersionTuple getSpirvVersion(spv_target_env env);
+
+  /// Returns the equivalent to spv_target_env in pretty, human readable form.
+  /// (SPV_ENV_VULKAN_1_0 -> "Vulkan 1.0").
+  /// Returns an empty Optional if the name cannot be matched.
+  static llvm::Optional<std::string>
+  spvEnvironmentToPrettyName(spv_target_env target_env);
 
 private:
   /// Returns whether codegen should allow usage of this extension by default.

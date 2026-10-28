@@ -1,15 +1,15 @@
-// Run: %dxc -T lib_6_3 -fspv-target-env=vulkan1.2
+// RUN: %dxc -T lib_6_3 -fspv-target-env=vulkan1.2 -fcgl  %s -spirv | FileCheck %s
 // CHECK:  OpCapability RayTracingKHR
 // CHECK:  OpExtension "SPV_KHR_ray_tracing"
 
-// CHECK:  OpDecorate [[l:%\d+]] BuiltIn HitKindNV
+// CHECK:  OpDecorate [[l:%[0-9]+]] BuiltIn HitKindKHR
 
-// CHECK:  OpTypePointer IncomingRayPayloadNV %Payload
+// CHECK:  OpTypePointer IncomingRayPayloadKHR %Payload
 struct Payload
 {
   float4 color;
 };
-// CHECK:  OpTypePointer HitAttributeNV %Attribute
+// CHECK:  OpTypePointer HitAttributeKHR %Attribute
 struct Attribute
 {
   float2 bary;

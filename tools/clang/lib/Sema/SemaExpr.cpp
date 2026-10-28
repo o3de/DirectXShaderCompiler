@@ -11,7 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "clang/Sema/SemaInternal.h"
 #include "TreeTransform.h"
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
@@ -24,6 +23,8 @@
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ExprObjC.h"
+#include "clang/AST/HlslTypes.h" // HLSL Change
+#include "clang/AST/OperationKinds.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/PartialDiagnostic.h"
@@ -41,9 +42,10 @@
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/SemaFixItUtils.h"
+#include "clang/Sema/SemaHLSL.h" // HLSL Change
+#include "clang/Sema/SemaInternal.h"
 #include "clang/Sema/Template.h"
 #include "llvm/Support/ConvertUTF.h"
-#include "clang/Sema/SemaHLSL.h" // HLSL Change
 using namespace clang;
 using namespace sema;
 
@@ -698,6 +700,11 @@ ExprResult Sema::DefaultLvalueConversion(Expr *E) {
     return ExprError();
   }
 
+  // HLSL Change Begin
+  // For HLSL we should not strip qualifiers for array types.
+  bool StripQualifiers = getLangOpts().HLSL ? !T->isArrayType() : true;
+  // HLSL Change End
+
   // C++ [conv.lval]p1:
   //   [...] If T is a non-class type, the type of the prvalue is the
   //   cv-unqualified version of T. Otherwise, the type of the
@@ -707,7 +714,7 @@ ExprResult Sema::DefaultLvalueConversion(Expr *E) {
   //   If the lvalue has qualified type, the value has the unqualified
   //   version of the type of the lvalue; otherwise, the value has the
   //   type of the lvalue.
-  if (T.hasQualifiers())
+  if (T.hasQualifiers() && StripQualifiers) // HLSL Change don't unqualify
     T = T.getUnqualifiedType();
 
   UpdateMarkingForLValueToRValue(E);
@@ -917,7 +924,7 @@ void Sema::checkVariadicArgument(const Expr *E, VariadicCallType CT) {
         E->getLocStart(), nullptr,
         PDiag(diag::warn_cxx98_compat_pass_non_pod_arg_to_vararg)
           << Ty << CT);
-    // Fall through.
+    LLVM_FALLTHROUGH; // HLSL Change
   case VAK_Valid:
     if (Ty->isRecordType()) {
       // This is unlikely to be what the user intended. If the class has a
@@ -1460,7 +1467,7 @@ Sema::CreateGenericSelectionExpr(SourceLocation KeyLoc,
         ContainsUnexpandedParameterPack);
 
   SmallVector<unsigned, 1> CompatIndices;
-  unsigned DefaultIndex = -1U;
+  unsigned DefaultIndex = std::numeric_limits<unsigned>::max();
   for (unsigned i = 0; i < NumAssocs; ++i) {
     if (!Types[i])
       DefaultIndex = i;
@@ -1492,7 +1499,8 @@ Sema::CreateGenericSelectionExpr(SourceLocation KeyLoc,
   // C11 6.5.1.1p2 "If a generic selection has no default generic association,
   // its controlling expression shall have type compatible with exactly one of
   // the types named in its generic association list."
-  if (DefaultIndex == -1U && CompatIndices.size() == 0) {
+  if (DefaultIndex == std::numeric_limits<unsigned>::max() &&
+      CompatIndices.size() == 0) {
     // We strip parens here because the controlling expression is typically
     // parenthesized in macro definitions.
     ControllingExpr = ControllingExpr->IgnoreParens();
@@ -1904,13 +1912,15 @@ Sema::DiagnoseEmptyLookup(Scope *S, CXXScopeSpec &SS, LookupResult &R,
           
           CXXScopeSpec SS;
           SS.Adopt(ULE->getQualifierLoc());
+          // HLSL Change Begin - This is a reference.
           CXXDependentScopeMemberExpr *DepExpr =
               CXXDependentScopeMemberExpr::Create(
-                  Context, DepThis, DepThisType, true, SourceLocation(),
-                  SS.getWithLocInContext(Context),
-                  ULE->getTemplateKeywordLoc(), nullptr,
-                  R.getLookupNameInfo(),
+                  Context, DepThis, DepThisType,
+                  /*IsArrow*/ !getLangOpts().HLSL, SourceLocation(),
+                  SS.getWithLocInContext(Context), ULE->getTemplateKeywordLoc(),
+                  nullptr, R.getLookupNameInfo(),
                   ULE->hasExplicitTemplateArgs() ? &TList : nullptr);
+          // HLSL Change End - This is a reference.
           CallsUndergoingInstantiation.back()->setCallee(DepExpr);
         } else {
           Diag(R.getNameLoc(), diagnostic) << Name;
@@ -1956,7 +1966,8 @@ Sema::DiagnoseEmptyLookup(Scope *S, CXXScopeSpec &SS, LookupResult &R,
            "Diagnosing an empty lookup with explicit template args!");
     *Out = CorrectTypoDelayed(
         R.getLookupNameInfo(), R.getLookupKind(), S, &SS, std::move(CCC),
-        [=](const TypoCorrection &TC) {
+        [this, SS, Name, TypoLoc, Args, diagnostic,
+         diagnostic_suggest](const TypoCorrection &TC) {
           emitEmptyLookupTypoDiagnostic(TC, *this, SS, Name, TypoLoc, Args,
                                         diagnostic, diagnostic_suggest);
         },
@@ -2094,6 +2105,12 @@ recoverFromMSUnqualifiedLookup(Sema &S, ASTContext &Context,
   DB << NameInfo.getName() << RD;
 
   if (!ThisType.isNull()) {
+    // HLSL Change Begin - This code is broken because `this` is a reference in
+    // HLSL, but this code should also be unreachable.
+    assert(!S.getLangOpts().HLSL &&
+           "This should be unreachable in DXC because we don't enable the "
+           "MSCompat language feature.");
+    // HLSL Change End
     DB << FixItHint::CreateInsertion(Loc, "this->");
     return CXXDependentScopeMemberExpr::Create(
         Context, /*This=*/nullptr, ThisType, /*IsArrow=*/true,
@@ -2330,9 +2347,19 @@ Sema::ActOnIdExpression(Scope *S, CXXScopeSpec &SS,
       return BuildPossibleImplicitMemberExpr(SS, TemplateKWLoc,
                                              R, TemplateArgs);
   }
-
+  // HLSL Change Begin: Allow templates without empty argument list if default
+  // arguments are provided.
+  if (getLangOpts().HLSL && R.isSingleResult()) {
+    if (TemplateDecl *Template = dyn_cast<TemplateDecl>(R.getFoundDecl())) {
+      if (Template->getTemplateParameters()->getMinRequiredArguments() == 0) {
+        TemplateArgsBuffer.setLAngleLoc(NameLoc);
+        TemplateArgsBuffer.setRAngleLoc(NameLoc);
+        TemplateArgs = &TemplateArgsBuffer;
+      }
+    }
+  }
+  // HLSL Change End
   if (TemplateArgs || TemplateKWLoc.isValid()) {
-
     // In C++1y, if this is a variable template id, then check it
     // in BuildTemplateIdExpr().
     // The single lookup result must be a variable template declaration.
@@ -2722,6 +2749,27 @@ Sema::PerformObjectMemberConversion(Expr *From,
   }
 
   CXXCastPath BasePath;
+  // HLSL Change Begin
+  // When converting ConstantBuffer or TextureBuffers to 
+  // TextureBuffer
+  if (getLangOpts().HLSL) {
+    if (auto TSTy = dyn_cast<TemplateSpecializationType>(FromRecordType)) {
+      if (TSTy->getTemplateName().getAsTemplateDecl()->getName() ==
+              "ConstantBuffer" ||
+          TSTy->getTemplateName().getAsTemplateDecl()->getName() ==
+              "TextureBuffer") {
+        auto FirstArg = TSTy->getArgs()[0];
+        if (FirstArg.getKind() == TemplateArgument::Type &&
+            FirstArg.getAsType() == DestRecordType) {
+          return ImpCastExprToType(From, DestType, CK_FlatConversion, VK,
+                                   &BasePath);
+        }
+      }
+    }
+  }
+
+  // HLSL Change End.
+  
   if (CheckDerivedToBaseConversion(FromRecordType, DestRecordType,
                                    FromLoc, FromRange, &BasePath,
                                    IgnoreAccess))
@@ -2741,13 +2789,18 @@ bool Sema::UseArgumentDependentLookup(const CXXScopeSpec &SS,
   // Never if a scope specifier was provided.
   if (SS.isSet()) {
     // HLSL Change begins
-    // We want to be able to have intrinsics inside the "vk" namespace.
+    // We want to be able to have intrinsics inside the "vk" and "dx"
+    // namespaces.
     const bool isVkNamespace =
         SS.getScopeRep() && SS.getScopeRep()->getAsNamespace() &&
         SS.getScopeRep()->getAsNamespace()->getName() == "vk";
 
-    if (!isVkNamespace)
-    // HLSL Change ends
+    const bool isDxNamespace =
+        SS.getScopeRep() && SS.getScopeRep()->getAsNamespace() &&
+        SS.getScopeRep()->getAsNamespace()->getName() == "dx";
+
+    if (!isVkNamespace && !isDxNamespace)
+      // HLSL Change ends
       return false;
   }
 
@@ -2969,7 +3022,7 @@ ExprResult Sema::BuildDeclarationNameExpr(
         valueKind = VK_RValue;
         break;
       }
-      // fallthrough
+      LLVM_FALLTHROUGH; // HLSL Change
 
     case Decl::ImplicitParam:
     case Decl::ParmVar: {
@@ -3050,7 +3103,7 @@ ExprResult Sema::BuildDeclarationNameExpr(
         valueKind = VK_LValue;
         break;
       }
-      // fallthrough
+      LLVM_FALLTHROUGH; // HLSL Change
 
     case Decl::CXXConversion:
     case Decl::CXXDestructor:
@@ -3212,7 +3265,7 @@ ExprResult Sema::ActOnIntegerConstant(SourceLocation Loc, uint64_t Val) {
   unsigned IntSize = Context.getTargetInfo().getIntWidth();
   // HLSL Change Starts - HLSL literal int
   QualType Ty;
-  if (getLangOpts().HLSL) {
+  if (getLangOpts().HLSL && getLangOpts().HLSLVersion < hlsl::LangStd::v202x) {
     IntSize = 64;
     Ty = Context.LitIntTy;
   } else
@@ -3406,13 +3459,21 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
 
       Ty = Context.FloatTy;
     // HLSL Change Starts
-    else if (getLangOpts().HLSL && !Literal.isLong && !Literal.isHalf)
+    else if (getLangOpts().HLSL &&
+             getLangOpts().HLSLVersion < hlsl::LangStd::v202x &&
+             !Literal.isLong && !Literal.isHalf)
       Ty = Context.LitFloatTy;
-    else if (getLangOpts().HLSL && Literal.isLong)
+    else if (Literal.isLong)
       Ty = Context.DoubleTy;
-    else if (getLangOpts().HLSL && Literal.isHalf) {
-      Ty = getLangOpts().UseMinPrecision ? Context.FloatTy : Context.HalfTy;
-    }
+    else if (Literal.isHalf) {
+      if (getLangOpts().HLSL &&
+          getLangOpts().HLSLVersion < hlsl::LangStd::v202x)
+        Ty = getLangOpts().UseMinPrecision ? Context.FloatTy : Context.HalfTy;
+      else
+        Ty = getLangOpts().UseMinPrecision ? Context.HalfFloatTy
+                                           : Context.HalfTy;
+    } else if (getLangOpts().HLSL)
+      Ty = Context.FloatTy;
     // HLSL Change Ends
     else if (!Literal.isLong)
       Ty = Context.DoubleTy;
@@ -3435,7 +3496,8 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
     return ExprError();
 
   // HLSL Change Starts
-  } else if (getLangOpts().HLSL) {
+  } else if (getLangOpts().HLSL &&
+             getLangOpts().HLSLVersion < hlsl::LangStd::v202x) {
     QualType Ty;
     unsigned Width = 64;
     llvm::APInt ResultVal(Width, 0);
@@ -3444,12 +3506,14 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
       Ty = Context.LitIntTy;
       if (Literal.GetIntegerValue(ResultVal)) {
         // If this value didn't fit into 64-bit literal int, report error.
-        Diag(Tok.getLocation(), diag::err_integer_literal_too_large);
+        Diag(Tok.getLocation(), diag::err_integer_literal_too_large)
+            << /* Unsigned */ 1;
       }
     } else {
 
       if (Literal.GetIntegerValue(ResultVal)) {
-        Diag(Tok.getLocation(), diag::err_integer_literal_too_large);
+        Diag(Tok.getLocation(), diag::err_integer_literal_too_large)
+            << /* Unsigned */ 1;
       }
       if (Literal.isLongLong) {
         if (Literal.isUnsigned)
@@ -3468,14 +3532,24 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
           Ty = Context.IntTy;
       }
     }
+    if (Literal.getRadix() != 10) {
+      uint64_t Val = ResultVal.getLimitedValue();
+      if (Val < std::numeric_limits<uint32_t>::max())
+        Width = 32;
+      uint64_t MSB = 1ull << (Width - 1);
+      if ((Val & MSB) != 0)
+        Diag(Tok.getLocation(),
+             diag::warn_hlsl_legacy_integer_literal_signedness);
+    }
     return IntegerLiteral::Create(Context, ResultVal, Ty, Tok.getLocation());
   // HLSL Change Ends
 
   } else {
     QualType Ty;
 
+    // HLSL Change: disable the warning below.
     // 'long long' is a C99 or C++11 feature.
-    if (!getLangOpts().C99 && Literal.isLongLong) {
+    if (!getLangOpts().HLSL && !getLangOpts().C99 && Literal.isLongLong) {
       if (getLangOpts().CPlusPlus)
         Diag(Tok.getLocation(),
              getLangOpts().CPlusPlus11 ?
@@ -3494,6 +3568,9 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
         Context.getTargetInfo().hasInt128Type())
       MaxWidth = 128;
     llvm::APInt ResultVal(MaxWidth, 0);
+
+    // HLSL Change - 202x integer warnings.
+    uint64_t MSB = 1ull << (MaxWidth - 1);
 
     if (Literal.GetIntegerValue(ResultVal)) {
       // If this value didn't fit into uintmax_t, error and force to ull.
@@ -3545,6 +3622,17 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
         }
       }
 
+      // HLSL Change Begin - Treat `long` literal as `long long`
+      // This is a bit hacky. HLSL doesn't really have a `long` or `long long`
+      // type so the specification has simplified the suffices. Unfortunately,
+      // rather than just treating `ll` as `l` we need to do the inverse. This
+      // is because we rely on the MSVC mangling which follows LLP64 (l being
+      // 32-bit and ll 64-bit). We should find a better solution to this in
+      // Clang.
+      if (getLangOpts().HLSL && !Literal.isLongLong)
+        Literal.isLongLong = Literal.isLong;
+      // HLSL Change End
+
       // Are long/unsigned long possibilities?
       if (Ty.isNull() && !Literal.isLongLong) {
         unsigned LongSize = Context.getTargetInfo().getLongWidth();
@@ -3558,7 +3646,9 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
             Ty = Context.UnsignedLongTy;
           // Check according to the rules of C90 6.1.3.2p5. C++03 [lex.icon]p2
           // is compatible.
-          else if (!getLangOpts().C99 && !getLangOpts().CPlusPlus11) {
+          // HLSL Change: HLSL will promote to the next signed integer type.
+          else if (!getLangOpts().HLSL && !getLangOpts().C99 &&
+                   !getLangOpts().CPlusPlus11) {
             const unsigned LongLongSize =
                 Context.getTargetInfo().getLongLongWidth();
             Diag(Tok.getLocation(),
@@ -3604,7 +3694,16 @@ ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
 
       if (ResultVal.getBitWidth() != Width)
         ResultVal = ResultVal.trunc(Width);
+      MSB = 1ull << (Width - 1); // HLSL Change - 202x integer warnings.
     }
+    // HLSL Change Begin - 202x integer warnings.
+    if (Literal.getRadix() != 10) {
+      uint64_t Val = ResultVal.getLimitedValue();
+      if ((Val & MSB) != 0)
+        Diag(Tok.getLocation(),
+             diag::warn_hlsl_legacy_integer_literal_signedness);
+    }
+    // HLSL Change End - 202x integer warnings.
     Res = IntegerLiteral::Create(Context, ResultVal, Ty, Tok.getLocation());
   }
 
@@ -3703,16 +3802,31 @@ static void warnOnSizeofOnArrayDecay(Sema &S, SourceLocation Loc, QualType T,
 }
 
 // HLSL Change Begins
-bool Sema::CheckHLSLUnaryExprOrTypeTraitOperand(QualType ExprType, SourceLocation Loc,
+bool Sema::CheckHLSLUnaryExprOrTypeTraitOperand(QualType ExprType,
+                                                SourceLocation Loc,
                                                 UnaryExprOrTypeTrait ExprKind) {
   assert(ExprKind == UnaryExprOrTypeTrait::UETT_SizeOf);
 
-  // "sizeof 42" is ill-defined because HLSL has literal int type which can decay to an int of any size.
-  const BuiltinType* BuiltinTy = ExprType->getAs<BuiltinType>();
-  if (BuiltinTy != nullptr && (BuiltinTy->getKind() == BuiltinType::LitInt || BuiltinTy->getKind() == BuiltinType::LitFloat)) {
+  if (RequireCompleteType(Loc, ExprType,
+                          diag::err_sizeof_alignof_incomplete_type, ExprKind,
+                          ExprType))
+    return true;
+
+  // "sizeof 42" is ill-defined because HLSL has literal int type which can
+  // decay to an int of any size.
+  const BuiltinType *BuiltinTy = ExprType->getAs<BuiltinType>();
+  if (BuiltinTy != nullptr && (BuiltinTy->getKind() == BuiltinType::LitInt ||
+                               BuiltinTy->getKind() == BuiltinType::LitFloat)) {
     Diag(Loc, diag::err_hlsl_sizeof_literal) << ExprType;
     return true;
   }
+
+  // vk::BufferPointer is allowed in sizeof
+#ifdef ENABLE_SPIRV_CODEGEN
+  if (hlsl::IsVKBufferPointerType(ExprType)) {
+    return false;
+  }
+#endif
 
   if (!hlsl::IsHLSLNumericOrAggregateOfNumericType(ExprType)) {
     Diag(Loc, diag::err_hlsl_sizeof_nonnumeric) << ExprType;
@@ -4245,6 +4359,10 @@ Sema::CreateBuiltinArraySubscriptExpr(Expr *Base, SourceLocation LLoc,
       BaseExpr = LHSExp;
       IndexExpr = RHSExp;
       ResultType = LHSTy->getAsArrayTypeUnsafe()->getElementType();
+      // We need to make sure to preserve qualifiers on array types, since these
+      // are in effect references.
+      if (LHSTy.hasQualifiers())
+        ResultType.setLocalFastQualifiers(LHSTy.getQualifiers().getFastQualifiers());
     } else {
     // HLSL Change Ends
       Diag(LHSExp->getLocStart(), diag::ext_subscript_non_lvalue) <<
@@ -4339,50 +4457,15 @@ ExprResult Sema::BuildCXXDefaultArgExpr(SourceLocation CallLoc,
   }
   
   if (Param->hasUninstantiatedDefaultArg()) {
-    Expr *UninstExpr = Param->getUninstantiatedDefaultArg();
-
-    EnterExpressionEvaluationContext EvalContext(*this, PotentiallyEvaluated,
-                                                 Param);
-
+    /// HLSL Change Begin - back ported from llvm-project/4409a83c2935.
     // Instantiate the expression.
     MultiLevelTemplateArgumentList MutiLevelArgList
       = getTemplateInstantiationArgs(FD, nullptr, /*RelativeToPrimary=*/true);
 
-    InstantiatingTemplate Inst(*this, CallLoc, Param,
-                               MutiLevelArgList.getInnermost());
-    if (Inst.isInvalid())
+    if (SubstDefaultArgument(CallLoc, Param, MutiLevelArgList,
+                             /*ForCallExpr*/ true))
       return ExprError();
-
-    ExprResult Result;
-    {
-      // C++ [dcl.fct.default]p5:
-      //   The names in the [default argument] expression are bound, and
-      //   the semantic constraints are checked, at the point where the
-      //   default argument expression appears.
-      ContextRAII SavedContext(*this, FD);
-      LocalInstantiationScope Local(*this);
-      Result = SubstExpr(UninstExpr, MutiLevelArgList);
-    }
-    if (Result.isInvalid())
-      return ExprError();
-
-    // Check the expression as an initializer for the parameter.
-    InitializedEntity Entity
-      = InitializedEntity::InitializeParameter(Context, Param);
-    InitializationKind Kind
-      = InitializationKind::CreateCopy(Param->getLocation(),
-             /*FIXME:EqualLoc*/UninstExpr->getLocStart());
-    Expr *ResultE = Result.getAs<Expr>();
-
-    InitializationSequence InitSeq(*this, Entity, Kind, ResultE);
-    Result = InitSeq.Perform(*this, Entity, Kind, ResultE);
-    if (Result.isInvalid())
-      return ExprError();
-
-    Expr *Arg = Result.getAs<Expr>();
-    CheckCompletedExpr(Arg, Param->getOuterLocStart());
-    // Build the default argument expression.
-    return CXXDefaultArgExpr::Create(Context, CallLoc, Param, Arg);
+    /// HLSL Change End - back ported from llvm-project/4409a83c2935.
   }
 
   // If the default expression creates temporaries, we need to
@@ -5274,7 +5357,6 @@ Sema::BuildResolvedCallExpr(Expr *Fn, NamedDecl *NDecl,
   if (FDecl) {
     if (CheckFunctionCall(FDecl, TheCall, Proto))
       return ExprError();
-
     if (BuiltinID)
       return CheckBuiltinFunctionCall(FDecl, BuiltinID, TheCall);
   } else if (NDecl) {
@@ -6304,8 +6386,17 @@ QualType Sema::CheckConditionalOperands(ExprResult &Cond, ExprResult &LHS,
 
   // HLSL Change Starts: HLSL supports a vector condition and is
   // sufficiently different to merit its own checker.
-  if (getLangOpts().HLSL)
-    return hlsl::CheckVectorConditional(this, Cond, LHS, RHS, QuestionLoc);
+  if (getLangOpts().HLSL) {
+    // For HLSL 202x+ in a ternary operator we follow C++ rules unless both the
+    // right and left are minimum precision types, or either type is not a
+    // builtin scalar integer or float (e.g. vector, matrix, UDT).
+    QualType LHSTy = LHS.get()->getType();
+    QualType RHSTy = RHS.get()->getType();
+    if (getLangOpts().HLSLVersion < hlsl::LangStd::v202x ||
+        !LHSTy->isBuiltinType() || !RHSTy->isBuiltinType() ||
+        (hlsl::IsHLSLMinPrecision(LHSTy) && hlsl::IsHLSLMinPrecision(RHSTy)))
+      return hlsl::CheckVectorConditional(this, Cond, LHS, RHS, QuestionLoc);
+  }
   // HLSL Change Ends
 
   // C++ is sufficiently different to merit its own checker.
@@ -10370,7 +10461,12 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
 
   // HLSL Change Starts
   // Handle HLSL binary operands differently
-  if (getLangOpts().HLSL) {
+  if ((getLangOpts().HLSL &&
+          (getLangOpts().HLSLVersion < hlsl::LangStd::v2021 ||
+           !hlsl::IsUserDefinedRecordType(LHSExpr->getType()))) ||
+      !hlsl::DoesTypeDefineOverloadedOperator(
+          LHSExpr->getType(), clang::BinaryOperator::getOverloadedOperator(Opc),
+          RHSExpr->getType())) {
     hlsl::CheckBinOpForHLSL(*this, OpLoc, Opc, LHS, RHS, ResultTy, CompLHSTy, CompResultTy);
     if (!ResultTy.isNull() && Opc == BO_Comma) {
       // In C/C++, the RHS value kind should propagate. In HLSL, it should yield an r-value.
@@ -10446,6 +10542,7 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
     break;
   case BO_And:
     checkObjCPointerIntrospection(*this, LHS, RHS, OpLoc);
+    LLVM_FALLTHROUGH; // HLSL Change
   case BO_Xor:
   case BO_Or:
     ResultTy = CheckBitwiseOperands(LHS, RHS, OpLoc);
@@ -10488,6 +10585,7 @@ ExprResult Sema::CreateBuiltinBinOp(SourceLocation OpLoc,
   case BO_AndAssign:
   case BO_OrAssign: // fallthrough
 	  DiagnoseSelfAssignment(*this, LHS.get(), RHS.get(), OpLoc);
+          LLVM_FALLTHROUGH; // HLSL Change
   case BO_XorAssign:
     CompResultTy = CheckBitwiseOperands(LHS, RHS, OpLoc, true);
     CompLHSTy = CompResultTy;
@@ -10846,10 +10944,20 @@ ExprResult Sema::BuildBinOp(Scope *S, SourceLocation OpLoc,
     RHSExpr = resolvedRHS.get();
   }
 
-  // HLSL Change: bypass binary operator overload work, which isn't supported in any case;
-  // otherwise more extensive changes need to be done to add HLSL-specific behavior to
-  // be considered when building overload candidate sets
-  if (getLangOpts().CPlusPlus && !getLangOpts().HLSL) {
+  // HLSL Change: The condition of this if-statement must be false for the
+  // binary operator overloading for HLSL-specific resource types because they
+  // must be handled by the following CreateBuiltinBinOp(). If it is a
+  // user-defined type with operator overloading methods, we know it is not a
+  // binary operator overloading for a HLSL-specific resource type. This
+  // if-statement condition does not perfectly checks all the cases, but it
+  // simply checks whether it is a user-defined type with operator overloading
+  // methods or not.
+  if (getLangOpts().CPlusPlus &&
+      (!getLangOpts().HLSL || getLangOpts().HLSLVersion >= hlsl::LangStd::v2021) &&
+      hlsl::IsUserDefinedRecordType(LHSExpr->getType()) &&
+      hlsl::DoesTypeDefineOverloadedOperator(
+          LHSExpr->getType(), clang::BinaryOperator::getOverloadedOperator(Opc),
+          RHSExpr->getType())) {
     // If either expression is type-dependent, always build an
     // overloaded op.
     if (LHSExpr->isTypeDependent() || RHSExpr->isTypeDependent())

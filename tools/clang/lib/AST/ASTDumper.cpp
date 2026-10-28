@@ -23,6 +23,7 @@
 #include "clang/AST/TypeVisitor.h"
 #include "clang/Basic/Module.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Sema/SemaHLSL.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace clang;
 using namespace clang::comments;
@@ -118,6 +119,8 @@ namespace  {
 
     bool ShowColors;
 
+    bool DumpImplicitTopLevelDecls = true; // HLSL Change
+
     /// Dump a child of the current node.
     template<typename Fn> void dumpChild(Fn doDumpChild) {
       // If we're at the top level, there's nothing interesting to do; just
@@ -209,6 +212,10 @@ namespace  {
       : OS(OS), Traits(Traits), SM(SM), TopLevel(true), FirstChild(true),
         LastLocFilename(""), LastLocLine(~0U),
         ShowColors(ShowColors) { }
+
+    // HLSL Change Start - filter implicit decls.
+    void setDumpImplicitTopLevelDecls(bool B) { DumpImplicitTopLevelDecls = B; }
+    // HLSL Change End - filter implicit decls.
 
     void dumpDecl(const Decl *D);
     void dumpStmt(const Stmt *S);
@@ -335,7 +342,7 @@ namespace  {
       for (QualType PT : T->getParamTypes())
         dumpTypeAsChild(PT);
       if (EPI.Variadic)
-        dumpChild([=] { OS << "..."; });
+        dumpChild([this] { OS << "..."; });
     }
     void VisitUnresolvedUsingType(const UnresolvedUsingType *T) {
       dumpDeclRef(T->getDecl());
@@ -364,6 +371,26 @@ namespace  {
       // FIXME: AttrKind
       dumpTypeAsChild(T->getModifiedType());
     }
+    void VisitAttributedLinAlgMatrixType(const AttributedLinAlgMatrixType *T) {
+      dumpTypeAsChild(T->getWrappedType());
+      OS << " [[__LinAlgMatrix_Attributes("
+         << hlsl::ConvertLinAlgMatrixComponentTypeToString(
+                T->getComponentType())
+         << ", " << T->getRows() << ", " << T->getCols() << ", "
+         << hlsl::ConvertLinAlgMatrixUseToString(T->getUse()) << ", "
+         << hlsl::ConvertLinAlgMatrixScopeToString(T->getScope()) << ")]]";
+    }
+    void VisitDependentAttributedLinAlgMatrixType(
+        const DependentAttributedLinAlgMatrixType *T) {
+      OS << " ";
+      dumpTypeAsChild(T->getWrappedType());
+      dumpStmt(T->getComponentTyExpr());
+      dumpStmt(T->getRowsExpr());
+      dumpStmt(T->getColsExpr());
+      dumpStmt(T->getUseExpr());
+      dumpStmt(T->getScopeExpr());
+    }
+
     void VisitTemplateTypeParmType(const TemplateTypeParmType *T) {
       OS << " depth " << T->getDepth() << " index " << T->getIndex();
       if (T->isParameterPack()) OS << " pack";
@@ -640,7 +667,7 @@ void ASTDumper::dumpTypeAsChild(QualType T) {
   if (!SQT.Quals.hasQualifiers())
     return dumpTypeAsChild(SQT.Ty);
 
-  dumpChild([=] {
+  dumpChild([this, T] {
     OS << "QualType";
     dumpPointer(T.getAsOpaquePtr());
     OS << " ";
@@ -651,7 +678,7 @@ void ASTDumper::dumpTypeAsChild(QualType T) {
 }
 
 void ASTDumper::dumpTypeAsChild(const Type *T) {
-  dumpChild([=] {
+  dumpChild([this, T] {
     if (!T) {
       ColorScope Color(*this, NullColor);
       OS << "<<<NULL>>>";
@@ -708,7 +735,7 @@ void ASTDumper::dumpDeclRef(const Decl *D, const char *Label) {
   if (!D)
     return;
 
-  dumpChild([=]{
+  dumpChild([this, Label, D] {
     if (Label)
       OS << Label << ' ';
     dumpBareDeclRef(D);
@@ -734,11 +761,15 @@ void ASTDumper::dumpDeclContext(const DeclContext *DC) {
   if (!DC)
     return;
 
+  // HLSL Change Starts: Don't dump implicit decls unless requested.
+  bool ShouldDumpImplicit = DumpImplicitTopLevelDecls || !DC->isTranslationUnit();
   for (auto *D : DC->noload_decls())
-    dumpDecl(D);
+    if (ShouldDumpImplicit || !D->isImplicit())
+      dumpDecl(D);
+  // HLSL Change Ends
 
   if (DC->hasExternalLexicalStorage()) {
-    dumpChild([=]{
+    dumpChild([this] {
       ColorScope Color(*this, UndeserializedColor);
       OS << "<undeserialized declarations>";
     });
@@ -746,7 +777,7 @@ void ASTDumper::dumpDeclContext(const DeclContext *DC) {
 }
 
 void ASTDumper::dumpLookups(const DeclContext *DC, bool DumpDecls) {
-  dumpChild([=] {
+  dumpChild([this, DC, DumpDecls] {
     OS << "StoredDeclsMap ";
     dumpBareDeclRef(cast<Decl>(DC));
 
@@ -764,7 +795,7 @@ void ASTDumper::dumpLookups(const DeclContext *DC, bool DumpDecls) {
       DeclarationName Name = I.getLookupName();
       DeclContextLookupResult R = *I++;
 
-      dumpChild([=] {
+      dumpChild([this, Name, R, DumpDecls] {
         OS << "DeclarationName ";
         {
           ColorScope Color(*this, DeclNameColor);
@@ -773,7 +804,7 @@ void ASTDumper::dumpLookups(const DeclContext *DC, bool DumpDecls) {
 
         for (DeclContextLookupResult::iterator RI = R.begin(), RE = R.end();
              RI != RE; ++RI) {
-          dumpChild([=] {
+          dumpChild([this, RI, DumpDecls] {
             dumpBareDeclRef(*RI);
 
             if ((*RI)->isHidden())
@@ -795,7 +826,7 @@ void ASTDumper::dumpLookups(const DeclContext *DC, bool DumpDecls) {
     }
 
     if (HasUndeserializedLookups) {
-      dumpChild([=] {
+      dumpChild([this] {
         ColorScope Color(*this, UndeserializedColor);
         OS << "<undeserialized lookups>";
       });
@@ -804,7 +835,7 @@ void ASTDumper::dumpLookups(const DeclContext *DC, bool DumpDecls) {
 }
 
 void ASTDumper::dumpAttr(const Attr *A) {
-  dumpChild([=] {
+  dumpChild([this, A] {
     {
       ColorScope Color(*this, AttrColor);
 
@@ -876,7 +907,7 @@ void ASTDumper::dumpAccessSpecifier(AccessSpecifier AS) {
 }
 
 void ASTDumper::dumpCXXCtorInitializer(const CXXCtorInitializer *Init) {
-  dumpChild([=] {
+  dumpChild([this, Init] {
     OS << "CXXCtorInitializer";
     if (Init->isAnyMemberInitializer()) {
       OS << ' ';
@@ -917,7 +948,7 @@ void ASTDumper::dumpTemplateArgumentList(const TemplateArgumentList &TAL) {
 }
 
 void ASTDumper::dumpTemplateArgument(const TemplateArgument &A, SourceRange R) {
-  dumpChild([=] {
+  dumpChild([this, A, R] {
     OS << "TemplateArgument";
     if (R.isValid())
       dumpSourceRange(R);
@@ -983,19 +1014,23 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
 {
   for (auto It = UA.begin(), E = UA.end(); It != E; ++It)
   {
-    dumpChild([=] {
+    dumpChild([this, It] {
       {
         ColorScope Color(*this, AttrColor);
         switch ((*It)->getKind())
         {
-          case hlsl::UnusualAnnotation::UA_ConstantPacking:
-            OS << "ConstantPacking"; break;
-          case hlsl::UnusualAnnotation::UA_RegisterAssignment:
-            OS << "RegisterAssignment"; break;
-          case hlsl::UnusualAnnotation::UA_SemanticDecl:
-            OS << "SemanticDecl"; break;
-          case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier:
-            OS << "PayloadAccessQualifier"; break;
+        case hlsl::UnusualAnnotation::UA_ConstantPacking:
+          OS << "ConstantPacking";
+          break;
+        case hlsl::UnusualAnnotation::UA_RegisterAssignment:
+          OS << "RegisterAssignment";
+          break;
+        case hlsl::UnusualAnnotation::UA_SemanticDecl:
+          OS << "SemanticDecl";
+          break;
+        case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier:
+          OS << "PayloadAccessQualifier";
+          break;
         }
       }
       dumpPointer(It);
@@ -1004,48 +1039,52 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
       switch ((*It)->getKind())
       {
       case hlsl::UnusualAnnotation::UA_ConstantPacking: {
-          const hlsl::ConstantPacking* constantPacking = cast<hlsl::ConstantPacking>(*It);
-          OS << " packoffset(c";
-          OS << constantPacking->Subcomponent;
-          OS << ".";
-          const char *xyzw[4] = { "x", "y", "z", "w" };
-          if(constantPacking->ComponentOffset < 4)
-            OS << xyzw[constantPacking->ComponentOffset];
-          else
-            OS << "<invalid>";
-          OS << ")";
-          if (!constantPacking->IsValid)
-            OS << " invalid";
-          break;
-        }
+        const hlsl::ConstantPacking *constantPacking =
+            cast<hlsl::ConstantPacking>(*It);
+        OS << " packoffset(c";
+        OS << constantPacking->Subcomponent;
+        OS << ".";
+        const char *xyzw[4] = {"x", "y", "z", "w"};
+        if (constantPacking->ComponentOffset < 4)
+          OS << xyzw[constantPacking->ComponentOffset];
+        else
+          OS << "<invalid>";
+        OS << ")";
+        if (!constantPacking->IsValid)
+          OS << " invalid";
+        break;
+      }
       case hlsl::UnusualAnnotation::UA_RegisterAssignment: {
-          const hlsl::RegisterAssignment* registerAssignment = cast<hlsl::RegisterAssignment>(*It);
-          OS << " register(";
-          if (!registerAssignment->ShaderProfile.empty())
-            OS << registerAssignment->ShaderProfile << ", ";
-          bool needsComma = false;
-          if (!registerAssignment->isSpaceOnly()) {
-            if (!registerAssignment->RegisterType)
-              OS << "invalid";
-            else
-              OS << StringRef(&registerAssignment->RegisterType, 1);
-            OS << registerAssignment->RegisterNumber + registerAssignment->RegisterOffset;
-            needsComma = true;
-          }
-          if (registerAssignment->RegisterSpace.hasValue()) {
-            if (needsComma) OS << ", ";
-            OS << "space" << registerAssignment->RegisterSpace.getValue();
-          }
-          OS << ")";
-          if (!registerAssignment->IsValid)
-            OS << " invalid";
-          break;
+        const hlsl::RegisterAssignment *registerAssignment =
+            cast<hlsl::RegisterAssignment>(*It);
+        OS << " register(";
+        if (!registerAssignment->ShaderProfile.empty())
+          OS << registerAssignment->ShaderProfile << ", ";
+        bool needsComma = false;
+        if (!registerAssignment->isSpaceOnly()) {
+          if (!registerAssignment->RegisterType)
+            OS << "invalid";
+          else
+            OS << StringRef(&registerAssignment->RegisterType, 1);
+          OS << registerAssignment->RegisterNumber +
+                    registerAssignment->RegisterOffset;
+          needsComma = true;
         }
+        if (registerAssignment->RegisterSpace.hasValue()) {
+          if (needsComma)
+            OS << ", ";
+          OS << "space" << registerAssignment->RegisterSpace.getValue();
+        }
+        OS << ")";
+        if (!registerAssignment->IsValid)
+          OS << " invalid";
+        break;
+      }
       case hlsl::UnusualAnnotation::UA_SemanticDecl: {
-          const hlsl::SemanticDecl* semanticDecl = cast<hlsl::SemanticDecl>(*It);
-          OS << " \"" << semanticDecl->SemanticName << "\"";
-          break;
-        }      
+        const hlsl::SemanticDecl *semanticDecl = cast<hlsl::SemanticDecl>(*It);
+        OS << " \"" << semanticDecl->SemanticName << "\"";
+        break;
+      }
       case hlsl::UnusualAnnotation::UA_PayloadAccessQualifier: {
         const hlsl::PayloadAccessAnnotation *annotation =
             cast<hlsl::PayloadAccessAnnotation>(*It);
@@ -1071,16 +1110,7 @@ void ASTDumper::dumpHLSLUnusualAnnotations(const ArrayRef<hlsl::UnusualAnnotatio
 // HLSL Change Ends
 
 void ASTDumper::dumpDecl(const Decl *D) {
-  // HLSL Change Starts: Don't display decls with invalid SourceLocations.
-  if (D && D->getDeclContext() &&
-      D->getDeclContext()->getDeclKind() == Decl::Kind::TranslationUnit &&
-      D->getSourceRange().isInvalid())
-  {
-    return;
-  }
-  // HLSL Change Ends
-
-  dumpChild([=] {
+  dumpChild([this, D] {
     if (!D) {
       ColorScope Color(*this, NullColor);
       OS << "<<<NULL>>>";
@@ -1112,7 +1142,7 @@ void ASTDumper::dumpDecl(const Decl *D) {
     if (auto *ND = dyn_cast<NamedDecl>(D))
       for (Module *M : D->getASTContext().getModulesWithMergedDefinition(
                const_cast<NamedDecl *>(ND)))
-        dumpChild([=] { OS << "also in " << M->getFullModuleName(); });
+        dumpChild([this, M] { OS << "also in " << M->getFullModuleName(); });
     if (const NamedDecl *ND = dyn_cast<NamedDecl>(D))
       if (ND->isHidden())
         OS << " hidden";
@@ -1252,7 +1282,8 @@ void ASTDumper::VisitFunctionDecl(const FunctionDecl *D) {
     dumpDecl(*I);
 
   if (!D->param_begin() && D->getNumParams())
-    dumpChild([=] { OS << "<<NULL params x " << D->getNumParams() << ">>"; });
+    dumpChild(
+        [this, D] { OS << "<<NULL params x " << D->getNumParams() << ">>"; });
   else
     for (FunctionDecl::param_const_iterator I = D->param_begin(),
                                             E = D->param_end();
@@ -1355,7 +1386,7 @@ void ASTDumper::VisitCXXRecordDecl(const CXXRecordDecl *D) {
     return;
 
   for (const auto &I : D->bases()) {
-    dumpChild([=] {
+    dumpChild([this, I] {
       if (I.isVirtual())
         OS << "virtual ";
       dumpAccessSpecifier(I.getAccessSpecifier());
@@ -1394,7 +1425,7 @@ void ASTDumper::VisitTemplateDeclSpecialization(const SpecializationDecl *D,
     case TSK_ExplicitInstantiationDefinition:
       if (!DumpExplicitInst)
         break;
-      // Fall through.
+      LLVM_FALLTHROUGH; // HLSL Change
     case TSK_Undeclared:
     case TSK_ImplicitInstantiation:
       if (DumpRefOnly)
@@ -1594,7 +1625,7 @@ void ASTDumper::VisitObjCMethodDecl(const ObjCMethodDecl *D) {
   }
 
   if (D->isVariadic())
-    dumpChild([=] { OS << "..."; });
+    dumpChild([this] { OS << "..."; });
 
   if (D->hasBody())
     dumpStmt(D->getBody());
@@ -1722,13 +1753,13 @@ void ASTDumper::VisitBlockDecl(const BlockDecl *D) {
     dumpDecl(I);
 
   if (D->isVariadic())
-    dumpChild([=]{ OS << "..."; });
+    dumpChild([this] { OS << "..."; });
 
   if (D->capturesCXXThis())
-    dumpChild([=]{ OS << "capture this"; });
+    dumpChild([this] { OS << "capture this"; });
 
   for (const auto &I : D->captures()) {
-    dumpChild([=] {
+    dumpChild([this, I] {
       OS << "capture";
       if (I.isByRef())
         OS << " byref";
@@ -1750,7 +1781,7 @@ void ASTDumper::VisitBlockDecl(const BlockDecl *D) {
 //===----------------------------------------------------------------------===//
 
 void ASTDumper::dumpStmt(const Stmt *S) {
-  dumpChild([=] {
+  dumpChild([this, S] {
     if (!S) {
       ColorScope Color(*this, NullColor);
       OS << "<<<NULL>>>";
@@ -1964,7 +1995,7 @@ void ASTDumper::VisitStringLiteral(const StringLiteral *Str) {
 void ASTDumper::VisitInitListExpr(const InitListExpr *ILE) {
   VisitExpr(ILE);
   if (auto *Filler = ILE->getArrayFiller()) {
-    dumpChild([=] {
+    dumpChild([this, Filler] {
       OS << "array filler";
       dumpStmt(Filler);
     });
@@ -2301,7 +2332,7 @@ void ASTDumper::dumpFullComment(const FullComment *C) {
 }
 
 void ASTDumper::dumpComment(const Comment *C) {
-  dumpChild([=] {
+  dumpChild([this, C] {
     if (!C) {
       ColorScope Color(*this, NullColor);
       OS << "<<<NULL>>>";
@@ -2447,6 +2478,8 @@ LLVM_DUMP_METHOD void Decl::dump() const { dump(llvm::errs()); }
 LLVM_DUMP_METHOD void Decl::dump(raw_ostream &OS) const {
   ASTDumper P(OS, &getASTContext().getCommentCommandTraits(),
               &getASTContext().getSourceManager());
+  // HLSL Change - Support suppressing dumping implicit decls.
+  P.setDumpImplicitTopLevelDecls(getASTContext().getLangOpts().DumpImplicitTopLevelDecls);
   P.dumpDecl(this);
 }
 
